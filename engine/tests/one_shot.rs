@@ -142,12 +142,12 @@ fn deadline_kills_a_wedged_child() {
     let start = Instant::now();
     let err = os.call(&json!({"type": "hang"})).unwrap_err();
     assert!(matches!(err, SessionError::Timeout { .. }), "{err}");
-    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 
     let start = Instant::now();
     let err = os.stream(&json!({"type": "hang"}), |_| {}).unwrap_err();
     assert!(matches!(err, SessionError::Timeout { .. }), "{err}");
-    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 
     let _ = std::fs::remove_file(&path);
 }

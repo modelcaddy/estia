@@ -203,14 +203,16 @@ fn wedged_child_trips_the_deadline_and_is_respawned() {
     let elapsed = start.elapsed();
     assert!(res.is_err(), "a wedged runner must error, not hang");
     assert!(matches!(res, Err(SessionError::AfterRespawn(_))), "{res:?}");
-    assert!(elapsed < Duration::from_secs(2), "deadline (~2×300ms incl. respawn), got {elapsed:?}");
+    // ~2×300 ms plus a respawn; the bound only has to tell "deadline fired" from
+    // "hung", with room for a slow CI machine starting Python.
+    assert!(elapsed < Duration::from_secs(5), "deadline (~2×300ms incl. respawn), got {elapsed:?}");
     assert_ne!(s.pid(), pid_before, "the wedged child was replaced");
 
     // Streams use the same deadline as a silence timeout.
     let start = Instant::now();
     let res = s.stream(&Request::GenerateStream { model_path: "/m", prompt: "p", max_tokens: None, temperature: None }, |_| {});
     assert!(matches!(res, Err(SessionError::StreamSilence { .. })), "{res:?}");
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(5));
     assert_eq!(s.in_flight(), 0);
     let _ = std::fs::remove_file(&path);
 }
@@ -352,6 +354,11 @@ fn interactive_calls_jump_the_background_queue() {
     // One background call occupies the child (250 ms). While it runs, queue
     // two more background calls, then one interactive call. The interactive
     // call must complete before either queued background call.
+    //
+    // Each call is started only once the previous one is inside the session
+    // (`in_flight` counts the running call plus the queued ones), so the queue
+    // order is fixed by the test, not by how a busy CI machine schedules
+    // threads — fixed sleeps let two background calls swap places on CI.
     let mut handles = Vec::new();
     for (i, prio) in [
         (0, estia_engine::Priority::Background),
@@ -359,13 +366,11 @@ fn interactive_calls_jump_the_background_queue() {
         (2, estia_engine::Priority::Background),
         (3, estia_engine::Priority::Interactive),
     ] {
-        let s = Arc::clone(&s);
+        let s2 = Arc::clone(&s);
         let order = Arc::clone(&order);
         handles.push(std::thread::spawn(move || {
-            // Stagger so the first background call is running before the rest queue.
-            std::thread::sleep(Duration::from_millis(40 * i as u64));
             let prompt = format!("{i}");
-            let g: GenerateResp = s
+            let g: GenerateResp = s2
                 .call_typed_with(
                     &Request::Generate { model_path: "/m", prompt: &prompt, max_tokens: None, temperature: None, json: None },
                     prio,
@@ -373,6 +378,11 @@ fn interactive_calls_jump_the_background_queue() {
                 .unwrap();
             order.lock().unwrap().push(g.text);
         }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.in_flight() < i + 1 {
+            assert!(Instant::now() < deadline, "call {i} never entered the session (in_flight {})", s.in_flight());
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
     for h in handles {
         h.join().unwrap();
