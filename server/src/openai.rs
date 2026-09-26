@@ -85,17 +85,14 @@ fn content_text(v: &Option<Value>) -> String {
 
 pub(crate) fn to_messages(msgs: &[OaiMessage]) -> Vec<Message> {
     msgs.iter()
-        .map(|m| {
-            let mut content = content_text(&m.content);
-            if let Some(calls) = &m.tool_calls {
-                // The model sees its earlier call as text; the template has no
-                // slot for structured prior calls we can rely on across models.
-                if !content.is_empty() {
-                    content.push('\n');
-                }
-                content.push_str(&Value::Array(calls.clone()).to_string());
-            }
-            Message { role: m.role.clone(), content, name: m.name.clone(), tool_call_id: m.tool_call_id.clone() }
+        .map(|m| Message {
+            role: m.role.clone(),
+            content: content_text(&m.content),
+            name: m.name.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+            // Passed through structured: chat templates render a `tool` result
+            // only after the assistant turn whose `tool_calls` it answers.
+            tool_calls: m.tool_calls.clone().filter(|c| !c.is_empty()),
         })
         .collect()
 }

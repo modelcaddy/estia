@@ -1,0 +1,18 @@
+[package]
+name = "estia-llama"
+description = "Estia's llama.cpp backend: a runner-protocol adapter in front of upstream llama-server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["llm", "inference", "llama-cpp", "gguf", "local"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+estia-proto = { path = "../proto", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing = "0.1"

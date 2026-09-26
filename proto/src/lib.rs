@@ -145,11 +145,17 @@ pub struct Message {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// OpenAI-shaped tool calls an assistant turn made
+    /// (`[{"id", "type": "function", "function": {"name", "arguments"}}]`).
+    /// Chat templates only show a `tool` result after the assistant turn that
+    /// called it, so dropping these dropped the results too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<Value>>,
 }
 
 impl Message {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), name: None, tool_call_id: None }
+        Self { role: role.into(), content: content.into(), name: None, tool_call_id: None, tool_calls: None }
     }
 }
 
@@ -167,6 +173,14 @@ pub struct GenerationMeta {
     /// `manual` for the runner's fallback rendering.
     #[serde(default)]
     pub template: Option<String>,
+    /// OpenAI-shaped tool calls the runner parsed itself. Only runners that
+    /// declare [`Capabilities::parses_tool_calls`] send it; otherwise the
+    /// client parses the model's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<Value>>,
+    /// Decode rate the runner measured (tokens/s, generation only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_tps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +251,14 @@ pub struct Capabilities {
     /// `json_schema`). Empty means the client validates and repairs instead.
     #[serde(default)]
     pub structured: Vec<String>,
+    /// The runner parses tool calls itself and returns them in
+    /// `meta.tool_calls` (llama.cpp does); text is not re-parsed.
+    #[serde(default)]
+    pub parses_tool_calls: bool,
+    /// The backend id vectors and outputs from this runner carry
+    /// (`mlx-python`, `llama-cpp`). Absent on older runners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 /// Answer to `hello`.

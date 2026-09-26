@@ -530,6 +530,7 @@ mod tests {
             cached_tokens: Some(8),
             generation_tokens: Some(50),
             template: None,
+            ..Default::default()
         }));
         a.with(|f| {
             f.call_started = Some(t0 + Duration::from_millis(100));

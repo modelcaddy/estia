@@ -2,6 +2,7 @@
 #
 #   proto   estia-proto   runner protocol wire types (JSON lines)
 #   engine  estia-engine  sessions, models, runtime, roles, structured output
+#   llama   estia-llama   llama.cpp backend: runner adapter in front of llama-server
 #   server  estia-server  HTTP API: OpenAI-compatible /v1/* and native /engine/*
 #   cli     estia         the `estia` binary
 #
@@ -9,7 +10,7 @@
 # ordinary dependencies. See README.md.
 [workspace]
 resolver = "2"
-members = ["proto", "engine", "server", "cli"]
+members = ["proto", "engine", "llama", "server", "cli"]
 
 [workspace.package]
 version = "0.1.0"

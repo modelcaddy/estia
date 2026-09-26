@@ -25,6 +25,7 @@
 //!
 //! The wire types live in [`proto`] (re-exported `estia-proto`).
 
+pub mod backend;
 pub mod engine;
 pub mod error;
 pub mod handles;
@@ -38,6 +39,7 @@ pub mod runtime;
 pub mod session;
 pub mod structured;
 
+pub use backend::{Backend, BACKEND_LLAMA_CPP};
 pub use engine::{Engine, EngineConfig, EngineError, Reaped};
 pub use error::SessionError;
 pub use estia_proto as proto;
