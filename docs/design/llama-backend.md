@@ -30,7 +30,7 @@ difference noted here.
 | L4 embeddings | Built; EmbeddingGemma GGUF not run | 384-dimension unit vectors from all-MiniLM-L6-v2 Q8_0, fingerprint `minilm@llama-cpp`, 422 on an MLX fingerprint, 256 inputs in one batch |
 | L5 runtime install | Built; macOS arm64 only | `estia runtime install --backend llama` verifies the SHA-256, unpacks, runs `--version` (`build 11146`). Probe order and CUDA pairing are unit-tested; no GPU fallback after `--list-devices` yet |
 | L6 cache isolation | Partly | One slot; reused only by the cache key whose request filled it and succeeded. Several slots: not done |
-| L7 CI and releases | Partly | The `llama` job (ubuntu-latest CPU, macos-15 Metal) is written and its steps passed locally; it has not run on GitHub. No new release archives |
+| L7 CI and releases | Partly | The `llama` job (ubuntu-latest CPU, macos-15 Metal) passed on GitHub on 2026-09-26 (commit `8642bfc`): the 6 adapter integration tests ran against `llama-server` b11146 on both, none skipped. No new release archives |
 | L8, L9 | Not started | |
 
 Differences from the text below:
@@ -136,8 +136,9 @@ What remains:
   turn; the adapter has no such retry).
 - **EmbeddingGemma GGUF (L4).** Pull `embeddinggemma-300m-q8_0-gguf`, check 768
   dimensions and the fingerprint, and list its tensors for the dense layers.
-- **Linux and GPUs (L5, L7).** The CI job on GitHub; a GPU fallback after
-  `--list-devices`; an NVIDIA machine picking CUDA; release archives for Linux
+- **Linux and GPUs (L5, L7).** A GPU fallback after `--list-devices`; an
+  NVIDIA machine picking CUDA; `estia setup` and `estia serve` on a real
+  Linux machine (CI runs only the adapter's tests); release archives for Linux
   and Intel macOS.
 - **More slots (L6), benchmarks and the Mac default (L8), images (L9).**
 - **Smaller:** `service install` does not copy `ESTIA_LLAMA_SERVER` or

@@ -1,11 +1,12 @@
 name: Release
 
-# Push a tag like v0.1.0 to publish a release. The tag must match the version
-# in the workspace Cargo.toml, or the job stops before building.
+# Push a tag like v0.4.0 to publish a release. The tag must match the version
+# in the workspace Cargo.toml, or the job stops before building. The release
+# checklist is in docs/versioning.md.
 #
-# Artifacts: aarch64-apple-darwin only. MLX, the only backend today, needs
-# Apple Silicon, so there is no Intel macOS build. There are no Linux or
-# Windows artifacts yet: those platforms need the planned llama.cpp backend.
+# Artifacts: aarch64-apple-darwin only. Linux and Intel Macs use the llama.cpp
+# backend, but there are no archives for them yet (ROADMAP.md, slice L7);
+# build from source there. Estia does not build for Windows.
 #
 # The binary is not signed with a Developer ID or notarized. macOS blocks a
 # quarantined download (one saved by a browser) until the quarantine attribute
@@ -93,13 +94,15 @@ jobs:
       # compiled-in copy under <data dir>/engine/runners/ and still report a
       # path ending in runners/mlx-python/estia-runner.py; so match the whole
       # line, with the unpacked directory's absolute path, and check that the
-      # fallback wrote nothing.
+      # fallback wrote nothing. The binary must also name the tag's commit,
+      # without +dirty (see "Build information" in docs/versioning.md).
       - name: Check the packaged binary finds its runner
         shell: bash
         run: |
           set -euo pipefail
           name="${{ steps.package.outputs.name }}"
           (cd dist && shasum -a 256 -c "$name.tar.gz.sha256")
+          want="$(git rev-parse HEAD | cut -c1-9)"
           smoke="$RUNNER_TEMP/estia-smoke"
           rm -rf "$smoke"
           mkdir -p "$smoke/unpack" "$smoke/cwd"
@@ -111,6 +114,12 @@ jobs:
           data="$smoke/data"
           cd "$smoke/cwd"
           "$dir/estia" --version
+          "$dir/estia" version
+          got="$("$dir/estia" version --json | jq -r .build.commit)"
+          if [ "$got" != "$want" ]; then
+            echo "the binary says it was built from $got, but the tag is at $want" >&2
+            exit 1
+          fi
           env -u ESTIA_RUNNER ESTIA_DATA_DIR="$data" "$dir/estia" status | tee "$smoke/status.txt"
           grep -qxF "runner   : $dir/runners/mlx-python/estia-runner.py" "$smoke/status.txt" || {
             echo "status did not report the runner inside the unpacked tarball ($dir)" >&2

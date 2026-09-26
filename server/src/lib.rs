@@ -10,7 +10,7 @@
 //!
 //! Auth is a bearer token from `tokens.json` with scopes; `/engine/health` is
 //! open. A non-loopback bind needs [`ServeOptions::lan`] (the CLI's `--lan`)
-//! and auth on; LAN clients pair for a token. One engine per machine:
+//! and auth on; LAN clients pair for a token. One engine per data directory:
 //! `engine.json` in the data directory records where it bound, and a second
 //! `serve` refuses when that port answers.
 //!
@@ -55,6 +55,16 @@ use tokens::TokenStore;
 
 /// Version of the `/engine/*` contract. Clients check it in `/engine/health`.
 pub const API_VERSION: u32 = 1;
+
+/// The commit this crate was built from: 9 hex digits, with `+dirty` when
+/// compiled-in files differed from it, or `unknown` (a build without git or
+/// package metadata). Set by `build.rs`; `/engine/health` reports it as
+/// `build.commit`. See docs/versioning.md.
+pub const BUILD_COMMIT: &str = env!("ESTIA_BUILD_COMMIT");
+
+/// The UTC day this crate was built, `YYYY-MM-DD` (the day of
+/// `SOURCE_DATE_EPOCH` when that was set). `/engine/health` `build.date`.
+pub const BUILD_DATE: &str = env!("ESTIA_BUILD_DATE");
 
 /// Environment variable with extra `Host` names to answer to, comma-separated.
 /// Same syntax as [`ServeOptions::allowed_hosts`].
@@ -1137,7 +1147,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     if let Some(rec) = another_engine_running(&data_dir) {
         let host = if rec.bind.contains(':') { format!("[{}]", rec.bind) } else { rec.bind.clone() };
         anyhow::bail!(
-            "an engine is already running for this data directory (pid {} on {host}:{}); one engine per machine",
+            "an engine is already running for this data directory (pid {} on {host}:{}); one engine per data directory",
             rec.pid,
             rec.port
         );
@@ -1156,6 +1166,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     std::fs::write(engine_record_path(&data_dir), serde_json::to_string_pretty(&record)?)?;
     tracing::info!(
         version = %env!("CARGO_PKG_VERSION"),
+        commit = %BUILD_COMMIT,
         api_version = API_VERSION,
         protocol_version = estia_engine::proto::PROTOCOL_VERSION,
         url = %format!("http://{bound}"),

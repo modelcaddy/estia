@@ -255,17 +255,28 @@ round. Models that are not downloaded are listed too; check `installed`.
 
 Open, so clients can check an engine before they have a token.
 
+From an MLX engine, just after it started (the server sorts the keys; they
+are regrouped here):
+
 ```json
-{"ok": true, "engine": "estia", "version": "0.1.0", "api_version": 1, "protocol_version": 2,
- "bind": "127.0.0.1:27200", "auth_required": true, "uptime_s": 3, "backend": "llama-cpp",
- "backends": [{"id": "llama-cpp", "active": true, "supported": true, "runtime_installed": true,
-               "build": "b11146", "variant": "metal", "server": "installed"},
-              {"id": "mlx-python", "active": false, "supported": true, "runtime_installed": false}],
- "loaded": ["tinygemma3"]}
+{"ok": true, "engine": "estia", "version": "0.4.0",
+ "build": {"commit": "8642bfc4e+dirty", "date": "2026-09-26"},
+ "api_version": 1, "protocol_version": 2,
+ "bind": "127.0.0.1:27391", "auth_required": true, "uptime_s": 0, "backend": "mlx-python",
+ "backends": [{"id": "mlx-python", "active": true, "supported": true, "runtime_installed": true},
+              {"id": "llama-cpp", "active": false, "supported": true, "runtime_installed": false,
+               "build": "b11146", "variant": null, "server": null}],
+ "loaded": []}
 ```
 
-`version` is the crate version of the server that answered. `backend` is the
-backend this engine runs. `backends` lists both, the active one first:
+On a llama.cpp engine with the runtime installed, the `llama-cpp` entry comes
+first, for example `"variant": "metal", "server": "installed"`, and `loaded`
+lists the models in memory.
+
+`version` is the crate version of the server that answered, and `build` the
+commit and UTC date its binary was built from, as `estia version` prints them
+([versioning.md](versioning.md)). `backend` is the backend this engine runs.
+`backends` lists both, the active one first:
 `supported` says whether it can run on this machine and `runtime_installed`
 whether its runtime is installed. For `llama-cpp`, `build` is the pinned
 llama.cpp build, `variant` the installed variant (`cpu`, `metal`, `vulkan`,

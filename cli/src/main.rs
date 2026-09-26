@@ -25,10 +25,18 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing_subscriber::filter::{Directive, EnvFilter, LevelFilter};
 
+/// What `estia --version` prints after the name: `0.4.0 (<commit>, <date>)`.
+/// build.rs sets the commit and date; see docs/versioning.md.
+const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ESTIA_BUILD_COMMIT"), ", ", env!("ESTIA_BUILD_DATE"), ")");
+
+/// The `estia-engine` features this binary is built with, as cli/Cargo.toml
+/// lists them (a test keeps the two in step).
+const ENGINE_FEATURES: &[&str] = &["python-mlx", "llama-runtime"];
+
 #[derive(Parser)]
 #[command(
     name = "estia",
-    version,
+    version = VERSION_LINE,
     about = "Estia: a local LLM inference engine. Serve an OpenAI-compatible API, manage models and roles, pair devices on the LAN."
 )]
 struct Cli {
@@ -282,6 +290,13 @@ enum Cmd {
     Token {
         #[command(subcommand)]
         action: TokenAction,
+    },
+    /// This build: version, commit, date, target, API and protocol versions,
+    /// backends, features and the pinned llama.cpp build.
+    Version {
+        /// Print one JSON object, for scripts.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2678,6 +2693,10 @@ async fn run_cli() -> Result<()> {
         }
         std::process::exit(llama_runner(args.clone()) as i32);
     }
+    // Reads no data directory, config or environment, so it works anywhere.
+    if let Cmd::Version { json } = &cli.cmd {
+        return print_version(*json);
+    }
     // The backend decides how much runner output the terminal gets, so it is
     // read before logging starts; Ctx reads config.json properly below.
     let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
@@ -2727,6 +2746,74 @@ async fn run_cli() -> Result<()> {
         Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),
         Cmd::RemoteCheck { engine, token, model } => tokio::task::block_in_place(|| remote_check(&engine, token, &model)),
+        Cmd::Version { .. } => unreachable!("handled above"),
+    }
+}
+
+/// `RUNNER_VERSION` of the MLX runner compiled into this binary.
+fn embedded_runner_version() -> Option<&'static str> {
+    EMBEDDED_RUNNER.lines().find_map(|l| l.strip_prefix("RUNNER_VERSION = \"")?.strip_suffix('"'))
+}
+
+/// What `estia version --json` prints. `version` and `build.commit` /
+/// `build.date` match the fields of the same names in `/engine/health`.
+fn version_info() -> serde_json::Value {
+    let default = Backend::platform_default();
+    let backends: Vec<serde_json::Value> =
+        Backend::ALL.iter().map(|b| serde_json::json!({"id": b.id(), "supported": b.supported_here(), "default": *b == default})).collect();
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "build": {
+            "commit": env!("ESTIA_BUILD_COMMIT"),
+            "date": env!("ESTIA_BUILD_DATE"),
+            "target": env!("ESTIA_BUILD_TARGET"),
+            "profile": env!("ESTIA_BUILD_PROFILE"),
+            "rustc": env!("ESTIA_BUILD_RUSTC"),
+        },
+        "api_version": estia_server::API_VERSION,
+        "protocol_version": estia_engine::proto::PROTOCOL_VERSION,
+        "backends": backends,
+        "features": ENGINE_FEATURES,
+        "llama_cpp_build": estia_engine::runtime::llama_pins::LLAMA_BUILD,
+        "mlx_runner_version": embedded_runner_version(),
+    })
+}
+
+/// `estia version` without `--json`: one `key : value` line per field.
+fn version_text() -> String {
+    let default = Backend::platform_default();
+    let backends: Vec<String> = Backend::ALL
+        .iter()
+        .map(|b| match (*b == default, b.supported_here()) {
+            (true, _) => format!("{b} (default on this machine)"),
+            (false, true) => b.to_string(),
+            (false, false) => format!("{b} (not on this machine)"),
+        })
+        .collect();
+    let rows = [
+        ("version", env!("CARGO_PKG_VERSION").to_string()),
+        ("commit", env!("ESTIA_BUILD_COMMIT").to_string()),
+        ("date", env!("ESTIA_BUILD_DATE").to_string()),
+        ("target", format!("{} ({} build)", env!("ESTIA_BUILD_TARGET"), env!("ESTIA_BUILD_PROFILE"))),
+        ("rustc", env!("ESTIA_BUILD_RUSTC").to_string()),
+        ("api", format!("v{} (HTTP /engine/*)", estia_server::API_VERSION)),
+        ("protocol", format!("v{} (runners)", estia_engine::proto::PROTOCOL_VERSION)),
+        ("backends", backends.join(", ")),
+        ("features", ENGINE_FEATURES.join(", ")),
+        ("llama.cpp", format!("{} (pinned for `estia runtime install --backend llama`)", estia_engine::runtime::llama_pins::LLAMA_BUILD)),
+        ("runner", format!("mlx-python {} (compiled in)", embedded_runner_version().unwrap_or("unknown"))),
+    ];
+    rows.iter().map(|(k, v)| format!("{k:<9}: {v}\n")).collect()
+}
+
+/// `estia version`: which build this is, for bug reports and for checking a
+/// release download. A closed pipe (`estia version | head -1`) is not an
+/// error.
+fn print_version(json: bool) -> Result<()> {
+    let out = if json { format!("{}\n", serde_json::to_string_pretty(&version_info())?) } else { version_text() };
+    match std::io::stdout().lock().write_all(out.as_bytes()) {
+        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -3169,5 +3256,71 @@ mod tests {
         if let Ok(canonical) = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../runners/mlx-python/estia-runner.py")) {
             assert_eq!(EMBEDDED_RUNNER, canonical);
         }
+    }
+
+    /// `estia --version` is one line: `estia <version> (<commit>, <date>)`.
+    #[test]
+    fn version_flag_is_one_line_with_commit_and_date() {
+        use clap::CommandFactory;
+        let line = Cli::command().render_version();
+        let line = line.trim_end();
+        assert!(!line.contains('\n'), "{line:?}");
+        let rest = line.strip_prefix(concat!("estia ", env!("CARGO_PKG_VERSION"), " (")).unwrap_or_else(|| panic!("{line:?}"));
+        let inner = rest.strip_suffix(')').unwrap_or_else(|| panic!("{line:?}"));
+        let (commit, date) = inner.split_once(", ").unwrap_or_else(|| panic!("{line:?}"));
+        assert_eq!(commit, env!("ESTIA_BUILD_COMMIT"));
+        assert_eq!(date, env!("ESTIA_BUILD_DATE"));
+        assert!(!commit.is_empty() && !commit.contains(char::is_whitespace), "{commit:?}");
+        let b = date.as_bytes();
+        assert!(date == "unknown" || (b.len() == 10 && b[4] == b'-' && b[7] == b'-'), "{date:?}");
+        let cli = Cli::try_parse_from(["estia", "version", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Version { json: true }));
+    }
+
+    /// `estia version --json` is one JSON object with every field scripts
+    /// read, and the build fields match what `/engine/health` reports.
+    #[test]
+    fn version_json_has_the_fields() {
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string_pretty(&version_info()).unwrap()).unwrap();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["build"]["commit"], estia_server::BUILD_COMMIT);
+        assert_eq!(v["build"]["date"], env!("ESTIA_BUILD_DATE"));
+        for k in ["target", "profile", "rustc"] {
+            assert!(v["build"][k].as_str().is_some_and(|s| !s.is_empty()), "build.{k}: {v}");
+        }
+        assert_eq!(v["build"]["target"], env!("ESTIA_BUILD_TARGET"));
+        assert_eq!(v["api_version"], estia_server::API_VERSION);
+        assert_eq!(v["protocol_version"], estia_engine::proto::PROTOCOL_VERSION);
+        let backends = v["backends"].as_array().unwrap();
+        let ids: Vec<&str> = backends.iter().map(|b| b["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["mlx-python", "llama-cpp"]);
+        assert_eq!(backends.iter().filter(|b| b["default"] == true).count(), 1);
+        assert!(backends.iter().all(|b| b["supported"].is_boolean()));
+        assert_eq!(v["features"], serde_json::json!(ENGINE_FEATURES));
+        assert_eq!(v["llama_cpp_build"], estia_engine::runtime::llama_pins::LLAMA_BUILD);
+        assert!(v["mlx_runner_version"].as_str().is_some_and(|s| s.split('.').count() == 3), "{v}");
+    }
+
+    /// `estia version` lines up its keys and leads with the version and commit.
+    #[test]
+    fn version_text_lists_the_build() {
+        let text = version_text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], concat!("version  : ", env!("CARGO_PKG_VERSION")));
+        assert_eq!(lines[1], concat!("commit   : ", env!("ESTIA_BUILD_COMMIT")));
+        assert!(lines.iter().all(|l| l.as_bytes().get(9) == Some(&b':')), "{text}");
+        for key in ["date", "target", "rustc", "api", "protocol", "backends", "features", "llama.cpp", "runner"] {
+            assert!(lines.iter().any(|l| l.starts_with(key)), "no {key}: {text}");
+        }
+    }
+
+    /// `ENGINE_FEATURES` is what cli/Cargo.toml turns on for `estia-engine`.
+    #[test]
+    fn version_features_match_the_manifest() {
+        let manifest = include_str!("../Cargo.toml");
+        let line = manifest.lines().find(|l| l.starts_with("estia-engine = ")).expect("estia-engine dependency line");
+        let list = line.split("features = [").nth(1).and_then(|s| s.split(']').next()).expect("features list");
+        let declared: Vec<&str> = list.split(',').map(|s| s.trim().trim_matches('"')).filter(|s| !s.is_empty()).collect();
+        assert_eq!(declared, ENGINE_FEATURES);
     }
 }

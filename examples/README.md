@@ -63,6 +63,16 @@ The concepts behind them are explained in
    `~/Library/Application Support/estia` on macOS) and optionally
    `ESTIA_RUNNER` and `ESTIA_PYTHON` instead.
 
+4. Optionally, check the engine and the token first. From the repository
+   root, the smoke test reads the same variables:
+
+   ```bash
+   scripts/smoke-test.sh --quick
+   ```
+
+   [docs/running-and-testing.md](../docs/running-and-testing.md#the-smoke-test)
+   explains its output and what to do when a check fails.
+
 ## Running them
 
 curl (needs only curl):

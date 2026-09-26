@@ -10,16 +10,19 @@ Estia is developed by ModelCaddy and runs inside its apps.
 
 ## Status
 
-Estia is early software. Version 0.1.0 has not been released. Expect breaking
-changes before 1.0.
+Estia is early software. This tree is version 0.4.0, which has not been
+tagged or published yet; the earlier versions were never released on their
+own. [CHANGELOG.md](CHANGELOG.md) says what each version holds, and
+[docs/versioning.md](docs/versioning.md) what the numbers mean. Expect
+breaking changes before 1.0.
 
 - **Two backends, one of them new.** On Apple Silicon Macs the default is
   MLX, run by a Python runner that Estia installs for itself. Everywhere else
   the default is llama.cpp: upstream's `llama-server` behind a small Rust
   adapter (see [Backends](#backends)). The llama.cpp backend is new. It has
   run end to end only on an Apple Silicon Mac, with two small test models; it
-  has not yet run the Gemma 4 GGUF files, and has not run on Linux outside
-  the CI job written for it. Estia does not build for Windows yet.
+  has not yet run the Gemma 4 GGUF files, and on Linux it has run only in CI
+  (the adapter's tests, on Ubuntu x64). Estia does not build for Windows yet.
 - **No TLS.** LAN traffic is plain HTTP, including bearer tokens, prompts and
   outputs. That is fine on a home network you control. Do not serve the LAN on
   shared or public Wi-Fi.
@@ -40,7 +43,9 @@ closes each item.
 You need:
 
 - Rust 1.89 or newer ([rustup](https://rustup.rs)) and, on macOS, the Xcode
-  Command Line Tools.
+  Command Line Tools. On Linux, a C compiler, `pkg-config` and the OpenSSL
+  headers, which the HTTPS client links against (Debian and Ubuntu:
+  `build-essential pkg-config libssl-dev`).
 - To run models: an Apple Silicon Mac for the MLX backend, or a Mac or Linux
   machine for the llama.cpp backend. `estia setup` downloads what the backend
   needs (Python and the MLX packages, or a pinned `llama-server` build);
@@ -164,6 +169,38 @@ estia token new editor --replace           # rotate: the old token stops working
 Token names are unique. `token new` refuses a name that already exists;
 `--replace` rotates it, keeping the old token's scopes unless you pass
 `--scopes`.
+
+## Run and test
+
+[docs/running-and-testing.md](docs/running-and-testing.md) walks through a
+first run on a Mac (MLX) and on Linux (llama.cpp), running Estia as a
+service, where the logs are and how to follow one request, testing an engine
+from a phone or another computer, a troubleshooting table, and the test suites
+for contributors. It also says what has and has not been run on Linux.
+
+To check a running engine, give the smoke test a token with the scopes
+`generate`, `embed` and `models:read`:
+
+```bash
+(umask 077 && estia token new smoke --scopes generate,embed,models:read > ~/.estia-smoke-token)
+scripts/smoke-test.sh --token-file ~/.estia-smoke-token            # 12 checks
+scripts/smoke-test.sh --token-file ~/.estia-smoke-token --quick    # health, one chat, one embedding
+scripts/smoke-test.sh --url http://192.168.1.20:27200 --token-file ~/.estia-token        # an engine on another machine, with a paired token
+```
+
+It needs only bash, curl and python3, prints PASS, FAIL or SKIP with the time
+each check took, and exits 1 if any check failed.
+
+`estia --version` and `estia version` say which build you are running;
+`/engine/health` reports the build of a running engine. Put the output of
+`estia version` in bug reports. [docs/versioning.md](docs/versioning.md)
+explains the fields, how the version numbers change and how a release is
+made.
+
+```console
+$ estia --version
+estia 0.4.0 (8642bfc4e+dirty, 2026-09-26)
+```
 
 ## Backends
 
@@ -597,6 +634,7 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | `bench` | Time a model load, two generations and a batch of 32 embeddings |
 | `runner-check` | Handshake with the runner and print its capabilities; loads no model |
 | `runner llama` | Hidden: the llama.cpp adapter, which the engine starts for each model; not for direct use |
+| `version [--json]` | This build: version, commit, build date, target, API and protocol versions, backends, features, the pinned llama.cpp build. Reads no data directory, so it works before `setup` |
 
 `run`, `chat`, `embed`, `tokens` and `bench` start their own runner process.
 They do not go through a running server.

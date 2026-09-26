@@ -13,12 +13,15 @@ cargo build
 cargo run -p estia -- --help
 ```
 
-The workspace builds on macOS and Linux. Running a real model needs an Apple
-Silicon Mac, because MLX is the only backend today. There, `cargo run -p estia
--- setup` installs the Python MLX runtime and the default models.
+The workspace builds on macOS and Linux (on Linux, also install a C compiler,
+`pkg-config` and the OpenSSL headers). `cargo run -p estia -- setup` installs
+the backend's runtime and the default models: MLX on an Apple Silicon Mac,
+llama.cpp everywhere else, or llama.cpp on a Mac with `--backend llama`.
 
 Pass `--data-dir <dir>` (or set `ESTIA_DATA_DIR`) to keep a development
 engine's models, tokens and config apart from an installed one.
+[docs/running-and-testing.md](docs/running-and-testing.md#running-a-development-engine-beside-an-installed-one)
+shows how, and how to check it with `scripts/smoke-test.sh`.
 
 ## Test
 
@@ -41,8 +44,9 @@ CI runs these, and a pull request must pass them:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo deny check
+cargo +1.89.0 check --workspace --all-targets --all-features --locked   # the minimum Rust version
 ```
 
 `rustfmt.toml` sets the line width. `deny.toml` sets the dependency policy:
@@ -74,6 +78,22 @@ The adapter's integration tests (`llama/tests/adapter.rs`) run against a real
 `ESTIA_LLAMA_TEST_EMBED_MODEL` are set, and skip otherwise. The `llama` job in
 `.github/workflows/ci.yml` shows where to get the pinned build and the two
 small test models.
+
+## Checking a change against a real model
+
+CI does not run a model through `estia serve`. When you change the server,
+the engine or a runner, run a development engine with a real model and the
+smoke test against it (`scripts/smoke-test.sh`; see
+[docs/running-and-testing.md](docs/running-and-testing.md#the-smoke-test)),
+and say in the pull request which backend and model it ran with, and the
+output of `estia version`.
+
+## Versions and releases
+
+[docs/versioning.md](docs/versioning.md) says what counts as a breaking
+change, when the API and protocol versions change, and how a release is made.
+Add a line under `## Unreleased` in `CHANGELOG.md` for a change users or
+client authors would notice.
 
 ## Commits and pull requests
 

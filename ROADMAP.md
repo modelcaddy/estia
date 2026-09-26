@@ -5,7 +5,7 @@ item gives the reason for it and an exit check: something anyone can run to
 see that the item is done. Plans change; [CHANGELOG.md](CHANGELOG.md) records
 what actually shipped.
 
-Last reviewed 2026-09-26, against version 0.1.0 (unreleased).
+Last reviewed 2026-09-27, against version 0.4.0 (not yet tagged).
 
 ## Where Estia is today
 
@@ -14,7 +14,7 @@ depending on it. Each limit below was checked against the code or a live run.
 
 | Area | Today |
 |---|---|
-| Platforms | Models run on Apple Silicon Macs (MLX, or llama.cpp with Metal). The llama.cpp backend should also run on Linux, but has only been exercised there by a CI job that has not run on GitHub yet. Estia does not build for Windows. Releases ship one tarball, `aarch64-apple-darwin`. |
+| Platforms | Models run on Apple Silicon Macs (MLX, or llama.cpp with Metal). The llama.cpp backend should also run on Linux, but has run there only in CI: the adapter's integration tests pass against the pinned `llama-server` on GitHub's Ubuntu 24.04 x64 runners. Estia does not build for Windows. Releases ship one tarball, `aarch64-apple-darwin`. |
 | Backend | Two. MLX, through a Python runner (`runners/mlx-python/estia-runner.py`) and a Python runtime of about 700 MB that Estia installs; `mlx-vlm` is held below 0.7 because the runner has not been run on 0.7. And llama.cpp, new: upstream `llama-server` behind the `estia-llama` adapter, with a pinned build (b11146) that Estia downloads and checks. |
 | Models | A registry of three Gemma 4 families and four embedding models, with MLX and GGUF artifacts. On llama.cpp, `estia import` adds a GGUF file without a code change. |
 | Input | Text only. Image parts become a marker such as `[image_url omitted]`. The `vision` role exists, but the runner loads Gemma with no image input. |
@@ -86,7 +86,8 @@ changes unless the operator picks the llama backend.
 
 **Progress (2026-09-27).** Slices L1 to L7 have their code. What is missing
 are the live checks that need a Gemma 4 GGUF download (3.35 GB for the
-smallest), a Linux or NVIDIA machine, or GitHub.
+smallest) or a Linux or NVIDIA machine, and the Linux and Intel macOS
+release archives.
 
 | Slice | State |
 |---|---|
@@ -96,7 +97,7 @@ smallest), a Linux or NVIDIA machine, or GitHub.
 | L4 | Built. Embeddings, fingerprints and the 422, checked with a 25 MB MiniLM. EmbeddingGemma Q8_0 (334 MB) has not been pulled, nor its dense layers checked. |
 | L5 | Built. The installer, pinned hashes and the variant probe, checked on macOS arm64. No fallback to the next build when `--list-devices` shows no GPU; no Linux or NVIDIA run. |
 | L6 | Partly. A slot is reused only by the cache key that filled it, and cache keys are per token. One slot per model, not several. |
-| L7 | Partly. The CI job is written and its steps passed on this Mac; it has not run on GitHub. No Linux or Intel macOS release archives. |
+| L7 | Partly. The `llama` CI job runs on GitHub (Ubuntu x64 with the CPU build, macOS 15 with Metal) and passed on 2026-09-26: the adapter's 6 integration tests against the pinned `llama-server`, none skipped. No Linux or Intel macOS release archives. |
 | L8, L9 | Not started. |
 
 Checked end to end on an Apple Silicon Mac with the two small test models:

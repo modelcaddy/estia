@@ -96,10 +96,17 @@ variable is `ESTIA_LOG_FORMAT`.
 Text puts the time (UTC), the level, the span, the target, the message and
 the fields on one line. Strings that came from a client (`caller`, `asked`,
 `error`, device names) are quoted and escaped, so they cannot move the
-cursor or recolour your terminal. From a live run:
+cursor or recolour your terminal. The startup line of a 0.4.0 engine, from a
+live run (paths shortened):
 
 ```text
-2026-09-26T07:28:59.878398Z  INFO estia_server: estia serving version=0.1.0 api_version=1 protocol_version=2 url=http://127.0.0.1:27321 bind=127.0.0.1:27321 auth=true lan=false advertise=false idle_unload_s=900 allowed_hosts=- data_dir=/tmp/estia-demo/data runner=/opt/estia/runners/mlx-python/estia-runner.py pid=53851
+2026-09-26T21:56:28.815248Z  INFO estia_server: estia serving version=0.4.0 commit=8642bfc4e+dirty api_version=1 protocol_version=2 url=http://127.0.0.1:27391 bind=127.0.0.1:27391 auth=true lan=false advertise=false idle_unload_s=900 allowed_hosts=- data_dir=…/data backend=mlx-python runner=…/data/engine/runners/mlx-python/estia-runner.py pid=88202
+```
+
+Lines from requests, from a live run of an earlier build (they have the same
+shape in 0.4.0):
+
+```text
 2026-09-26T07:29:11.339963Z  INFO request{request_id=204209c3ff0ef7df}: estia_engine::session: runner started model=gemma4-e2b-it-4bit-mlx pid=53949 program=/tmp/estia-demo/data/runtime/python/bin/python3
 2026-09-26T07:29:14.970672Z  INFO request{request_id=204209c3ff0ef7df}: estia_engine::resident: model loaded model=gemma4-e2b-it-4bit-mlx kind=generation load_ms=2635
 2026-09-26T07:29:15.269041Z  INFO estia_server::access: request_id=204209c3ff0ef7df method=POST path=/v1/chat/completions status=200 duration_ms=3929 peer=127.0.0.1:52593 caller="builder" asked="fast" model=gemma4-e2b-it-4bit-mlx stream=false load_ms=3630 max_tokens=16 prompt_tokens=16 cached_tokens=0 completion_tokens=2 tokens_per_s=6.7 finish=stop
@@ -111,11 +118,17 @@ cursor or recolour your terminal. From a live run:
 JSON writes one object per line. The event's fields sit at the top level
 next to `timestamp` (UTC, RFC 3339), `level`, `message` and `target`. An
 event emitted while a request was being handled also carries
-`"span": {"name": "request", "request_id": "…"}`. From a live run (paths
-shortened):
+`"span": {"name": "request", "request_id": "…"}`. The startup line of a 0.4.0
+engine (paths shortened):
 
 ```json
-{"timestamp":"2026-09-26T07:29:49.498942Z","level":"INFO","message":"estia serving","version":"0.1.0","api_version":1,"protocol_version":2,"url":"http://127.0.0.1:27321","bind":"127.0.0.1:27321","auth":true,"lan":false,"advertise":false,"idle_unload_s":60,"allowed_hosts":"-","data_dir":"/tmp/estia-demo/data","runner":"/opt/estia/runners/mlx-python/estia-runner.py","pid":54112,"target":"estia_server"}
+{"timestamp":"2026-09-26T21:57:47.670222Z","level":"INFO","message":"estia serving","version":"0.4.0","commit":"8642bfc4e+dirty","api_version":1,"protocol_version":2,"url":"http://127.0.0.1:27391","bind":"127.0.0.1:27391","auth":true,"lan":false,"advertise":false,"idle_unload_s":900,"allowed_hosts":"-","data_dir":"…/data","backend":"mlx-python","runner":"…/data/engine/runners/mlx-python/estia-runner.py","pid":88888,"target":"estia_server"}
+```
+
+Other events, from a live run of an earlier build (paths shortened; the MLX
+runner was then version 2.1.0):
+
+```json
 {"timestamp":"2026-09-26T07:29:52.035818Z","level":"INFO","message":"runner handshake","model":"gemma4-e2b-it-4bit-mlx","pid":54146,"runner":"mlx-python","runner_version":"2.1.0","protocol":2,"capabilities":"generate,stream,embed,cancel,load,chat,tools,prompt_cache,count_tokens","target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:54.259940Z","level":"INFO","message":"model loaded","model":"gemma4-e2b-it-4bit-mlx","kind":"generation","load_ms":2223,"target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:55.081943Z","level":"INFO","request_id":"json-stream-1","method":"POST","path":"/v1/chat/completions","status":200,"duration_ms":540,"peer":"127.0.0.1:52658","caller":"builder","asked":"fast","model":"gemma4-e2b-it-4bit-mlx","stream":true,"max_tokens":60,"prompt_tokens":16,"cached_tokens":0,"completion_tokens":36,"time_to_first_token_ms":144,"tokens_per_s":66.7,"finish":"stop","target":"estia_server::access"}
@@ -232,7 +245,7 @@ does not apply to the request is left out.
 
 | Event (message) | Level | Fields |
 |---|---|---|
-| `estia serving` | info | `version`, `api_version`, `protocol_version`, `url`, `bind`, `auth`, `lan`, `advertise`, `idle_unload_s`, `allowed_hosts`, `data_dir`, `runner`, `pid` |
+| `estia serving` | info | `version`, `commit`, `api_version`, `protocol_version`, `url`, `bind`, `auth`, `lan`, `advertise`, `idle_unload_s`, `allowed_hosts`, `data_dir`, `backend`, `runner`, `pid` |
 | `runner started` | info | `model`, `pid`, `program` |
 | `runner handshake` | info | `model`, `pid`, `runner`, `runner_version`, `protocol`, `capabilities` |
 | `model loaded` | info | `model`, `kind`, `load_ms` (the runner's own measure) |

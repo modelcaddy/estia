@@ -4,7 +4,7 @@ use crate::access::{spawn_blocking_in_span, Access};
 use crate::jobs::JobStatus;
 use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, runner_format, task_name, to_messages, OaiMessage};
 use crate::pairing::PairingError;
-use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION};
+use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION, BUILD_COMMIT, BUILD_DATE};
 use axum::{
     extract::{Path, State},
     response::{
@@ -75,6 +75,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "ok": true,
         "engine": "estia",
         "version": env!("CARGO_PKG_VERSION"),
+        "build": {"commit": BUILD_COMMIT, "date": BUILD_DATE},
         "api_version": API_VERSION,
         "protocol_version": estia_engine::proto::PROTOCOL_VERSION,
         "bind": state.bind.to_string(),
@@ -841,5 +842,34 @@ mod tests {
         assert_eq!(resumed.crossed(&at("downloading", 42, Some(100))), Some(40), "a resumed pull starts where it is");
         assert_eq!(PullMilestones::default().crossed(&at("downloading", 50, None)), None);
         assert_eq!(PullMilestones::default().crossed(&at("finalizing", 50, Some(100))), None);
+    }
+
+    /// Health names the build (commit and date from build.rs) beside the
+    /// version fields clients already read.
+    #[tokio::test]
+    async fn health_reports_the_build() {
+        use estia_engine::models::ModelStore;
+        use estia_engine::runtime::PythonRuntime;
+        use estia_engine::{Engine, EngineConfig};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("estia-health-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = EngineConfig::new(ModelStore::new(dir.join("models")), PythonRuntime::new(dir.join("runtime")), dir.join("no-runner.py"));
+        let tokens = crate::tokens::TokenStore::open(dir.join("tokens.json")).unwrap();
+        let state = Arc::new(crate::AppState::new(Arc::new(Engine::new(cfg)), tokens, true, "127.0.0.1:0".parse().unwrap()));
+        let axum::Json(v) = super::health(axum::extract::State(state)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["api_version"], crate::API_VERSION);
+        assert_eq!(v["protocol_version"], estia_engine::proto::PROTOCOL_VERSION);
+        assert_eq!(v["build"]["commit"], crate::BUILD_COMMIT);
+        assert_eq!(v["build"]["date"], crate::BUILD_DATE);
+        let commit = crate::BUILD_COMMIT;
+        assert!(!commit.is_empty() && !commit.contains(char::is_whitespace), "{commit:?}");
+        let date = crate::BUILD_DATE;
+        let b = date.as_bytes();
+        assert!(date == "unknown" || (b.len() == 10 && b[4] == b'-' && b[7] == b'-'), "{date:?}");
     }
 }

@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "estia"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "estia-engine"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "estia-proto",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "estia-llama"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "estia-proto",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "estia-proto"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "estia-server"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",

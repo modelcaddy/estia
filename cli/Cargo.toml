@@ -17,10 +17,10 @@ path = "src/main.rs"
 [dependencies]
 # python-mlx and llama-runtime: `estia runtime install` downloads the Python
 # MLX runtime or upstream llama.cpp's llama-server.
-estia-engine = { path = "../engine", version = "0.1.0", features = ["python-mlx", "llama-runtime"] }
+estia-engine = { path = "../engine", version = "0.4.0", features = ["python-mlx", "llama-runtime"] }
 # The llama.cpp adapter, run in-process as `estia runner llama`.
-estia-llama = { path = "../llama", version = "0.1.0" }
-estia-server = { path = "../server", version = "0.1.0" }
+estia-llama = { path = "../llama", version = "0.4.0" }
+estia-server = { path = "../server", version = "0.4.0" }
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true

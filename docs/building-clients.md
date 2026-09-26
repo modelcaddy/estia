@@ -163,7 +163,7 @@ hostname, and the TXT record has three keys:
 | Key | Meaning |
 |---|---|
 | `api_version` | Version of the `/engine/*` contract (`1`) |
-| `engine_version` | The server's version (`0.1.0`) |
+| `engine_version` | The server's version, as `version` in `/engine/health` (`0.4.0`) |
 | `protocol_version` | Runner protocol version (`2`) |
 
 ```text
@@ -171,7 +171,7 @@ $ dns-sd -B _estia._tcp
   Add  ...  local.  _estia._tcp.  MacBook-Pro-5
 $ dns-sd -L MacBook-Pro-5 _estia._tcp local.
   MacBook-Pro-5._estia._tcp.local. can be reached at MacBook-Pro-5.local.:27200
-  api_version=1 engine_version=0.1.0 protocol_version=2
+  api_version=1 engine_version=0.4.0 protocol_version=2
 ```
 
 In an app, use the platform's browser for service type `_estia._tcp`: the

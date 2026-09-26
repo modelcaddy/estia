@@ -15,7 +15,7 @@ name = "estia-llama"
 path = "src/main.rs"
 
 [dependencies]
-estia-proto = { path = "../proto", version = "0.1.0" }
+estia-proto = { path = "../proto", version = "0.4.0" }
 serde_json.workspace = true
 anyhow.workspace = true
 # The API key for llama-server.

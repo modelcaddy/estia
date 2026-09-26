@@ -312,7 +312,7 @@ request with the tail of its log, and the runner stays up.
 ### What it declares
 
 ```json
-{"ok": true, "runner": "estia-llama", "version": "0.1.0", "protocol": 2,
+{"ok": true, "runner": "estia-llama", "version": "0.4.0", "protocol": 2,
  "capabilities": {"generate": true, "stream": true, "embed": true, "cancel": true,
                   "load": true, "chat": true, "tools": true, "prompt_cache": true,
                   "count_tokens": true, "structured": ["json", "json_schema"],

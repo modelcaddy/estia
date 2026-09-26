@@ -31,9 +31,10 @@ jobs:
   test:
     # macos-15 is Apple Silicon (arm64), where the MLX backend runs. It is
     # pinned rather than macos-latest so the image cannot move under us; move
-    # it to the next version before GitHub retires this one. Linux has no
-    # backend yet, but the workspace must still build and pass its tests there.
-    # The tests drive a fake runner written in Python; both images ship python3.
+    # it to the next version before GitHub retires this one. On Linux the
+    # llama.cpp backend is the default; the llama job below runs its adapter
+    # against a real llama-server. The tests here drive a fake runner written
+    # in Python; both images ship python3.
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false

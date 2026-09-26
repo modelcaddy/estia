@@ -1,74 +1,33 @@
 # Changelog
 
-## 0.1.0 — unreleased
+Changes to Estia, newest first. [docs/versioning.md](docs/versioning.md) says
+what the numbers mean: before 1.0, a new minor version (0.4 to 0.5) may break
+things and a patch version (0.4.0 to 0.4.1) does not.
 
-First public release. Estia was developed by ModelCaddy and moved into this
-repository with its history.
+Estia was developed by ModelCaddy and moved into this repository with its
+history. The 0.1.0, 0.2.0 and 0.3.0 sections are retroactive: those versions
+were never tagged or published, and builds made before 0.4.0 report version
+0.0.1 or 0.1.0 whatever they contain. The sections group that history by
+milestone, each dated by its last commit, and use today's names (the project
+took the name Estia in 0.3.0).
 
-### Backend
+## Unreleased
 
-- MLX on Apple Silicon macOS, through a resident Python runner
-  (`runners/mlx-python/estia-runner.py`) using `mlx-vlm` for generation and
-  `mlx-embeddings` for embeddings. The default on Apple Silicon.
-- llama.cpp, new and not yet run with the Gemma 4 GGUF files: upstream
-  `llama-server` behind the `estia-llama` adapter. The default everywhere
-  else. See [llama.cpp backend](#llamacpp-backend) below.
-- Runner protocol v2: newline-delimited JSON over stdin/stdout with a `hello`
-  handshake and capabilities, `load` / `unload`, `chat` and `chat_stream`
-  rendered by the model's own chat template, a per-conversation KV cache
-  (`cache_key`), `count_tokens`, and `cancel`. v1 runners still work.
-- One-shot runners kept alongside: the older Python runner, an Apple
-  Foundation Models runner and a compiled Swift MLX runner. The CLI and server
-  do not use them.
+This will be 0.4.0, the version the workspace already carries, and the first
+public release. When it is tagged, this heading becomes `## 0.4.0 — <date>`
+(step 2 of the release checklist in [docs/versioning.md](docs/versioning.md)).
 
-### Engine (`estia-engine`)
-
-- Runner sessions with per-line deadlines, one respawn on a dead child, a
-  priority gate that serves interactive calls before background ones, and
-  cancel.
-- A built-in model registry: three Gemma 4 generation models and four
-  embedding models, grouped into families.
-- A Hugging Face downloader with resume, parallel chunks, SHA-256 checks and
-  pause, and an on-disk model store.
-- A Python runtime installer: a pinned `python-build-standalone` build plus
-  the MLX packages, installed under the data directory (feature `python-mlx`).
-- Roles (`text`, `fast`, `vision`, `code`, `embed`, and any other name) bound
-  to model families, checked against capabilities, with fallbacks.
-- Structured output: a JSON repair ladder, JSON Schema validation and a retry
-  hint.
-- Embedding fingerprints (`<model id>@<backend>`) and task prefixes per model.
-- `RemoteEngine`, `RemoteGen` and `RemoteEmbed` for using a server from Rust.
-
-### Server (`estia-server`)
-
-- OpenAI-compatible `/v1/chat/completions` (streaming, tools, `response_format`,
-  prompt cache keyed by `user`), `/v1/embeddings` and `/v1/models`.
-- Native `/engine/*` routes: health, role defaults, model list, pulls and
-  deletes with job progress over server-sent events, generation against a
-  JSON Schema, embeddings with a fingerprint check, runtime install, stats and
-  jobs.
-- Bearer tokens with scopes (`generate`, `embed`, `models:read`,
-  `models:write`, `admin`), stored as SHA-256 hashes. A running server picks
-  up tokens minted or revoked with `estia token` on the next request, without
-  a restart.
-- LAN mode with pairing (request, operator approval, one-time token pickup)
-  and Bonjour advertisement as `_estia._tcp`.
-- Idle unload of resident models (15 minutes by default).
-- A static browser test client at `/client`.
-
-### CLI (`estia`)
-
-- `setup`, `service` (launchd on macOS, systemd `--user` on Linux), `serve`,
-  `status`, `dashboard`.
-- `pair`, `discover`, `remote-check`, `token`.
-- `models`, `pull`, `rm`, `roles`, `runtime`.
-- `run`, `chat`, `embed`, `tokens`, `bench`, `runner-check`.
+The llama.cpp backend, version numbers that say which build is running, and
+a guide to running and testing Estia.
 
 ### llama.cpp backend
 
 From [docs/design/llama-backend.md](docs/design/llama-backend.md), which has
 the status of each slice and the live evidence.
 
+- **A second backend**, new and not yet run with the Gemma 4 GGUF files:
+  upstream `llama-server` behind the `estia-llama` adapter. It is the default
+  everywhere except Apple Silicon, where MLX stays the default.
 - **`estia-llama`**, a new crate: an adapter that speaks runner protocol v2 on
   stdin and stdout and runs one upstream `llama-server` per model on a private
   UNIX socket with a random API key. Streaming, cancel (the HTTP connection is
@@ -137,6 +96,83 @@ the status of each slice and the live evidence.
   schema in the prompt. The guide drops both workarounds.
 - The `/client` page names the backend, describes the right runtime, and
   leaves models the backend cannot run out of its pickers.
+
+### Versions and build information
+
+See [docs/versioning.md](docs/versioning.md).
+
+- **Version 0.4.0** for every crate in the workspace, and in the version
+  requirements between them. The history before it is numbered 0.1.0 to
+  0.3.0 in this file.
+- **`estia --version`** prints one line, `estia 0.4.0 (<commit>, <date>)`.
+- **`estia version`** prints the version, commit, build date, target and
+  build profile, the Rust compiler, the HTTP API version, the runner protocol
+  version, the backends and whether each runs on this machine, the engine
+  features, the pinned llama.cpp build and the version of the MLX runner
+  compiled into the binary. `estia version --json` prints the same as one
+  JSON object. It reads no data directory, so it works before `setup`.
+- **`/engine/health`** gains `build`, `{"commit": …, "date": …}`, the build
+  of the server that answered. The other fields are unchanged.
+- **The `estia serving` log line** gains `commit`.
+- **Where the commit comes from:** git, with `+dirty` when a compiled-in file
+  differs from the commit; `.cargo_vcs_info.json` in a crate built from its
+  published package; or `ESTIA_BUILD_COMMIT` at build time. Otherwise
+  `unknown`. `SOURCE_DATE_EPOCH` sets the date. The build never fails for
+  want of git.
+
+### Running and testing
+
+- **[docs/running-and-testing.md](docs/running-and-testing.md)**, a guide:
+  what a machine needs, installing from source or a release archive, a first
+  run with MLX on a Mac and with llama.cpp on Linux, the service, where the
+  logs are and how to follow one request by its id, testing from a phone or
+  another computer, a troubleshooting table, and the test suites and CI for
+  contributors. It says what was run for it and what was not; on Linux, only
+  CI has run.
+- **`scripts/smoke-test.sh`** checks a running engine the way a client sees
+  it: health and build, auth, models, chat, streaming, the prompt cache, JSON
+  Schema output, embeddings, the fingerprint check, the JSON 404, the `Host`
+  check and request ids (12 checks; `--quick` runs 3). It needs bash, curl
+  and python3, takes the token from `--token-file`, `--token` or
+  `ESTIA_TOKEN`, tags its requests with `X-Request-Id`s that share one prefix
+  so the engine's log lines for a run are easy to find, and exits 0 (all
+  passed), 1 (a check failed) or 2 (could not start).
+- The README gains a "Run and test" section and the `version` command; its
+  build instructions name the Linux packages (a C compiler, `pkg-config`,
+  the OpenSSL headers). `examples/README.md` points to the smoke test.
+- **Release workflow:** the packaged binary must report the tag's commit,
+  without `+dirty` (`estia version --json`), or the release stops.
+- A second `estia serve` on a data directory that already has an engine now
+  says "one engine per data directory" instead of "one engine per machine",
+  which was wrong: engines with different data directories can run side by
+  side on one machine.
+
+### Known limits
+
+[ROADMAP.md](ROADMAP.md) says which of these are planned to change.
+
+- The llama.cpp backend has run end to end only on an Apple Silicon Mac with
+  small test models. The Gemma 4 GGUF files, Linux (outside CI) and NVIDIA
+  GPUs are untested, and Estia does not build for Windows.
+- No TLS: LAN traffic, tokens included, is plain HTTP.
+- Image input is not passed through the API.
+- Role sampling settings (`temperature`, `max_tokens`, `pin`) are stored but
+  not applied.
+- A non-streaming request is not cancelled when its client disconnects, and
+  there is no time limit on reading a request body.
+
+## 0.3.0 — 2026-09-26
+
+Ready to stand alone: the Estia name, hardening, logs, examples and
+documentation.
+
+### The Estia name
+
+- Crates `estia-proto`, `estia-engine`, `estia-server` and `estia` (the
+  binary), `ESTIA_*` environment variables, the `estia_` token prefix,
+  `x_estia` in responses, `_estia._tcp` on Bonjour, the launchd label
+  `com.modelcaddy.estia` and the systemd unit `estia.service`. Tokens minted
+  before the rename still verify.
 
 ### Logging and request ids
 
@@ -208,12 +244,13 @@ Behaviour changes that come with it:
   check that closes each item.
 - [docs/design/llama-backend.md](docs/design/llama-backend.md): the design for
   a llama.cpp backend (upstream `llama-server` as a child process behind a
-  protocol-v2 adapter), now with its implementation status.
+  protocol-v2 adapter).
+- The README, [docs/api.md](docs/api.md), [docs/protocol.md](docs/protocol.md),
+  CONTRIBUTING.md and SECURITY.md, written for Estia on its own.
 
 ### Hardening before release
 
-These change behaviour for anyone who used the pre-release builds inside
-ModelCaddy.
+These change behaviour from 0.2.0.
 
 - **Host and Origin checks.** The server answers only to a `Host` that is an
   IP literal, `localhost` / `*.localhost`, a `*.local` name, this machine's
@@ -222,6 +259,9 @@ ModelCaddy.
   `Origin` is not the origin it was sent to is refused. Both are 403, on every
   route, before authentication. This closes DNS rebinding and cross-site posts
   from web pages, including against `--no-auth`.
+- **Revoked tokens.** A token revoked with `estia token revoke` kept working
+  in a running server until it restarted. The server now reads `tokens.json`
+  again whenever the file changes.
 - **Pairing names.** At most 64 characters of letters, digits, single spaces
   and `. _ - ' ’ ( )`; control, escape, invisible and bidi characters are
   refused with 400 instead of being stored and printed. Unknown scopes are
@@ -255,7 +295,8 @@ ModelCaddy.
   instead of 401; `/client/` redirects to `/client`.
 - **Runner lookup.** The CLI no longer looks for `estia-runner.py` under the
   current directory, and looks two levels above the binary only when it runs
-  from a cargo `target/<profile>/` directory.
+  from a cargo `target/<profile>/` directory. A binary with no runner beside
+  it writes the copy compiled into it to `<data_dir>/engine/runners/`.
 - **Service files.** Paths in the systemd unit are quoted and escaped; paths
   with control characters are refused for both launchd and systemd.
 - **Bonjour on macOS.** The `dns-sd` registration ends with the engine, even
@@ -268,29 +309,95 @@ ModelCaddy.
 - **Test page.** The `/client` page moved to `server/client/index.html`, inside
   the server crate that embeds it; `clients/web/index.html` links to it. The
   CLI's embedded runner is likewise `cli/estia-runner.py`, a link to
-  `runners/mlx-python/estia-runner.py`.
+  `runners/mlx-python/estia-runner.py`. On phones, fields no longer zoom the
+  page on focus and every tab fits the screen.
 - `status` hints lead with loopback (`estia serve`,
   `service install --local`); the dashboard clock shows local time.
 
 ### Distribution
 
-- A release tarball for `aarch64-apple-darwin`, built on GitHub Actions: the
-  `estia` binary, the runner scripts, `LICENSE`, `NOTICE`, `README.md` and
-  `THIRD_PARTY_LICENSES` (the licence texts of the Rust crates compiled into
-  the binary, generated by cargo-about).
+- A release workflow that builds a tarball for `aarch64-apple-darwin` on
+  GitHub Actions when a `v*` tag is pushed: the `estia` binary, the runner
+  scripts, `LICENSE`, `NOTICE`, `README.md` and `THIRD_PARTY_LICENSES` (the
+  licence texts of the Rust crates compiled into the binary, generated by
+  cargo-about).
+- CI on macOS and Linux: rustfmt, clippy, build, tests, the minimum Rust
+  version, packaging and cargo-deny.
 - Every crate carries `LICENSE`, `NOTICE` and the README.
 - Minimum supported Rust version: 1.89.
 
-### Known limits
+## 0.2.0 — 2026-09-26
 
-[ROADMAP.md](ROADMAP.md) says which of these are planned to change.
+The LAN daemon: an HTTP server over the engine, pairing, Bonjour discovery, a
+login service, and a client for remote engines. Built from 2026-09-09.
 
-- The llama.cpp backend has run end to end only on an Apple Silicon Mac with
-  small test models. The Gemma 4 GGUF files, Linux (outside CI) and NVIDIA
-  GPUs are untested, and Estia does not build for Windows.
-- No TLS: LAN traffic, tokens included, is plain HTTP.
-- Image input is not passed through the API.
-- Role sampling settings (`temperature`, `max_tokens`, `pin`) are stored but
-  not applied.
-- A non-streaming request is not cancelled when its client disconnects, and
-  there is no time limit on reading a request body.
+### Runner protocol v2
+
+- Newline-delimited JSON over stdin/stdout, as before, plus a `hello`
+  handshake with capabilities, `load` / `unload`, `chat` and `chat_stream`
+  rendered by the model's own chat template, a per-conversation KV cache
+  (`cache_key`), and `count_tokens`. v1 runners still work.
+
+### Server (`estia-server`)
+
+- OpenAI-compatible `/v1/chat/completions` (streaming, tools, `response_format`,
+  prompt cache keyed by `user`), `/v1/embeddings` and `/v1/models`.
+- Native `/engine/*` routes: health, role defaults, model list, pulls and
+  deletes with job progress over server-sent events, generation against a
+  JSON Schema, embeddings with a fingerprint check, runtime install, stats and
+  jobs.
+- Bearer tokens with scopes (`generate`, `embed`, `models:read`,
+  `models:write`, `admin`), stored as SHA-256 hashes. A running server picks
+  up tokens minted with `estia token` on the next request, without a restart.
+- LAN mode with pairing (request, operator approval, one-time token pickup)
+  and Bonjour advertisement as `_estia._tcp`.
+- Idle unload of resident models (15 minutes by default).
+- A static browser test client at `/client`.
+
+### Engine (`estia-engine`)
+
+- `RemoteEngine`, `RemoteGen` and `RemoteEmbed` for using a server from Rust.
+
+### CLI (`estia`)
+
+- `setup`, `service` (launchd on macOS, systemd `--user` on Linux), `serve`,
+  `dashboard`.
+- `pair`, `discover`, `remote-check`, `token`.
+- `chat`, `tokens`, `runner-check`.
+
+## 0.1.0 — 2026-09-08
+
+The engine and the CLI.
+
+### Backend
+
+- MLX on Apple Silicon macOS, through a resident Python runner
+  (`runners/mlx-python/estia-runner.py`) using `mlx-vlm` for generation and
+  `mlx-embeddings` for embeddings.
+- The runner protocol (version 1): newline-delimited JSON over stdin/stdout,
+  with `cancel`.
+- One-shot runners kept alongside: the older Python runner, an Apple
+  Foundation Models runner and a compiled Swift MLX runner. The CLI and server
+  do not use them.
+
+### Engine (`estia-engine`)
+
+- Runner sessions with per-line deadlines, one respawn on a dead child, a
+  priority gate that serves interactive calls before background ones, and
+  cancel.
+- A built-in model registry: three Gemma 4 generation models and four
+  embedding models, grouped into families.
+- A Hugging Face downloader with resume, parallel chunks, SHA-256 checks and
+  pause, and an on-disk model store.
+- A Python runtime installer: a pinned `python-build-standalone` build plus
+  the MLX packages, installed under the data directory (feature `python-mlx`).
+- Roles (`text`, `fast`, `vision`, `code`, `embed`, and any other name) bound
+  to model families, checked against capabilities, with fallbacks.
+- Structured output: a JSON repair ladder, JSON Schema validation and a retry
+  hint.
+- Embedding fingerprints (`<model id>@<backend>`) and task prefixes per model.
+
+### CLI (`estia`)
+
+- `status`, `models`, `pull`, `rm`, `roles`, `runtime`.
+- `run`, `embed`, `bench`.

@@ -11,7 +11,7 @@ keywords = ["llm", "inference", "openai", "embeddings", "estia"]
 categories = ["artificial-intelligence", "web-programming::http-server"]
 
 [dependencies]
-estia-engine = { path = "../engine", version = "0.1.0" }
+estia-engine = { path = "../engine", version = "0.4.0" }
 anyhow.workspace = true
 axum.workspace = true
 getrandom.workspace = true
