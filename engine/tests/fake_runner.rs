@@ -393,19 +393,22 @@ fn cancel_token_stops_a_stream_and_keeps_the_session_usable() {
     let s = spawn(&path, None);
     let token = estia_engine::CancelToken::new();
     let flip = token.clone();
-    // Cancel after the first token has landed.
+    // Cancel after the first token has landed. Time from the cancel, not from
+    // the call: the call includes starting Python, which a cold CI runner can
+    // stretch past any fixed bound.
     let mut toks = Vec::new();
-    let start = Instant::now();
+    let mut cancelled_at: Option<Instant> = None;
     let res = s.stream_with(
         &Request::GenerateStream { model_path: "/m", prompt: "p", max_tokens: None, temperature: None },
         estia_engine::Priority::Interactive,
         Some(&token),
         |t| {
             toks.push(t.to_string());
+            cancelled_at.get_or_insert_with(Instant::now);
             flip.cancel();
         },
     );
-    let elapsed = start.elapsed();
+    let elapsed = cancelled_at.expect("a token arrived before the cancel").elapsed();
     match res {
         Err(SessionError::Cancelled { partial }) => {
             assert_eq!(partial, "one ", "partial text is what was delivered");
@@ -413,7 +416,8 @@ fn cancel_token_stops_a_stream_and_keeps_the_session_usable() {
         other => panic!("expected Cancelled, got {other:?}"),
     }
     assert_eq!(toks, vec!["one "]);
-    assert!(elapsed < Duration::from_millis(900), "cancel must not wait for the full stream: {elapsed:?}");
+    // The rest of the stream would take 900 ms; the runner checks for cancel every 50 ms.
+    assert!(elapsed < Duration::from_millis(600), "cancel must not wait for the full stream: {elapsed:?}");
 
     // The session is not desynced: the next call gets its own answer.
     let g: GenerateResp =
