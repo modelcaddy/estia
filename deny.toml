@@ -1,0 +1,55 @@
+# cargo-deny policy. Run with `cargo deny check`. CI runs it on pushes to main
+# and on pull requests.
+#
+# Estia is Apache-2.0, and closed-source applications embed it. So the
+# dependency graph must stay permissive: no copyleft licence (GPL, AGPL, LGPL,
+# MPL, EPL, CDDL, ...) may enter it. cargo-deny refuses every licence that is
+# not in `allow` below, so copyleft is denied by leaving it out. Do not add a
+# copyleft licence here, or an exception for a copyleft crate.
+
+[graph]
+# Check every feature, so optional dependencies (python-mlx) are covered too.
+all-features = true
+
+[advisories]
+# Every RustSec vulnerability is an error. Also fail on yanked versions and on
+# unmaintained or unsound crates anywhere in the graph.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+# The list is a policy, not an inventory: a permissive licence no current
+# dependency uses is fine to keep.
+unused-allowed-license = "allow"
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+# Also applies to the workspace's own path dependencies: give each one a
+# `version` as well, which crates.io needs anyway.
+wildcards = "deny"
+deny = []
+
+[sources]
+# crates.io only. A git or other-registry dependency needs a deliberate entry.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

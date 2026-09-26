@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# Staged runner binaries. They are built on demand, never committed.
+/runners/apple/estia-apple-runner
+/runners/estia-mlx-swift
+/runners/mlx-swift/estia-mlx-swift
+/runners/mlx-swift/*.bundle
+
+# SwiftPM / Xcode build output (runners/mlx-swift/.gitignore covers it too)
+.build/
+.xcode-build/
+DerivedData/
+*.dSYM/
+
+# Release packaging (release.yml, or a local run of the same steps)
+/dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

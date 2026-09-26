@@ -1,0 +1,23 @@
+[package]
+name = "estia-server"
+description = "Estia HTTP server: OpenAI-compatible /v1/* plus native /engine/* routes over the engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+estia-engine = { path = "../engine", version = "0.1.0" }
+anyhow.workspace = true
+axum.workspace = true
+getrandom.workspace = true
+mdns-sd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio-stream.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }

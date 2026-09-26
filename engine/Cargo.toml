@@ -1,0 +1,31 @@
+[package]
+name = "estia-engine"
+description = "Estia inference engine: runner sessions, model management, roles, structured output."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+estia-proto = { path = "../proto", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Model downloads (models::hf). The download and install paths use anyhow for
+# their error contexts; the session layer stays on typed errors.
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+sha2 = "0.10"
+# JSON Schema validation for structured output (structured::enforce).
+jsonschema = { version = "0.26", default-features = false }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util", "macros", "sync", "time", "process"] }
+# Python MLX backend runtime installer (runtime::python): unpacks a
+# python-build-standalone tarball. Optional so a build that must not download
+# executable code (for example a sandboxed, store-distributed app) contains none of it.
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+
+[features]
+default = []
+# The downloaded-Python + mlx runtime installer.
+python-mlx = ["dep:flate2", "dep:tar"]

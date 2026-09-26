@@ -1,0 +1,87 @@
+name: Release
+
+# Push a tag like v0.1.0 to publish a release. The tag must match the version
+# in the workspace Cargo.toml, or the job stops before building.
+#
+# Artifacts: aarch64-apple-darwin only. MLX, the only backend today, needs
+# Apple Silicon, so there is no Intel macOS build. There are no Linux or
+# Windows artifacts yet: those platforms need the planned llama.cpp backend.
+#
+# The binary is not signed with a Developer ID or notarized. macOS blocks a
+# quarantined download (one saved by a browser) until the quarantine attribute
+# is removed; a download made with curl is not quarantined.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-arm64:
+    name: aarch64-apple-darwin
+    runs-on: macos-14
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+
+      - name: Check the tag against the crate version
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "estia") | .version')"
+          if [ "$tag" != "$crate" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match the estia crate version $crate." >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked -p estia --target "$TARGET"
+
+      # Layout inside the tarball:
+      #   estia-<version>-aarch64-apple-darwin/
+      #     estia
+      #     runners/mlx-python/*.py
+      #     LICENSE  NOTICE  README.md
+      # The binary looks for runners/mlx-python/estia-runner.py beside itself
+      # (find_runner in cli/src/main.rs), which is also the layout that
+      # `estia service install` stages.
+      - name: Package
+        id: package
+        run: |
+          name="estia-${{ steps.version.outputs.version }}-$TARGET"
+          stage="dist/$name"
+          mkdir -p "$stage/runners/mlx-python"
+          cp "target/$TARGET/release/estia" "$stage/"
+          cp runners/mlx-python/*.py "$stage/runners/mlx-python/"
+          cp LICENSE NOTICE README.md "$stage/"
+          # COPYFILE_DISABLE keeps macOS tar from adding ._ metadata files.
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Check the packaged binary finds its runner
+        run: |
+          dir="dist/${{ steps.package.outputs.name }}"
+          "$dir/estia" --version
+          "$dir/estia" --data-dir "$RUNNER_TEMP/estia-smoke" status | tee "$RUNNER_TEMP/status.txt"
+          grep -q "runners/mlx-python/estia-runner.py" "$RUNNER_TEMP/status.txt"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

@@ -1,0 +1,5 @@
+# Wide lines, and rustfmt keeps a call, chain or struct literal on one line
+# whenever it fits in max_width. This matches most of the existing code.
+edition = "2021"
+max_width = 140
+use_small_heuristics = "Max"

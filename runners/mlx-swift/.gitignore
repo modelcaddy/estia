@@ -1,0 +1,5 @@
+# SwiftPM / xcodebuild artifacts — never commit (huge, machine-specific)
+.build/
+.xcode-build/
+*.dSYM/
+DerivedData/
