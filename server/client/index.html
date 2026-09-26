@@ -17,6 +17,7 @@
   }
 }
 * { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; }
 header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
 header h1 { font-size: 15px; margin: 0; font-weight: 650; }
@@ -64,7 +65,17 @@ th { color: var(--mute); font-weight: 500; font-size: 12px; }
 #log div { padding: 2px 0; border-bottom: 1px dashed var(--line); }
 .chips label { display: inline-flex; gap: 4px; align-items: center; margin-right: 12px; }
 .note { color: var(--mute); font-size: 13px; margin: 6px 0 0; }
-@media (max-width: 600px) { .row > label { min-width: 100%; } main { padding: 12px; } }
+input, select, textarea, button { max-width: 100%; }
+button { touch-action: manipulation; }
+@media (max-width: 600px) {
+  .row > label { min-width: 100%; } main { padding: 12px; }
+  nav { padding: 0 8px; } nav button { padding: 10px 7px; }
+}
+/* iOS Safari zooms into any focused field under 16px and leaves the page
+   zoomed, which breaks the layout; phones and tablets get 16px fields. */
+@media (max-width: 600px), (pointer: coarse) {
+  input[type=text], input[type=password], input[type=number], select, textarea { font-size: 16px; }
+}
 </style>
 </head>
 <body>
