@@ -153,6 +153,18 @@ impl Adapter {
         }
     }
 
+    /// The next line that is not a keepalive. A cold model load (a slow CI
+    /// machine, or macOS checking a freshly unpacked binary) sends keepalives
+    /// before the first token.
+    fn recv_event(&self, within: Duration) -> Value {
+        loop {
+            let v = self.recv(within);
+            if v["type"] != "keepalive" {
+                return v;
+            }
+        }
+    }
+
     fn call(&mut self, v: Value) -> Value {
         let slow = matches!(v["type"].as_str(), Some("load" | "embed_batch" | "embed" | "count_tokens"));
         self.send(&v);
@@ -373,7 +385,7 @@ fn cancel_ends_a_long_stream_and_sigterm_cleans_up() {
     req["type"] = json!("chat_stream");
     req["messages"] = user("Count from one to one thousand, in words.");
     ad.send(&req);
-    let first = ad.recv(LOAD);
+    let first = ad.recv_event(LOAD);
     assert_eq!(first["type"], "token", "{first}");
     ad.send(&json!({"type": "cancel"}));
     let cancelled_at = Instant::now();

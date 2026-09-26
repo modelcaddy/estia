@@ -151,7 +151,7 @@ pub(crate) fn choose_endpoint(run_dir: &Path, pid: u32) -> io::Result<(Endpoint,
         if sock.as_os_str().len() <= MAX_SOCKET_PATH {
             return Ok((Endpoint::Unix(sock), None));
         }
-        let dir = std::env::temp_dir().join(format!("estia-llama-{pid}-{}", &random_hex(4)?));
+        let dir = std::env::temp_dir().join(format!("estia-llama-{pid}-{}", random_hex(4)?));
         let sock = dir.join(format!("llama-{pid}.sock"));
         if sock.as_os_str().len() <= MAX_SOCKET_PATH {
             make_private_dir(&dir)?;
