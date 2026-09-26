@@ -2,6 +2,7 @@
 //! to the engine. Extra engine facts ride in an `x_estia` field the client can
 //! ignore.
 
+use crate::access::{spawn_blocking_in_span, Access};
 use crate::engine_api::{capped_max_tokens, check_embed_inputs};
 use crate::{derive_cache_key, toolcalls, ApiError, AppState, Caller};
 use axum::{
@@ -189,26 +190,45 @@ pub async fn chat_completions(
     let prio = priority_of(&req.priority);
     let backend = state.embed_backend();
     let stream = req.stream.unwrap_or(false);
+    let access = Access::current();
+    if let Some(a) = &access {
+        a.generation(&req.model, artifact.id, stream, max_tokens);
+    }
 
     let st = Arc::clone(&state);
-    let session = tokio::task::spawn_blocking(move || st.gen_session(artifact)).await??;
+    let (session, load_ms) = spawn_blocking_in_span(move || st.gen_session_timed(artifact)).await??;
+    if let (Some(a), Some(ms)) = (&access, load_ms) {
+        a.loaded(ms);
+    }
 
     if !stream {
         let s = Arc::clone(&session);
         let (msgs, tls, ck, fmt) = (messages.clone(), tools.clone(), cache_key.clone(), format.clone());
-        let finished: Finished = tokio::task::spawn_blocking(move || -> Result<Finished, ApiError> {
+        let acc = access.clone();
+        let finished: Finished = spawn_blocking_in_span(move || -> Result<Finished, ApiError> {
             let t0 = Instant::now();
-            let mut out = s.chat_with(&msgs, tls.as_deref(), Some(&ck), None, Some(max_tokens), Some(temperature), prio)?;
+            let call = |m: &[Message]| {
+                if let Some(a) = &acc {
+                    a.call_start();
+                }
+                let out = s.chat_with(m, tls.as_deref(), Some(&ck), None, Some(max_tokens), Some(temperature), prio)?;
+                if let Some(a) = &acc {
+                    a.call_end(Some(&out.meta));
+                }
+                Ok::<_, ApiError>(out)
+            };
+            let mut out = call(&msgs)?;
             let mut structured = None;
             if fmt.wants_json() {
                 structured = Some(match structured::enforce(&out.text, &fmt) {
                     Ok(v) => v,
                     Err(first_err) => {
                         // One retry with the validator's complaint appended.
+                        tracing::debug!("structured output did not validate; retrying once");
                         let mut retry = msgs.clone();
                         retry.push(Message::new("assistant", out.text.clone()));
                         retry.push(Message::new("user", Structured::retry_hint(&first_err).trim().to_string()));
-                        out = s.chat_with(&retry, tls.as_deref(), Some(&ck), None, Some(max_tokens), Some(temperature), prio)?;
+                        out = call(&retry)?;
                         structured::enforce(&out.text, &fmt)
                             .map_err(|e| ApiError::unprocessable(format!("structured output failed after retry: {e}")))?
                     }
@@ -222,6 +242,9 @@ pub async fn chat_completions(
             Ok(Finished { text: out.text, tool_calls, structured, meta: out.meta, ms: t0.elapsed().as_millis() })
         })
         .await??;
+        if let Some(a) = &access {
+            a.finish(finish_reason(&finished));
+        }
 
         let content: Value = match &finished.structured {
             Some(s) if !finished.tool_calls.is_empty() => Value::String(s.value.to_string()),
@@ -255,7 +278,9 @@ pub async fn chat_completions(
     let wants_json = format.wants_json();
     let has_tools = tools.is_some();
     let s = Arc::clone(&session);
-    tokio::task::spawn_blocking(move || {
+    let acc = access.clone();
+    let request_id = access.as_ref().map(|a| a.id().to_string());
+    spawn_blocking_in_span(move || {
         let chunk = |delta: Value, finish: Option<&str>, extra: Option<Value>| -> Value {
             let mut v = json!({
                 "id": id, "object": "chat.completion.chunk", "created": created, "model": model_id,
@@ -286,6 +311,10 @@ pub async fn chat_completions(
             decided = Some(true);
         }
         let t0 = Instant::now();
+        if let Some(a) = &acc {
+            a.call_start();
+        }
+        let mut first = true;
         let result = s.chat_stream_with(
             &messages,
             tools.as_deref(),
@@ -295,24 +324,31 @@ pub async fn chat_completions(
             Some(temperature),
             prio,
             Some(&cancel),
-            |tok| match decided {
-                Some(true) => {
-                    if !send(chunk(json!({"content": tok}), None, None)) {
-                        flip.cancel();
+            |tok| {
+                if std::mem::take(&mut first) {
+                    if let Some(a) = &acc {
+                        a.token();
                     }
                 }
-                Some(false) => buffered.push_str(tok),
-                None => {
-                    buffered.push_str(tok);
-                    let head = buffered.trim_start();
-                    if head.len() >= 12 || head.starts_with("<|tool") || head.starts_with('{') {
-                        let looks_like_call = head.starts_with("<|tool") || head.starts_with("{\"tool") || head.starts_with("{\"name");
-                        if looks_like_call {
-                            decided = Some(false);
-                        } else {
-                            decided = Some(true);
-                            if !send(chunk(json!({"content": buffered.clone()}), None, None)) {
-                                flip.cancel();
+                match decided {
+                    Some(true) => {
+                        if !send(chunk(json!({"content": tok}), None, None)) {
+                            flip.cancel();
+                        }
+                    }
+                    Some(false) => buffered.push_str(tok),
+                    None => {
+                        buffered.push_str(tok);
+                        let head = buffered.trim_start();
+                        if head.len() >= 12 || head.starts_with("<|tool") || head.starts_with('{') {
+                            let looks_like_call = head.starts_with("<|tool") || head.starts_with("{\"tool") || head.starts_with("{\"name");
+                            if looks_like_call {
+                                decided = Some(false);
+                            } else {
+                                decided = Some(true);
+                                if !send(chunk(json!({"content": buffered.clone()}), None, None)) {
+                                    flip.cancel();
+                                }
                             }
                         }
                     }
@@ -320,8 +356,19 @@ pub async fn chat_completions(
             },
         );
         let ms = t0.elapsed().as_millis();
+        // Our hold on the access record goes before the stream ends (the
+        // sender drops with this closure), so the response body is normally
+        // the last holder and the line is written as the response finishes.
+        let settle = |acc: Option<Access>, f: &dyn Fn(&Access)| {
+            if let Some(a) = acc {
+                f(&a);
+            }
+        };
         match result {
             Ok(outcome) => {
+                if let Some(a) = &acc {
+                    a.call_end(Some(&outcome.meta));
+                }
                 let full = outcome.text;
                 let mut finish = "stop";
                 let mut final_delta = json!({});
@@ -339,8 +386,10 @@ pub async fn chat_completions(
                         match structured::enforce(&full, &format) {
                             Ok(sv) => final_delta = json!({"content": sv.value.to_string()}),
                             Err(e) => {
+                                // The message quotes the output, so the log gets a fixed one.
+                                settle(acc, &|a| a.failed("structured output failed validation"));
                                 let _ = send(
-                                    json!({"error": {"message": format!("structured output failed: {e}"), "type": "invalid_request_error"}}),
+                                    json!({"error": {"message": format!("structured output failed: {e}"), "type": "invalid_request_error", "request_id": request_id}}),
                                 );
                                 let _ = tx.send(Ok(Event::default().data("[DONE]")));
                                 return;
@@ -350,15 +399,18 @@ pub async fn chat_completions(
                         final_delta = json!({"content": full});
                     }
                 }
+                settle(acc, &|a| a.finish(finish));
                 let extra = json!({"usage": usage(&outcome.meta), "x_estia": {"cached_tokens": outcome.meta.cached_tokens, "template": outcome.meta.template, "ms": ms}});
                 let _ = send(chunk(final_delta, Some(finish), Some(extra)));
                 let _ = tx.send(Ok(Event::default().data("[DONE]")));
             }
             Err(estia_engine::SessionError::Cancelled { .. }) => {
                 // Client went away; nothing to tell it.
+                settle(acc, &|a| a.finish("cancelled"));
             }
             Err(e) => {
-                let _ = send(json!({"error": {"message": e.to_string(), "type": "server_error"}}));
+                settle(acc, &|a| a.failed(&e.to_string()));
+                let _ = send(json!({"error": {"message": e.to_string(), "type": "server_error", "request_id": request_id}}));
                 let _ = tx.send(Ok(Event::default().data("[DONE]")));
             }
         }
@@ -418,6 +470,10 @@ pub(crate) fn inputs_of(v: &Value) -> Result<Vec<String>, ApiError> {
 pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<EmbeddingsRequest>) -> Result<Response, ApiError> {
     let model = state.resolve_embedding(Some(&req.model))?;
     let inputs = inputs_of(&req.input)?;
+    let access = Access::current();
+    if let Some(a) = &access {
+        a.embedding(&req.model, model.id, inputs.len(), model.dims);
+    }
     if inputs.is_empty() {
         return Err(ApiError::bad_request("input must not be empty"));
     }
@@ -434,11 +490,14 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<Embe
     let prio = priority_of(&req.priority);
     let st = Arc::clone(&state);
     let prefixed = apply_prefix(model, task, &inputs);
-    let vectors = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, ApiError> {
-        let session = st.embed_session(model)?;
-        Ok(session.embed_batch_with(&prefixed, prio)?)
+    let (vectors, load_ms) = spawn_blocking_in_span(move || -> Result<(Vec<Vec<f32>>, Option<u64>), ApiError> {
+        let (session, load_ms) = st.embed_session_timed(model)?;
+        Ok((session.embed_batch_with(&prefixed, prio)?, load_ms))
     })
     .await??;
+    if let (Some(a), Some(ms)) = (&access, load_ms) {
+        a.loaded(ms);
+    }
     let data: Vec<Value> = vectors.iter().enumerate().map(|(i, v)| json!({"object": "embedding", "index": i, "embedding": v})).collect();
     Ok(Json(json!({
         "object": "list",

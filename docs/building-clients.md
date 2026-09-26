@@ -1,0 +1,578 @@
+# Building on Estia
+
+This guide is for developers who want to put their own app, assistant or tool
+on top of an Estia engine. It explains what a client needs to know, with a
+short snippet for each idea and a link to a complete example in
+[`examples/`](../examples/README.md). Every example runs against a live
+engine.
+
+The full request and response shapes are in [api.md](api.md).
+
+## Start here
+
+1. Run the engine: `estia serve` (or `estia service install --local`).
+2. Mint a token for your app with only the scopes it needs:
+   `estia token new myapp --scopes generate,embed,models:read`.
+   It prints the token once.
+3. Point any OpenAI SDK at `http://127.0.0.1:27200/v1` with the token as the
+   API key.
+4. Send a role such as `fast`, `text` or `embed` as the model.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:27200/v1", api_key=os.environ["ESTIA_TOKEN"])
+r = client.chat.completions.create(model="fast", messages=[{"role": "user", "content": "Name one sea."}])
+print(r.choices[0].message.content)
+```
+
+The first request to a model starts a runner and loads the weights, which
+takes a few seconds. Later requests reuse it. The engine unloads a model after
+15 idle minutes by default (`estia serve --idle-unload-minutes`), so the next
+request pays the load again.
+
+## Two APIs on one port
+
+| | `/v1/*` | `/engine/*` |
+|---|---|---|
+| Shape | OpenAI's | Estia's own |
+| Use it for | chat, embeddings and model lists through any OpenAI SDK | health, pairing, model downloads, role table, stats, and generation or embedding with the engine's facts at the top level |
+| Estia facts | in an `x_estia` object that standard clients can ignore | top-level fields (`fingerprint`, `attempts`, `json`, `meta`) |
+
+Most apps use `/v1/*` for inference and `/engine/health` plus pairing from
+`/engine/*`. `/engine/health` needs no token and reports `api_version`
+(currently `1`); check it before anything else.
+
+## Roles, not model ids
+
+A role is a name you send as `model`. The operator binds each role to a model
+family (`estia roles set fast gemma4-e2b`), so your app keeps working when the
+operator swaps a model.
+
+| Role | Default family | When unbound |
+|---|---|---|
+| `text` | `gemma4-e4b` | error |
+| `fast` | `gemma4-e2b` | falls back to `text` |
+| `vision` | `gemma4-e4b` | falls back to `text` |
+| `code` | none | falls back to `text` |
+| `embed` | `embeddinggemma-300m-4bit` (fixed) | cannot be rebound yet |
+
+`model` also accepts a family (`gemma4-e2b`) or an artifact id
+(`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family, and a family
+over a role. Prefer roles: an artifact id ties your app to one download, and
+fails with 404 on an engine that does not have it.
+
+The response tells you what answered: `model` is the artifact id and
+`x_estia.family` the family. `GET /v1/models` lists the role table first, each
+entry with `"x_estia": {"role": true, "family": …}`. An unknown role is a 404:
+
+```json
+{"error": {"code": 404, "message": "unknown model `writer`: role `writer` is not bound and has no fallback", "type": "not_found_error"}}
+```
+
+Examples: the chat examples read `ESTIA_MODEL` and default to `fast`.
+
+## Tokens and scopes
+
+Every route except `/engine/health`, the two pairing routes and `/client`
+needs `Authorization: Bearer <token>`, on loopback too.
+
+| Scope | Allows |
+|---|---|
+| `generate` | `/v1/chat/completions`, `/engine/generate` |
+| `embed` | `/v1/embeddings`, `/engine/embed` |
+| `models:read` | `/v1/models`, `/engine/models`, `/engine/defaults`, stats, jobs |
+| `models:write` | model downloads and deletes |
+| `admin` | everything, including roles, runtime install and pairing decisions |
+
+Give each app its own token with the least it needs. A chat app needs
+`generate`; a search indexer needs `embed`. Named tokens can be revoked one by
+one without touching other apps:
+
+```bash
+estia token new notes-app --scopes embed,generate
+estia token revoke notes-app              # refused from its next request
+estia token new notes-app --replace       # rotate: the old token stops working now
+```
+
+`estia token new` prints only the token, so
+`export ESTIA_TOKEN=$(estia token new myapp --scopes generate)` works. Keep
+tokens out of source code: read them from the environment, a file with mode
+0600, or the platform's keychain.
+
+A missing or unknown token is 401 (`authentication_error`). A valid token
+without the scope is 403 (`permission_error`, "token lacks the `generate`
+scope"). A running engine picks up tokens minted or revoked with
+`estia token` on the next request, without a restart.
+
+Examples: each example names its scopes at the top and exits with a clear
+message when `ESTIA_TOKEN` is missing, unknown or lacks a scope.
+
+## Pairing, for apps on other devices
+
+An app on a phone, tablet or another computer cannot run `estia token new`.
+It pairs instead: it asks for a token, the operator approves on the engine's
+machine, and the app collects the token once.
+
+```text
+POST /engine/pair {"name": "kitchen tablet", "scopes": ["generate"]}
+  → 202 {"id": "bb706d7dccbe7777", "status": "pending", "expires_in": 300, ...}
+GET /engine/pair/bb706d7dccbe7777 → {"status": "pending", "token": null}
+        operator: estia pair approve bb706d7dccbe7777
+GET /engine/pair/bb706d7dccbe7777 → {"status": "approved", "token": "estia_..."}   (once)
+GET /engine/pair/bb706d7dccbe7777 → {"status": "approved", "token": null}
+```
+
+What your app should do:
+
+- Ask for the smallest set of scopes. The operator sees them before approving,
+  and `estia pair approve` refuses `admin` without `--allow-admin`.
+- Use a name the operator will recognise: at most 64 letters, digits, single
+  spaces and `. _ - ' ’ ( )`. Anything else is a 400.
+- Show the pairing id and the approve command, then poll every 2 seconds or so.
+- Save the token the moment it arrives. It is handed out exactly once. Store it
+  in the keychain, or in a file created with mode 0600.
+- Handle the outcomes: `denied`; a 404 after about 5 minutes, when the request
+  has expired; 429 when 24 requests are pending, or 4 from your address; 500
+  when the engine could not read or write its pairing file (poll again).
+
+If the operator later denies the pairing, the token is revoked and your app
+gets 401. Treat 401 as "pair again".
+
+Examples: [`python/pair.py`](../examples/python/pair.py) (standard library
+only), [`remote_client.rs`](../engine/examples/remote_client.rs) with
+`--pair`.
+
+## Finding an engine on the network
+
+A LAN engine (`estia serve --lan` or `estia service install`) advertises the
+Bonjour service `_estia._tcp`. The instance name is the machine's short
+hostname, and the TXT record has three keys:
+
+| Key | Meaning |
+|---|---|
+| `api_version` | Version of the `/engine/*` contract (`1`) |
+| `engine_version` | The server's version (`0.1.0`) |
+| `protocol_version` | Runner protocol version (`2`) |
+
+```text
+$ dns-sd -B _estia._tcp
+  Add  ...  local.  _estia._tcp.  MacBook-Pro-5
+$ dns-sd -L MacBook-Pro-5 _estia._tcp local.
+  MacBook-Pro-5._estia._tcp.local. can be reached at MacBook-Pro-5.local.:27200
+  api_version=1 engine_version=0.1.0 protocol_version=2
+```
+
+In an app, use the platform's browser for service type `_estia._tcp`: the
+Network framework on Apple platforms, `NsdManager` on Android, a Zeroconf
+library elsewhere. Check `api_version` before pairing. Discovery is a
+convenience: always let the user type an address too, since `estia status`
+prints the URL and pairing by address always works.
+
+## The prompt cache
+
+The runner keeps each conversation's KV cache, so a conversation that grows by
+appending only prefills its new turn. Send a stable conversation id as `user`
+on `/v1/chat/completions` (`cache_key` on `/engine/generate`):
+
+```python
+conversation_id = f"chat-{uuid.uuid4().hex[:12]}"   # one per conversation, reused every turn
+r = client.chat.completions.create(model="fast", messages=history, user=conversation_id)
+print(r.usage.prompt_tokens_details.cached_tokens)  # also in x_estia.cached_tokens
+```
+
+In a run of `examples/python/chat.py` on `gemma4-e2b`, the second turn had 78
+prompt tokens, 64 of them served from the cache.
+
+Rules that follow from how it works:
+
+- Append to the history. Editing or reordering earlier turns breaks the shared
+  prefix and the turn prefills from scratch.
+- The cache belongs to your token. The engine mixes a hash of the caller's
+  token into the key, so two apps sending the same `user` never share an
+  entry, and `cached_tokens` cannot reveal another client's conversation.
+- Without `user`, the engine derives a key from the model, the leading system
+  messages and the first user message. Two of your conversations that open the
+  same way then share one entry. Send `user`.
+- The runner keeps a small number of conversation caches per loaded model (8
+  today), least recently used out first. An idle unload or a runner restart
+  drops them all. A cancelled turn may leave nothing to reuse; in our runs the
+  turn after a cancel prefilled from scratch.
+
+Examples: [`python/chat.py`](../examples/python/chat.py),
+[`javascript/chat.mjs`](../examples/javascript/chat.mjs),
+[`curl/quickstart.sh`](../examples/curl/quickstart.sh) steps 3 and 4.
+
+## Streaming and cancelling
+
+`"stream": true` on `/v1/chat/completions` returns server-sent events: one
+`data: {...}` line per piece, then `data: [DONE]`. The last chunk before
+`[DONE]` carries `finish_reason`, `usage` and `x_estia`
+(`cached_tokens`, `template`, `ms`).
+
+To cancel, close the connection. The engine sees the client go and stops the
+generation in the runner, so the next request does not wait behind it.
+
+```python
+stream = client.chat.completions.create(model="fast", messages=history, stream=True, user=conversation_id)
+try:
+    for chunk in stream:
+        ...
+except KeyboardInterrupt:
+    stream.close()          # closes the connection; the engine cancels
+```
+
+In JavaScript, call `stream.controller.abort()`. With openai-node 6 the
+`for await` loop then ends without throwing, so check
+`stream.controller.signal.aborted` afterwards. In Rust, flip a `CancelToken`.
+
+With `tools` declared, the engine holds the first characters back to tell a
+tool call from prose; a tool call arrives whole in the final chunk. JSON output
+(`response_format`) is also sent in the final chunk. If a stream fails after
+it started, it ends with a `data: {"error": {"message", "type", "request_id"}}`
+event and `data: [DONE]`; the Python SDK raises that as `openai.APIError`.
+
+Only streams can be cancelled. A non-streaming request keeps running in the
+runner after its client disconnects, and the next call to that model waits for
+it. If a person may give up on a long answer, stream it.
+
+`/engine/generate` streams differently: `{"token": "…"}` events, then one
+`{"done": true, "text": …, "meta": …}` or `{"error": "…"}`, with no `[DONE]`.
+
+Examples: all chat examples cancel on Ctrl-C;
+[`remote_client.rs`](../engine/examples/remote_client.rs) cancels with a
+`CancelToken`.
+
+## Structured output
+
+Ask for JSON that matches a schema with `response_format`:
+
+```python
+r = client.chat.completions.create(
+    model="fast",
+    messages=[{"role": "system", "content": "Answer with one JSON object matching this JSON Schema: " + json.dumps(schema)},
+              {"role": "user", "content": text}],
+    response_format={"type": "json_schema", "json_schema": {"name": "event", "schema": schema}},
+)
+event = json.loads(r.choices[0].message.content)
+```
+
+The MLX backend cannot constrain decoding, so the engine enforces the schema
+after generation: it parses the output, repairs common defects (code fences,
+preambles, bad escapes, unescaped quotes), validates, and retries once with the
+validator's complaint. `x_estia.repaired` and `x_estia.repairs` say what it
+fixed.
+
+**Put the schema in your prompt.** The engine validates against the schema but
+does not show it to the model. Without the schema in the prompt the model
+guesses field names. In our runs with `gemma4-e2b`, the event extraction in
+`structured.py` failed validation twice out of two without the schema in the
+prompt, and passed twice out of two with it.
+
+When the output still does not validate, the answer is a 422 with type
+`invalid_request_error` and a message that starts with
+`structured output failed after retry:` and lists the problems. The Python SDK
+raises `openai.UnprocessableEntityError`. Retrying the same request rarely
+helps: simplify the schema, give an example in the prompt, try a larger role,
+or fall back to text. A streamed JSON request gets no retry.
+
+`/engine/generate` takes the same object as `format`, retries up to
+`max_attempts` (1 to 3, default 2), and returns the parsed value as `json`
+with `attempts`.
+
+Examples: [`python/structured.py`](../examples/python/structured.py)
+(`--impossible` shows the 422), `quickstart.sh` steps 8 and 10,
+[`in_process.rs`](../engine/examples/in_process.rs).
+
+## Tools
+
+Declare tools with OpenAI tool schemas. The model answers in its own call
+syntax and the engine turns it into `tool_calls` with
+`finish_reason: "tool_calls"`. Your code runs the function and sends the
+result back.
+
+```python
+r = client.chat.completions.create(model="fast", messages=messages, tools=TOOLS)
+msg = r.choices[0].message
+if msg.tool_calls:
+    messages.append({"role": "assistant", "content": msg.content or "",
+                     "tool_calls": [c.model_dump() for c in msg.tool_calls]})
+    for call in msg.tool_calls:
+        result = FUNCTIONS[call.function.name](**json.loads(call.function.arguments))
+        messages.append({"role": "user", "content": f"Result of {call.function.name}: {json.dumps(result)}"})
+    # ...and ask again with the longer history
+```
+
+Send the result as a **user** message. With the Gemma models, a
+`{"role": "tool"}` message is dropped before the model sees it: the engine
+passes an assistant's `tool_calls` to the model as text, and Gemma's chat
+template renders a tool message only after a structured `tool_calls`. The
+model then answers with an empty reply. This is a current limitation, not the
+intended behaviour.
+
+`tool_choice` is accepted and ignored. Bound the loop (the example stops after
+4 steps), and decide in your code which calls to run: only tools you declare
+can be called, and nothing runs on the engine.
+
+Examples: [`python/tools.py`](../examples/python/tools.py), `quickstart.sh`
+step 9.
+
+## Embeddings
+
+```python
+docs = client.embeddings.create(model="embed", input=passages, encoding_format="float",
+                                extra_body={"task": "document", "priority": "background"})
+fingerprint = docs.model_extra["x_estia"]["fingerprint"]    # store it with the vectors
+query = client.embeddings.create(model="embed", input=[question], encoding_format="float",
+                                 extra_body={"task": "query", "expect_fingerprint": fingerprint})
+```
+
+**Task prefixes.** Embedding models expect a different prefix for what you
+store and what you search with. Send `task: "document"` when indexing and
+`task: "query"` when searching; the engine adds the model's own prefix.
+`document` is the default, so a query sent without `task` is embedded as a
+document. `clustering` exists too, and `none` sends your text unchanged, for
+clients that add prefixes themselves (`RemoteEngine` does).
+
+**Fingerprints.** Every response carries a fingerprint, `<model id>@<backend>`,
+for example `embeddinggemma-300m-4bit@mlx-python`. Vectors with different
+fingerprints cannot be compared, even for the same model on two backends.
+Store the fingerprint with your index and send it back as
+`expect_fingerprint`. If the engine would produce different vectors, it
+answers 422 before doing any work:
+
+```text
+fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `embeddinggemma-300m-4bit@mlx-swift` — re-embed before mixing
+```
+
+**Re-embedding.** Any change of embedding model or backend on the host changes
+the fingerprint. On that 422, rebuild the index from your source texts with
+the new fingerprint, then switch to it. Keep the source texts, not only the
+vectors. `GET /engine/models` lists each embedding model's `fingerprint`, so
+an app can check before it searches.
+
+Other facts: at most 256 inputs per request (more is a 400, so batch);
+vectors are float arrays whatever `encoding_format` says (pass `"float"` so
+SDKs do not try to decode base64); `usage` is reported as zero; `embed`
+currently means `embeddinggemma-300m-4bit` (768 dimensions). The native
+`POST /engine/embed` takes `inputs` and returns `vectors`, `fingerprint` and
+`dims` at the top level.
+
+Examples: [`python/rag.py`](../examples/python/rag.py) (explains the choice of
+route), [`javascript/embed.mjs`](../examples/javascript/embed.mjs),
+`quickstart.sh` steps 6, 7 and 10.
+
+## Priorities
+
+Chat, `/engine/generate`, `/v1/embeddings` and `/engine/embed` take a
+`priority` field: `interactive` (the default over HTTP) or `background`. Each
+loaded model serves one call at a time. When calls queue, every waiting
+interactive call goes before any background one. A running call is never
+interrupted.
+
+Mark bulk work, such as indexing or summarising a backlog, as `background`, so
+a person waiting on a chat reply goes first:
+
+```python
+client.embeddings.create(model="embed", input=batch, extra_body={"task": "document", "priority": "background"})
+```
+
+`GET /engine/stats` (`models:read`) shows how many generation calls wait at
+each priority. In Rust, `Priority::default()` is `Background`, and
+`GenHandle::generate` uses it; pass `Priority::Interactive` for calls a person
+waits on.
+
+## Limits
+
+| Limit | Value | Over it |
+|---|---|---|
+| `max_tokens` | default 1024, at most 8192 | Lowered to 8192 without an error |
+| `temperature` | default 0.2 | |
+| Inputs per embedding request | 256 | 400 |
+| `max_attempts` on `/engine/generate` | 1 to 3 | Held to that range |
+| Pending pairing requests | 24, and 4 per client address | 429 `rate_limit_error` |
+| Time to send request headers | 10 s | Connection closed |
+| Open connections per client address | 32 (loopback exempt) | New connections closed |
+
+There is no rate limit per token. The server speaks HTTP/1.1 only; reuse
+connections (the SDKs do).
+
+## Errors and request ids
+
+Errors use OpenAI's shape:
+
+```json
+{"error": {"message": "token lacks the `generate` scope", "type": "permission_error", "code": 403, "request_id": "afba215093ed7162"}}
+```
+
+| Status | Meaning | What your app does |
+|---|---|---|
+| 400 | Bad request: empty messages, over 256 inputs, bad pairing name | Fix the request |
+| 401 | Missing, unknown or revoked token | Ask for a new token or pair again |
+| 403 | Token lacks the scope, or the Host/Origin check refused the request | Mint a token with the scope; see below for Host and Origin |
+| 404 | Unknown role or model, model not downloaded, expired pairing | Use a role; ask the operator to `estia pull` |
+| 422 | Structured output invalid after the retry; fingerprint mismatch | See the sections above |
+| 429 | Too many pending pairing requests | Wait, then pair again |
+| 500 | Runner failure | Retry once; report it with the request id |
+
+A body that is not JSON, or a missing `Content-Type: application/json`, gets a
+plain-text 400, 415 or 422 from the HTTP framework instead.
+
+Every response carries an `X-Request-Id` header, and error bodies repeat it as
+`error.request_id`. Log it next to any error you show or report, so the
+operator can find the same request in the engine's log. The OpenAI SDKs read
+the header for you: `e.request_id` in Python, `e.requestID` in JavaScript. The
+examples print it with every error. `RemoteEngine` errors do not include it.
+
+You can also send your own id, for example your app's turn or job id, so your
+log and the engine's line up:
+
+```bash
+curl -s http://127.0.0.1:27200/v1/chat/completions -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -H 'X-Request-Id: myapp-turn-42' \
+  -d '{"model": "fast", "messages": [{"role": "user", "content": "Name one sea."}]}'
+```
+
+The engine keeps an id of 1 to 64 ASCII letters, digits, `.`, `_`, `:` and
+`-`, and replaces anything else with a random one. The operator finds every
+line about the request with `grep myapp-turn-42` on the engine's log.
+[logging.md](logging.md) describes the log, and what it never contains
+(prompts, completions, vectors, tokens).
+
+Set `max_retries=0` (Python) or `maxRetries: 0` (JavaScript) for a local
+engine. The SDKs' default retries repeat requests that will fail the same way.
+
+## Host and Origin rules
+
+Before authentication, the engine checks where each request is addressed:
+
+- `Host` must be an IP address, `localhost` or `*.localhost`, a `*.local`
+  name, this machine's hostname, or a name the operator allowed with
+  `estia serve --allow-host <name>` (or `ESTIA_ALLOWED_HOSTS`). Anything else
+  is a 403 whose message says how to allow the name.
+- Any request other than GET, HEAD or OPTIONS that carries an `Origin`
+  header must come from the same scheme, host and port it is sent to.
+  `Origin: null` never matches.
+
+This stops a web page from reaching the engine through DNS rebinding or a
+cross-site post. Native apps, command-line tools and servers send no `Origin`
+and reach the engine by IP address or `.local` name, so they are not affected.
+If your users reach the engine by a custom name, such as `studio.lan`, the
+operator adds `--allow-host studio.lan`.
+
+## Web front-ends and CORS
+
+Estia sends no CORS headers and refuses cross-origin writes. A page served
+from anywhere else, such as a dev server on `http://localhost:5173`, cannot
+call the engine directly:
+
+- A POST from that page carries `Origin: http://localhost:5173`, and the
+  engine answers 403 ("cross-origin request refused").
+- A request with an `Authorization` header first sends a CORS preflight
+  (`OPTIONS`). The engine answers it without `Access-Control-Allow-*` headers,
+  so the browser stops there.
+
+Your options, best first:
+
+1. **Call Estia from your own backend.** The browser talks to your server; your
+   server calls Estia with a token that never reaches the browser. Server-side
+   HTTP clients send no `Origin`, so nothing needs configuring. Stream the
+   engine's events through to the page if you want live text.
+2. **Desktop apps (Tauri, Electron and similar): call from the native side.**
+   A webview's `fetch` sends an origin such as `tauri://localhost`, which the
+   engine refuses. Make the request from Rust (`RemoteEngine`) or from the Node
+   main process instead.
+3. **Serve the page and the API from one origin through a reverse proxy.** The
+   proxy serves your static files and forwards `/v1/` and `/engine/` to Estia.
+   It must pass the browser's `Host` through unchanged, and the operator must
+   allow that name with `--allow-host`. If the proxy rewrites `Host` to the
+   engine's address, the browser's `Origin` no longer matches and writes get
+   403. The page then holds a token, so give it a narrow one (`generate` only)
+   and serve the page only to people you would give that token to.
+
+`--allow-host '*'` does not help: it turns off the `Host` check (for a proxy
+that checks `Host` itself) but adds no CORS headers. The bundled `/client`
+page works because the engine serves it from its own origin.
+
+## Running on the LAN
+
+```bash
+estia serve --lan                # or: estia service install
+estia status                     # prints the URL other devices should use
+```
+
+- Authentication cannot be turned off on a LAN bind. Devices pair for a token.
+- Traffic is plain HTTP, tokens included. Serve the LAN only on a network you
+  trust. Otherwise keep the engine on loopback and reach it through a tunnel,
+  for example `ssh -N -L 27200:127.0.0.1:27200 you@studio.local`, then use
+  `http://127.0.0.1:27200` on the client.
+- Devices reach the engine by IP address or `<hostname>.local`; any other name
+  needs `--allow-host`.
+- Only one engine runs per data directory, and one model call runs at a time
+  per loaded model. Many devices can share an engine; they queue.
+
+## From Rust
+
+The `estia-engine` crate gives you two ways in. Until the crates are
+published, depend on this repository by path or by git.
+
+**A server somewhere else: `RemoteEngine`.** It uses the `/engine/*` routes
+and returns the engine's own facts. It is blocking; call it from a thread or
+`spawn_blocking`.
+
+```rust
+let engine = Arc::new(RemoteEngine::new("http://127.0.0.1:27200", Some(token))?);
+let (text, meta) = engine.chat_stream("fast", &messages, None, Some("conv-1"), Some(200), None,
+                                      Priority::Interactive, None, |piece| print!("{piece}"))?;
+```
+
+HTTP failures come back as `SessionError::Runner` with text such as
+`remote engine 401 Unauthorized: unknown token`. `RemoteEngine::embed_batch`
+sends `task: none`, so add the model's prefix yourself
+(`EMBEDDING_GEMMA_300M_4BIT.prefix(EmbedTask::Query)`), as the example does.
+`GenHandle` and `EmbedHandle` wrap a local session or a remote one behind the
+same methods, so the rest of your code does not care where the model runs.
+
+**Models in your own process: `Engine`.** No server and no HTTP: your program
+starts the runner processes itself. It needs the Python runtime and the models
+that `estia setup` installs, and the runner script.
+
+```rust
+let cfg = EngineConfig::new(ModelStore::new(dir.join("models")), PythonRuntime::new(dir.join("runtime")), runner_script);
+let engine = Engine::new(cfg);
+let gen = engine.spawn_gen_session("gemma4-e2b-it-4bit-mlx")?;
+let out = gen.chat_with(&messages, None, Some("conv-1"), None, Some(200), None, Priority::Interactive)?;
+```
+
+The in-process engine does not read the CLI's `config.json`; pass your own
+role table with `EngineConfig::with_roles`. Structured output is yours to
+enforce with `structured::enforce` and `Structured::retry_hint`.
+
+`estia-engine` reports what its runners do (start, handshake, model load,
+cancel, restart, idle release) as `tracing` events, and turns each runner's
+stderr into events too. They are discarded until your program installs a
+`tracing` subscriber; [logging.md](logging.md#embedding-the-crates) shows one.
+
+Examples: [`remote_client.rs`](../engine/examples/remote_client.rs),
+[`in_process.rs`](../engine/examples/in_process.rs).
+
+## Current limits worth knowing
+
+[ROADMAP.md](../ROADMAP.md) says which of these are planned to change, and in
+what order.
+
+- Apple Silicon Macs only. The one backend is MLX through a Python runner. A
+  llama.cpp backend for Linux and Windows is designed
+  ([design/llama-backend.md](design/llama-backend.md)) and not written. Ask
+  by role, not artifact id, and store embedding fingerprints, and your app
+  will work on it unchanged.
+- Tool results sent as `{"role": "tool"}` are dropped with the Gemma models.
+  Send them as user messages (see [Tools](#tools)).
+- The JSON Schema in `response_format` is not shown to the model. Put it in
+  the prompt.
+- Image parts in messages are replaced by a text marker.
+- A non-streaming request is not cancelled when its client disconnects.
+- `tool_choice`, `n`, `top_p` and `stop` are accepted and ignored. Role
+  sampling settings (`temperature`, `max_tokens`) are stored but not applied.
+- No TLS.

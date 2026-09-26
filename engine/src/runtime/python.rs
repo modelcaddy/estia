@@ -466,10 +466,7 @@ impl PythonRuntime {
             None => match fetch_expected_sha256(&client, &url).await {
                 Ok(sha) => Some(sha),
                 Err(e) => {
-                    eprintln!(
-                        "python runtime: proceeding without integrity check — \
-                         no published SHA256 available ({e})"
-                    );
+                    tracing::warn!(error = %e, "python runtime: no published SHA-256 for the download; installing without an integrity check");
                     None
                 }
             },

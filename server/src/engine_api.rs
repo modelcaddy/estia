@@ -1,5 +1,6 @@
 //! `/engine/*` — what OpenAI's shape cannot say.
 
+use crate::access::{spawn_blocking_in_span, Access};
 use crate::jobs::JobStatus;
 use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, task_name, to_messages, OaiMessage};
 use crate::pairing::PairingError;
@@ -22,6 +23,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::Instrument as _;
 
 // Work caps: one request must not be able to hold a model indefinitely.
 // Public so the `/v1/*` handlers apply the same limits.
@@ -61,7 +63,7 @@ fn pairing_error(e: PairingError, missing: fn(String) -> ApiError) -> ApiError {
             ApiError { status: axum::http::StatusCode::TOO_MANY_REQUESTS, kind: "rate_limit_error", message: e.to_string() }
         }
         PairingError::Storage(_) => {
-            eprintln!("pairing: {e}");
+            tracing::error!(error = %e, "pairing store failure");
             ApiError::internal("the pairing store could not be read or written; see the engine's log")
         }
     }
@@ -104,6 +106,8 @@ pub async fn put_defaults(State(state): State<Arc<AppState>>, Json(roles): Json<
     std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap_or_default())
         .map_err(|e| ApiError::internal(format!("write config.json: {e}")))?;
     state.engine.set_roles(checked.clone());
+    let table: Vec<String> = checked.iter().map(|(role, b)| format!("{role}={}", b.family)).collect();
+    tracing::info!(roles = %table.join(","), "role table replaced");
     Ok(Json(checked))
 }
 
@@ -150,29 +154,82 @@ pub async fn pull_model(State(state): State<Arc<AppState>>, Json(req): Json<Pull
         return Err(ApiError::not_found(format!("unknown model `{}`", req.id)));
     };
     if let Some(job) = state.jobs.running_pull(&spec.id) {
+        if let Some(a) = Access::current() {
+            a.job(&job.id);
+        }
         return Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "already_running": true}))).into_response());
     }
     let (job_id, view) = state.jobs.create("pull", &spec.id);
+    if let Some(a) = Access::current() {
+        a.job(&job_id);
+    }
+    tracing::info!(job_id = %job_id, model = %spec.id, repo = %spec.repo_id, revision = %spec.revision, "model pull started");
     let store = state.engine.store().clone();
     let view2 = view.clone();
-    tokio::spawn(async move {
-        let result = store
-            .download(&spec, move |p| {
-                view2.send_modify(|v| v.progress = Some(p));
-            })
-            .await;
-        view.send_modify(|v| match &result {
+    // The job outlives the request: its events carry the job id, not the request's.
+    let span = tracing::info_span!(parent: None, "job", job_id = %job_id);
+    let (jid, model) = (job_id.clone(), spec.id.clone());
+    let (end_jid, end_model) = (job_id.clone(), spec.id.clone());
+    tokio::spawn(
+        async move {
+            let t0 = Instant::now();
+            let mut milestones = PullMilestones::default();
+            let result = store
+                .download(&spec, move |p| {
+                    if let Some(pct) = milestones.crossed(&p) {
+                        tracing::info!(job_id = %jid, model = %model, percent = pct, bytes = p.bytes_downloaded, total_bytes = p.total_bytes, "model pull progress");
+                    }
+                    view2.send_modify(|v| v.progress = Some(p));
+                })
+                .await;
+            match &result {
+                Ok(summary) => tracing::info!(
+                    job_id = %end_jid,
+                    model = %summary.model_id,
+                    files = summary.files_downloaded,
+                    bytes = summary.bytes_downloaded,
+                    secs = t0.elapsed().as_secs(),
+                    "model pull finished"
+                ),
+                Err(e) => tracing::warn!(job_id = %end_jid, model = %end_model, error = %format!("{e:#}"), "model pull failed"),
+            }
+            view.send_modify(|v| match &result {
             Ok(summary) => {
                 v.status = JobStatus::Done;
                 v.result = serde_json::to_value(summary).ok();
             }
-            Err(e) => {
-                v.status = JobStatus::Failed;
-                v.error = Some(e.to_string());
-            }
-        });
-    });
+                Err(e) => {
+                    v.status = JobStatus::Failed;
+                    v.error = Some(e.to_string());
+                }
+            });
+        }
+        .instrument(span),
+    );
     Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job_id}))).into_response())
+}
+
+/// Which tenth of a download was last logged, so a pull logs at 10 %, 20 %, …
+#[derive(Default)]
+struct PullMilestones {
+    logged: Option<u64>,
+}
+
+impl PullMilestones {
+    /// The percentage to log for this progress report, when it reaches a new
+    /// tenth (10 to 90; the end is logged as "finished").
+    fn crossed(&mut self, p: &estia_engine::models::DownloadProgress) -> Option<u64> {
+        let total = p.total_bytes.filter(|t| *t > 0)?;
+        if p.phase != "downloading" {
+            return None;
+        }
+        let tenth = (p.bytes_downloaded.min(total).saturating_mul(10) / total).min(9);
+        if tenth == 0 || self.logged.is_some_and(|l| l >= tenth) {
+            return None;
+        }
+        self.logged = Some(tenth);
+        Some(tenth * 10)
+    }
 }
 
 pub async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
@@ -180,6 +237,7 @@ pub async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<Str
         return Err(ApiError::not_found(format!("unknown model `{id}`")));
     }
     let removed = state.engine.store().remove(&id).await?;
+    tracing::info!(model = %id, removed, "model removed");
     Ok(Json(json!({"removed": removed})))
 }
 
@@ -221,21 +279,55 @@ pub async fn install_runtime(State(state): State<Arc<AppState>>) -> Result<Respo
         return Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "already_running": true}))).into_response());
     }
     let (job_id, view) = state.jobs.create("runtime", ID);
+    if let Some(a) = Access::current() {
+        a.job(&job_id);
+    }
+    tracing::info!(job_id = %job_id, "runtime install started");
     let runtime = state.engine.runtime().clone();
     let view2 = view.clone();
-    tokio::spawn(async move {
-        let result = runtime.install(move |p| view2.send_modify(|v| v.setup = Some(p))).await;
-        view.send_modify(|v| match &result {
-            Ok(summary) => {
-                v.status = JobStatus::Done;
-                v.result = serde_json::to_value(summary).ok();
+    let span = tracing::info_span!(parent: None, "job", job_id = %job_id);
+    let (jid, end_jid) = (job_id.clone(), job_id.clone());
+    tokio::spawn(
+        async move {
+            let t0 = Instant::now();
+            let mut phase: &'static str = "";
+            let mut phase_started = Instant::now();
+            let result = runtime
+                .install(move |p| {
+                    if p.phase != phase {
+                        if !phase.is_empty() {
+                            tracing::debug!(job_id = %jid, phase = %phase, ms = phase_started.elapsed().as_millis() as u64, "runtime install phase done");
+                        }
+                        tracing::info!(job_id = %jid, phase = %p.phase, step = %p.message, "runtime install phase");
+                        phase = p.phase;
+                        phase_started = Instant::now();
+                    }
+                    view2.send_modify(|v| v.setup = Some(p))
+                })
+                .await;
+            match &result {
+                Ok(summary) => tracing::info!(
+                    job_id = %end_jid,
+                    python = %summary.python_version,
+                    mlx_lm = %summary.mlx_lm_version,
+                    secs = t0.elapsed().as_secs(),
+                    "runtime install finished"
+                ),
+                Err(e) => tracing::warn!(job_id = %end_jid, error = %format!("{e:#}"), "runtime install failed"),
             }
-            Err(e) => {
-                v.status = JobStatus::Failed;
-                v.error = Some(e.to_string());
-            }
-        });
-    });
+            view.send_modify(|v| match &result {
+                Ok(summary) => {
+                    v.status = JobStatus::Done;
+                    v.result = serde_json::to_value(summary).ok();
+                }
+                Err(e) => {
+                    v.status = JobStatus::Failed;
+                    v.error = Some(e.to_string());
+                }
+            });
+        }
+        .instrument(span),
+    );
     Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job_id}))).into_response())
 }
 
@@ -288,8 +380,16 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     let max_tokens = capped_max_tokens(req.max_tokens, 1024);
     let temperature = req.temperature.unwrap_or(0.2);
     let attempts = req.max_attempts.unwrap_or(2).clamp(1, MAX_ATTEMPTS);
+    let streaming = req.stream.unwrap_or(false) && !format.wants_json();
+    let access = Access::current();
+    if let Some(a) = &access {
+        a.generation(&name, artifact.id, streaming, max_tokens);
+    }
     let st = Arc::clone(&state);
-    let session = tokio::task::spawn_blocking(move || st.gen_session(artifact)).await??;
+    let (session, load_ms) = spawn_blocking_in_span(move || st.gen_session_timed(artifact)).await??;
+    if let (Some(a), Some(ms)) = (&access, load_ms) {
+        a.loaded(ms);
+    }
 
     // Either a raw prompt (the resident runner's `generate_stream`) or messages
     // (protocol v2 `chat_stream` through the template).
@@ -305,15 +405,26 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
         .or_else(|| messages.as_ref().map(|m| derive_cache_key(artifact.id, m)))
         .map(|k| crate::Caller::current().scoped_key(&k));
 
-    if req.stream.unwrap_or(false) && !format.wants_json() {
+    if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
         let s = Arc::clone(&session);
-        tokio::task::spawn_blocking(move || {
+        let acc = access.clone();
+        let request_id = access.as_ref().map(|a| a.id().to_string());
+        spawn_blocking_in_span(move || {
             let cancel = CancelToken::new();
             let flip = cancel.clone();
             let send = |v: Value| tx.send(Ok(Event::default().data(v.to_string()))).is_ok();
             let t0 = Instant::now();
+            if let Some(a) = &acc {
+                a.call_start();
+            }
+            let mut first = true;
             let on_token = |tok: &str| {
+                if std::mem::take(&mut first) {
+                    if let Some(a) = &acc {
+                        a.token();
+                    }
+                }
                 if !send(json!({"token": tok})) {
                     flip.cancel();
                 }
@@ -337,15 +448,27 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                 }
                 _ => unreachable!(),
             };
+            // Let go of the access record before the stream ends (see chat_completions).
             match result {
                 Ok((text, meta)) => {
+                    if let Some(a) = acc {
+                        a.call_end(meta.as_ref());
+                        a.finish("stop");
+                    }
                     let _ = send(
                         json!({"done": true, "text": text, "meta": meta, "model": artifact.id, "family": artifact.family, "backend": "mlx-python", "ms": t0.elapsed().as_millis()}),
                     );
                 }
-                Err(estia_engine::SessionError::Cancelled { .. }) => {}
+                Err(estia_engine::SessionError::Cancelled { .. }) => {
+                    if let Some(a) = acc {
+                        a.finish("cancelled");
+                    }
+                }
                 Err(e) => {
-                    let _ = send(json!({"error": e.to_string()}));
+                    if let Some(a) = acc {
+                        a.failed(&e.to_string());
+                    }
+                    let _ = send(json!({"error": e.to_string(), "request_id": request_id}));
                 }
             }
         });
@@ -354,15 +477,19 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
 
     let s = Arc::clone(&session);
     let fmt = format.clone();
-    let body = tokio::task::spawn_blocking(move || -> Result<Value, ApiError> {
+    let acc = access.clone();
+    let body = spawn_blocking_in_span(move || -> Result<Value, ApiError> {
         let t0 = Instant::now();
         let run = |extra_turns: &[Message]| -> Result<(String, Option<estia_engine::proto::GenerationMeta>), ApiError> {
-            match (&messages, &prompt) {
+            if let Some(a) = &acc {
+                a.call_start();
+            }
+            let out = match (&messages, &prompt) {
                 (Some(m), _) => {
                     let mut all = m.clone();
                     all.extend_from_slice(extra_turns);
                     let o = s.chat_with(&all, tools.as_deref(), cache_key.as_deref(), None, Some(max_tokens), Some(temperature), prio)?;
-                    Ok((o.text, Some(o.meta)))
+                    (o.text, Some(o.meta))
                 }
                 (None, Some(p)) => {
                     let mut full = p.clone();
@@ -370,10 +497,14 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                         full.push_str("\n\n");
                         full.push_str(&t.content);
                     }
-                    Ok((s.generate_with(&full, Some(max_tokens), Some(temperature), prio)?, None))
+                    (s.generate_with(&full, Some(max_tokens), Some(temperature), prio)?, None)
                 }
                 _ => unreachable!(),
+            };
+            if let Some(a) = &acc {
+                a.call_end(out.1.as_ref());
             }
+            Ok(out)
         };
         let (mut text, mut meta) = run(&[])?;
         let mut structured: Option<Structured> = None;
@@ -387,6 +518,7 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                     }
                     Err(e) if attempt < attempts => {
                         attempt += 1;
+                        tracing::debug!(attempt, "structured output did not validate; retrying");
                         let hint = Structured::retry_hint(&e);
                         let (t, m) = run(&[Message::new("assistant", text.clone()), Message::new("user", hint.trim().to_string())])?;
                         text = t;
@@ -398,6 +530,9 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
         }
         let tool_calls: Vec<Value> =
             if tools.is_some() { toolcalls::parse(&text).iter().enumerate().map(|(i, c)| c.to_openai(i)).collect() } else { Vec::new() };
+        if let Some(a) = &acc {
+            a.finish(if tool_calls.is_empty() { "stop" } else { "tool_calls" });
+        }
         Ok(json!({
             "text": text,
             "json": structured.as_ref().map(|s| s.value.clone()),
@@ -430,6 +565,10 @@ pub struct EmbedRequest {
 pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequest>) -> Result<Json<Value>, ApiError> {
     let model = state.resolve_embedding(req.model.as_deref())?;
     let inputs = inputs_of(&req.inputs)?;
+    let access = Access::current();
+    if let Some(a) = &access {
+        a.embedding(req.model.as_deref().unwrap_or("embed"), model.id, inputs.len(), model.dims);
+    }
     check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
     let fingerprint = model.fingerprint_for(state.embed_backend());
@@ -442,11 +581,14 @@ pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequ
     let prefixed = apply_prefix(model, task, &inputs);
     let st = Arc::clone(&state);
     let t0 = Instant::now();
-    let vectors = tokio::task::spawn_blocking(move || -> Result<Vec<Vec<f32>>, ApiError> {
-        let session = st.embed_session(model)?;
-        Ok(session.embed_batch_with(&prefixed, prio)?)
+    let (vectors, load_ms) = spawn_blocking_in_span(move || -> Result<(Vec<Vec<f32>>, Option<u64>), ApiError> {
+        let (session, load_ms) = st.embed_session_timed(model)?;
+        Ok((session.embed_batch_with(&prefixed, prio)?, load_ms))
     })
     .await??;
+    if let (Some(a), Some(ms)) = (&access, load_ms) {
+        a.loaded(ms);
+    }
     Ok(Json(json!({
         "vectors": vectors, "fingerprint": fingerprint, "model": model.id, "dims": model.dims,
         "task": task_name(task), "backend": state.embed_backend(), "ms": t0.elapsed().as_millis()
@@ -471,9 +613,12 @@ pub async fn pair_request(
     let scopes = body.scopes.unwrap_or_else(|| vec!["generate".into(), "embed".into(), "models:read".into()]);
     let from = peer.ip().to_string();
     // The store takes a file lock (the CLI edits the same file): off the runtime.
-    let p = tokio::task::spawn_blocking(move || state.pairings.request(&body.name, &scopes, Some(from)))
+    let p = spawn_blocking_in_span(move || state.pairings.request(&body.name, &scopes, Some(from)))
         .await?
         .map_err(|e| pairing_error(e, ApiError::not_found))?;
+    if let Some(a) = Access::current() {
+        a.pairing(&p.id);
+    }
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(json!({
@@ -486,9 +631,12 @@ pub async fn pair_request(
 
 /// The client polls; the token is returned exactly once when approved.
 pub async fn pair_poll(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    if let Some(a) = Access::current() {
+        a.pairing(&id);
+    }
     let key = id.clone();
     let (status, token) =
-        tokio::task::spawn_blocking(move || state.pairings.poll(&key)).await?.map_err(|e| pairing_error(e, ApiError::not_found))?;
+        spawn_blocking_in_span(move || state.pairings.poll(&key)).await?.map_err(|e| pairing_error(e, ApiError::not_found))?;
     Ok(Json(json!({"id": id, "status": status, "token": token})))
 }
 
@@ -510,7 +658,10 @@ pub async fn list_pairings(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 pub async fn approve_pairing(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let p = tokio::task::spawn_blocking(move || state.pairings.approve(&id, &state.tokens))
+    if let Some(a) = Access::current() {
+        a.pairing(&id);
+    }
+    let p = spawn_blocking_in_span(move || state.pairings.approve(&id, &state.tokens))
         .await?
         .map_err(|e| pairing_error(e, ApiError::bad_request))?;
     Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status, "scopes": p.scopes})))
@@ -519,7 +670,10 @@ pub async fn approve_pairing(State(state): State<Arc<AppState>>, Path(id): Path<
 /// Deny a pending request, or take back an approved one: its token is revoked
 /// (`"revoked": true`) whether or not the device has collected it yet.
 pub async fn deny_pairing(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let p = tokio::task::spawn_blocking(move || state.pairings.deny_with(&id, &state.tokens))
+    if let Some(a) = Access::current() {
+        a.pairing(&id);
+    }
+    let p = spawn_blocking_in_span(move || state.pairings.deny_with(&id, &state.tokens))
         .await?
         .map_err(|e| pairing_error(e, ApiError::bad_request))?;
     Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status, "revoked": p.revoked, "token_name": p.token_name})))
@@ -533,4 +687,30 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
         "queue": {"interactive": interactive, "background": background},
         "jobs": state.jobs.list().len(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PullMilestones;
+    use estia_engine::models::DownloadProgress;
+
+    fn at(phase: &'static str, done: u64, total: Option<u64>) -> DownloadProgress {
+        DownloadProgress { phase, file_name: None, file_index: 1, file_count: 2, bytes_downloaded: done, total_bytes: total }
+    }
+
+    /// A pull logs each tenth once, skips tenths it jumps over, and never
+    /// logs 100 % (that is the "finished" line) or an unknown total.
+    #[test]
+    fn pull_progress_is_logged_once_per_tenth() {
+        let mut m = PullMilestones::default();
+        let seen: Vec<u64> = [0, 5, 10, 11, 19, 20, 55, 56, 90, 99, 100, 100]
+            .iter()
+            .filter_map(|pct| m.crossed(&at("downloading", *pct, Some(100))))
+            .collect();
+        assert_eq!(seen, [10, 20, 50, 90]);
+        let mut resumed = PullMilestones::default();
+        assert_eq!(resumed.crossed(&at("downloading", 42, Some(100))), Some(40), "a resumed pull starts where it is");
+        assert_eq!(PullMilestones::default().crossed(&at("downloading", 50, None)), None);
+        assert_eq!(PullMilestones::default().crossed(&at("finalizing", 50, Some(100))), None);
+    }
 }

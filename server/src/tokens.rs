@@ -61,7 +61,14 @@ pub struct TokenStore {
     stamp: Mutex<Option<(SystemTime, u64)>>,
     /// Serialises this process's writers; the lock file serialises processes.
     writer: Mutex<()>,
+    /// Hashes and names of tokens that left the file while this store was
+    /// open, newest last, so a refused request can be logged as "revoked"
+    /// rather than "unknown". Bounded by [`REMEMBER_REVOKED`].
+    revoked: Mutex<std::collections::VecDeque<(String, String)>>,
 }
+
+/// How many revoked tokens [`TokenStore::revoked_name`] remembers.
+const REMEMBER_REVOKED: usize = 256;
 
 fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
@@ -192,7 +199,48 @@ impl TokenStore {
             Err(_) => Vec::new(),
         };
         let lock_path = path.with_extension("lock");
-        Ok(Self { path, lock_path, records: Mutex::new(records), stamp: Mutex::new(stamp), writer: Mutex::new(()) })
+        Ok(Self {
+            path,
+            lock_path,
+            records: Mutex::new(records),
+            stamp: Mutex::new(stamp),
+            writer: Mutex::new(()),
+            revoked: Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    /// Log what changed between the records this store held and `new`, and
+    /// remember the tokens that left. `external`: the change came from the
+    /// file (another process, such as `estia token revoke`), not from this store.
+    fn note_changes(&self, old: &[TokenRecord], new: &[TokenRecord], external: bool) {
+        let mut revoked = self.revoked.lock().unwrap_or_else(PoisonError::into_inner);
+        for r in old.iter().filter(|r| !new.iter().any(|n| n.sha256 == r.sha256)) {
+            if external {
+                tracing::info!(name = r.name.as_str(), "token revoked (removed from tokens.json)");
+            } else {
+                tracing::debug!(name = r.name.as_str(), "token removed");
+            }
+            revoked.retain(|(sha, _)| sha != &r.sha256);
+            revoked.push_back((r.sha256.clone(), r.name.clone()));
+            while revoked.len() > REMEMBER_REVOKED {
+                revoked.pop_front();
+            }
+        }
+        for r in new.iter().filter(|n| !old.iter().any(|o| o.sha256 == n.sha256)) {
+            if external {
+                tracing::info!(name = r.name.as_str(), scopes = %r.scopes.join(","), "token added (found in tokens.json)");
+            } else {
+                tracing::debug!(name = r.name.as_str(), scopes = %r.scopes.join(","), "token minted");
+            }
+        }
+    }
+
+    /// The name a refused token had, if it was removed from `tokens.json`
+    /// while this store was open (revoked, replaced, or a denied pairing's).
+    /// For log lines: clients are told only that the token is unknown.
+    pub fn revoked_name(&self, plaintext: &str) -> Option<String> {
+        let h = hash(plaintext);
+        self.revoked.lock().unwrap_or_else(PoisonError::into_inner).iter().rev().find(|(sha, _)| *sha == h).map(|(_, name)| name.clone())
     }
 
     pub fn path(&self) -> &Path {
@@ -211,7 +259,11 @@ impl TokenStore {
             write_private(&self.path, serde_json::to_string_pretty(&records)?.as_bytes())?;
         }
         let stamp = file_stamp(&self.path);
-        *self.records.lock().unwrap() = records;
+        {
+            let mut held = self.records.lock().unwrap();
+            self.note_changes(&held, &records, false);
+            *held = records;
+        }
         *self.stamp.lock().unwrap() = stamp;
         Ok(out)
     }
@@ -298,17 +350,24 @@ impl TokenStore {
     pub fn reload(&self) {
         let stamp = file_stamp(&self.path);
         match std::fs::read_to_string(&self.path) {
-            Ok(text) => {
-                if let Ok(records) = serde_json::from_str::<Vec<TokenRecord>>(&text) {
-                    *self.records.lock().unwrap() = records;
+            Ok(text) => match serde_json::from_str::<Vec<TokenRecord>>(&text) {
+                Ok(records) => {
+                    let mut held = self.records.lock().unwrap();
+                    self.note_changes(&held, &records, true);
+                    *held = records;
+                    drop(held);
                     *self.stamp.lock().unwrap() = stamp;
                 }
-            }
+                Err(e) => tracing::debug!(error = %e, "tokens.json does not parse (mid-write?); keeping the last good set"),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.records.lock().unwrap().clear();
+                let mut held = self.records.lock().unwrap();
+                self.note_changes(&held, &[], true);
+                held.clear();
+                drop(held);
                 *self.stamp.lock().unwrap() = None;
             }
-            Err(_) => {}
+            Err(e) => tracing::warn!(path = %self.path.display(), error = %e, "could not read tokens.json; keeping the last good set"),
         }
     }
 }
@@ -348,6 +407,8 @@ mod tests {
         assert!(store.verify(&late).is_some(), "daemon-side store re-reads the file on a miss");
         assert!(store.revoke("local").unwrap());
         assert!(store.verify(&t).is_none());
+        assert_eq!(store.revoked_name(&t).as_deref(), Some("local"), "remembered for the log");
+        assert_eq!(store.revoked_name("estia_nope"), None);
         assert!(!store.revoke("local").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -362,6 +423,7 @@ mod tests {
         assert!(daemon.verify(&t).is_some(), "minted elsewhere, honoured");
         assert!(cli.revoke("phone").unwrap());
         assert!(daemon.verify(&t).is_none(), "revoked elsewhere, refused on the next check");
+        assert_eq!(daemon.revoked_name(&t).as_deref(), Some("phone"), "the daemon saw it leave the file");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -23,5 +23,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", features = ["json", "blocking"] }
-log = "0.4"
+# The subscriber for `serve` and the other commands: text or JSON lines on
+# stderr, filtered by --log-level / ESTIA_LOG / RUST_LOG. tracing-log forwards
+# records from crates that use `log` (mdns-sd).
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "registry", "smallvec", "std", "tracing-log"] }
 libc = "0.2"

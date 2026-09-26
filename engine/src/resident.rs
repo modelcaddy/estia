@@ -18,15 +18,58 @@ type Result<T> = std::result::Result<T, SessionError>;
 
 /// What both session types share: the handshake result and preloading.
 fn handshake(session: &Session) -> Result<Option<HelloResp>> {
-    session.hello()
+    let hello = session.hello()?;
+    let model = session.launch().label().unwrap_or("");
+    match &hello {
+        Some(h) => tracing::info!(
+            model = %model,
+            pid = session.pid(),
+            runner = %h.runner,
+            runner_version = %h.version,
+            protocol = h.protocol,
+            capabilities = %capability_list(&h.capabilities),
+            "runner handshake"
+        ),
+        None => tracing::info!(model = %model, pid = session.pid(), protocol = 1, "runner handshake: no hello, protocol v1"),
+    }
+    Ok(hello)
+}
+
+/// The capabilities a runner declared, as `chat,stream,…`, for a log line.
+pub(crate) fn capability_list(c: &Capabilities) -> String {
+    let flags = [
+        ("generate", c.generate),
+        ("stream", c.stream),
+        ("embed", c.embed),
+        ("cancel", c.cancel),
+        ("load", c.load),
+        ("chat", c.chat),
+        ("tools", c.tools),
+        ("prompt_cache", c.prompt_cache),
+        ("count_tokens", c.count_tokens),
+    ];
+    let mut out: Vec<String> = flags.iter().filter(|(_, on)| *on).map(|(n, _)| n.to_string()).collect();
+    out.extend(c.structured.iter().map(|s| format!("structured:{s}")));
+    out.join(",")
 }
 
 fn load(session: &Session, model_path: &str, kind: &str) -> Result<LoadResp> {
-    session.call_typed_with(&Request::Load { model_path, kind }, crate::session::Priority::Interactive)
+    let model = session.launch().label().unwrap_or("");
+    match session.call_typed_with::<_, LoadResp>(&Request::Load { model_path, kind }, crate::session::Priority::Interactive) {
+        Ok(r) => {
+            tracing::info!(model = %model, kind = %kind, load_ms = r.ms, "model loaded");
+            Ok(r)
+        }
+        Err(e) => {
+            tracing::warn!(model = %model, kind = %kind, error = %e, "model load failed");
+            Err(e)
+        }
+    }
 }
 
 fn unload(session: &Session, model_path: &str) -> Result<bool> {
     let r: UnloadResp = session.call_typed_with(&Request::Unload { model_path }, crate::session::Priority::Interactive)?;
+    tracing::info!(model = %session.launch().label().unwrap_or(""), unloaded = r.unloaded, "model unloaded");
     Ok(r.unloaded)
 }
 
@@ -61,9 +104,11 @@ impl EmbedSession {
         model_path: impl Into<String>,
         fingerprint: impl Into<String>,
     ) -> Result<Self> {
+        let model_path = model_path.into();
+        let launch = if launch.label().is_some() { launch } else { launch.with_label(model_label(&model_path)) };
         let session = Session::spawn(launch, cfg, observer)?;
         let hello = handshake(&session)?;
-        Ok(Self { session, model_path: model_path.into(), fingerprint: fingerprint.into(), hello })
+        Ok(Self { session, model_path, fingerprint: fingerprint.into(), hello })
     }
 
     pub fn set_call_timeout(&mut self, timeout: Duration) {
@@ -164,9 +209,11 @@ impl GenSession {
         model_path: impl Into<String>,
         model_id: impl Into<String>,
     ) -> Result<Self> {
+        let model_id = model_id.into();
+        let launch = if launch.label().is_some() { launch } else { launch.with_label(model_id.clone()) };
         let session = Session::spawn(launch, cfg, observer)?;
         let hello = handshake(&session)?;
-        Ok(Self { session, model_path: model_path.into(), model_id: model_id.into(), hello })
+        Ok(Self { session, model_path: model_path.into(), model_id, hello })
     }
 
     pub fn set_call_timeout(&mut self, timeout: Duration) {
@@ -336,6 +383,11 @@ impl GenSession {
     pub fn maybe_shutdown(&self, timeout: Duration) -> bool {
         self.session.maybe_shutdown(timeout)
     }
+}
+
+/// A model directory's last component (the artifact id in a model store), for log lines.
+fn model_label(model_path: &str) -> String {
+    std::path::Path::new(model_path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| model_path.to_string())
 }
 
 /// Text plus the runner's token accounting for one chat generation.

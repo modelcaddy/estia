@@ -1,0 +1,2 @@
+# The OpenAI SDK is the only dependency. pair.py and no_sdk.py need none.
+openai>=1

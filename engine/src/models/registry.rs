@@ -73,7 +73,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         required_disk_bytes: 5_220_000_000,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
-        license: "Gemma Terms of Use",
+        license: "Apache-2.0",
     },
     Artifact {
         id: "gemma4-12b-it-qat-4bit-mlx",
@@ -91,7 +91,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         required_disk_bytes: 6_780_000_000,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
-        license: "Gemma Terms of Use",
+        license: "Apache-2.0",
     },
     Artifact {
         id: "gemma4-e2b-it-4bit-mlx",
@@ -108,7 +108,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         required_disk_bytes: 3_600_000_000,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
-        license: "Gemma Terms of Use",
+        license: "Apache-2.0",
     },
 ];
 

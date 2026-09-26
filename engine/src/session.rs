@@ -36,6 +36,11 @@
 //! Serialized: one call at a time per child. This type decides *which* call
 //! goes next (the gate) and makes each call safe; it does not decide what the
 //! model does.
+//!
+//! Logging: the session emits `tracing` events for the child's lifecycle
+//! (started, died and respawned, timed out, cancelled, stopped) and forwards
+//! each line the child writes to stderr as an event with target
+//! `estia_engine::runner`. Nothing about requests or outputs is logged here.
 
 use crate::error::SessionError;
 use estia_proto as proto;
@@ -62,16 +67,38 @@ type Result<T> = std::result::Result<T, SessionError>;
 pub struct Launch {
     program: PathBuf,
     args: Vec<OsString>,
+    /// What the child serves, for log lines (a model id). Not passed to it.
+    label: Option<String>,
 }
 
 impl Launch {
     pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), args: Vec::new() }
+        Self { program: program.into(), args: Vec::new(), label: None }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
         self
+    }
+
+    /// Name the child in log events, usually the model id it serves. Log
+    /// lines carry it as `model`; without one they carry the program's file name.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// The label set with [`Launch::with_label`], if any.
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// The label, or the program's file name.
+    fn log_label(&self) -> Arc<str> {
+        match &self.label {
+            Some(l) => Arc::from(l.as_str()),
+            None => Arc::from(self.program.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default().as_str()),
+        }
     }
 
     pub fn program(&self) -> &Path {
@@ -172,17 +199,68 @@ struct Proc {
     stdin: SharedStdin,
     line_rx: Receiver<String>,
     reader: Option<JoinHandle<()>>,
+    /// For log lines: what this child serves.
+    label: Arc<str>,
 }
 
 impl Drop for Proc {
     fn drop(&mut self) {
         // Kill → stdout closes → the reader's read_line hits EOF → join.
+        let pid = self.child.id();
+        let already = self.child.try_wait().ok().flatten();
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let status = self.child.wait().ok();
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
+        tracing::debug!(model = %self.label, pid, exit = %exit_text(already.or(status)), "runner stopped");
     }
+}
+
+/// How a child ended, for a log line: `code 1`, `signal 9`, `running`.
+fn exit_text(status: Option<std::process::ExitStatus>) -> String {
+    let Some(status) = status else { return "running".into() };
+    if let Some(code) = status.code() {
+        return format!("code {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return format!("signal {sig}");
+        }
+    }
+    status.to_string()
+}
+
+/// The child's exit status, waiting up to `within` for it to be reaped. A
+/// child whose pipe just closed is usually gone, but not always reaped yet.
+fn exit_status_within(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(s)) => return Some(s),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => return None,
+        }
+    }
+}
+
+/// One stderr line from a runner as it goes into a log event: the last
+/// carriage-return segment (progress bars redraw with `\r`), control
+/// characters escaped so a line cannot rewrite the operator's terminal.
+fn stderr_line(raw: &str) -> Option<String> {
+    let line = raw.trim_end_matches(['\n', '\r']);
+    let line = line.rsplit('\r').find(|seg| !seg.trim().is_empty())?;
+    let mut out = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_control() && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    Some(out)
 }
 
 /// Decrements the in-flight counter on scope exit, including `?` returns and
@@ -329,14 +407,36 @@ impl Session {
     }
 
     fn spawn_proc(launch: &Launch, observer: &dyn SessionObserver) -> Result<Proc> {
-        let mut child = launch
-            .command()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|e| SessionError::Spawn { program: launch.program.display().to_string(), source: e })?;
+        let label = launch.log_label();
+        let mut child = launch.command().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| {
+            tracing::error!(model = %label, program = %launch.program.display(), error = %e, "could not start the runner");
+            SessionError::Spawn { program: launch.program.display().to_string(), source: e }
+        })?;
         let stdin = child.stdin.take().ok_or(SessionError::NotPiped)?;
         let stdout = child.stdout.take().ok_or(SessionError::NotPiped)?;
+        let pid = child.id();
+        // The child's stderr (Python warnings, tracebacks, library chatter)
+        // becomes log events instead of raw bytes on ours, so a JSON log stays
+        // one object per line. Not joined: it ends at EOF, when the child and
+        // anything that inherited the pipe are gone.
+        if let Some(stderr) = child.stderr.take() {
+            let label = Arc::clone(&label);
+            let _ = std::thread::Builder::new().name("estia-runner-stderr".into()).spawn(move || {
+                let mut r = BufReader::new(stderr);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match r.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Some(line) = stderr_line(&String::from_utf8_lossy(&buf)) {
+                                tracing::info!(target: "estia_engine::runner", model = %label, pid, "{line}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
         // Persistent reader: forward each line so calls can bound their wait.
         // Exits on EOF (child gone) or when the receiver is dropped (respawn
         // or teardown replaced this Proc).
@@ -357,8 +457,9 @@ impl Session {
                 }
             }
         });
-        observer.on_spawn(child.id());
-        Ok(Proc { child, stdin: Arc::new(Mutex::new(stdin)), line_rx, reader: Some(reader) })
+        observer.on_spawn(pid);
+        tracing::info!(model = %label, pid, program = %launch.program.display(), "runner started");
+        Ok(Proc { child, stdin: Arc::new(Mutex::new(stdin)), line_rx, reader: Some(reader), label })
     }
 
     fn lock_proc(&self) -> MutexGuard<'_, Proc> {
@@ -368,6 +469,9 @@ impl Session {
 
     /// Replace the child (after a death) and publish its stdin for cancels.
     fn respawn_into(&self, p: &mut Proc, cause: &SessionError) -> Result<()> {
+        let old_pid = p.child.id();
+        let status = exit_status_within(&mut p.child, Duration::from_millis(200));
+        tracing::warn!(model = %p.label, pid = old_pid, exit = %exit_text(status), cause = %cause, "runner failed; starting a new one");
         let fresh = Self::spawn_proc(&self.launch, self.observer.as_ref())
             .map_err(|e| SessionError::Respawn { cause: cause.to_string(), source: Box::new(e) })?;
         *self.stdin.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh.stdin);
@@ -471,6 +575,7 @@ impl Session {
         match p.line_rx.recv_timeout(timeout) {
             Ok(resp) => Ok(resp),
             Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner did not answer in time; killing it");
                 let _ = p.child.kill();
                 let _ = p.child.wait();
                 Err(SessionError::Timeout { secs: timeout.as_secs() })
@@ -543,6 +648,7 @@ impl Session {
         let outcome: Result<bool> = loop {
             if !cancel_sent && cancel.map(CancelToken::is_cancelled).unwrap_or(false) {
                 cancel_sent = true;
+                tracing::debug!(model = %p.label, pid = p.child.id(), "sending cancel to the runner");
                 if let Err(e) = self.send_cancel() {
                     break Err(e);
                 }
@@ -573,12 +679,17 @@ impl Session {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_line.elapsed() >= timeout {
+                        tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner stream silent too long; killing it");
                         let _ = p.child.kill();
                         let _ = p.child.wait();
                         break Err(SessionError::StreamSilence { secs: timeout.as_secs() });
                     }
                 }
-                Err(RecvTimeoutError::Disconnected) => break Err(SessionError::StreamEof),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let status = exit_status_within(&mut p.child, Duration::from_millis(200));
+                    tracing::warn!(model = %p.label, pid = p.child.id(), exit = %exit_text(status), "runner exited mid-stream");
+                    break Err(SessionError::StreamEof);
+                }
             }
         };
 
@@ -589,6 +700,9 @@ impl Session {
             // answers it with an error line. Drain that line so the next
             // call's response is its own.
             let _ = p.line_rx.recv_timeout(Duration::from_millis(500));
+        }
+        if cancel_sent {
+            tracing::info!(model = %p.label, pid = p.child.id(), acknowledged, "generation cancelled");
         }
         drop(p);
         self.touch();
@@ -626,9 +740,25 @@ impl Session {
         if self.in_flight() != 0 {
             return false;
         }
+        tracing::info!(model = %p.label, pid = p.child.id(), idle_s = timeout.as_secs(), "runner stopped after idle");
         let _ = p.child.kill();
         let _ = p.child.wait();
         true
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::stderr_line;
+
+    #[test]
+    fn stderr_lines_are_trimmed_and_escaped() {
+        assert_eq!(stderr_line("hello\n").as_deref(), Some("hello"));
+        assert_eq!(stderr_line("a\r\n").as_deref(), Some("a"));
+        assert_eq!(stderr_line("  10%|#  \r 50%|##  \r100%|###\n").as_deref(), Some("100%|###"));
+        assert_eq!(stderr_line("\n"), None);
+        assert_eq!(stderr_line("   \r  \n"), None);
+        assert_eq!(stderr_line("warn \u{1b}[31mred\u{1b}[0m\tx").as_deref(), Some("warn \\u{1b}[31mred\\u{1b}[0m\tx"));
     }
 }
 

@@ -147,7 +147,7 @@ impl Engine {
     /// with `fingerprint` (model **and** backend — the identity every vector
     /// carries). Does not touch `resident_embed`; callers decide where it lives.
     pub fn spawn_embed_session(&self, model_id: &str, fingerprint: &str) -> Result<EmbedSession, EngineError> {
-        let launch = self.launch()?;
+        let launch = self.launch()?.with_label(model_id);
         let model_path = self.installed_path(model_id)?;
         let s = EmbedSession::spawn(
             launch,
@@ -162,7 +162,7 @@ impl Engine {
 
     /// Spawn a fresh, ping-verified generation session for `model_id`.
     pub fn spawn_gen_session(&self, model_id: &str) -> Result<GenSession, EngineError> {
-        let launch = self.launch()?;
+        let launch = self.launch()?.with_label(model_id);
         let model_path = self.installed_path(model_id)?;
         let s = GenSession::spawn(
             launch,
@@ -182,14 +182,18 @@ impl Engine {
         let mut reaped = Reaped::default();
         if let Ok(mut guard) = self.resident_embed.try_lock() {
             if guard.as_ref().map(|s| s.is_idle(idle_after)).unwrap_or(false) {
+                let model = guard.as_ref().map(|s| s.model_path().to_string()).unwrap_or_default();
                 *guard = None;
                 reaped.embed = true;
+                tracing::info!(model_path = %model, idle_s = idle_after.as_secs(), "released idle embedding session");
             }
         }
         if let Ok(mut guard) = self.resident_gen.try_lock() {
             if guard.as_ref().map(|s| s.is_idle(idle_after)).unwrap_or(false) {
+                let model = guard.as_ref().map(|s| s.model_id().to_string()).unwrap_or_default();
                 *guard = None;
                 reaped.gen = true;
+                tracing::info!(model = %model, idle_s = idle_after.as_secs(), "released idle generation session");
             }
         }
         reaped

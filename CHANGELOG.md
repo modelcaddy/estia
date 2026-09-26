@@ -61,6 +61,78 @@ repository with its history.
 - `models`, `pull`, `rm`, `roles`, `runtime`.
 - `run`, `chat`, `embed`, `tokens`, `bench`, `runner-check`.
 
+### Logging and request ids
+
+See [docs/logging.md](docs/logging.md).
+
+- **Request ids.** Every response carries an `X-Request-Id` header. A client
+  may send its own (1 to 64 ASCII letters, digits, `.`, `_`, `:`, `-`);
+  anything else is replaced with 16 random hex digits. JSON error bodies carry
+  the id as `error.request_id`. A streamed chat completion that fails after it
+  started ends with `{"error": {"message", "type", "request_id"}}`; a failed
+  `/engine/generate` stream sends `{"error": "…", "request_id": "…"}`.
+- **Access log.** One line per request, target `estia_server::access`: method,
+  path (never the query string), status, duration, peer, the token's name,
+  and for model work the model asked for and served, load time, token counts,
+  time to first token, tokens per second and how it finished. A stream is
+  logged when it ends, so a stream the client abandons shows
+  `finish=cancelled`. 5xx responses and failed streams are `warn`; successful
+  polls (`health`, `stats`, `pairings`, `jobs`, `pair/{id}`) are `debug`. A
+  401 or 403 records its reason. Estia never logs prompts, completions,
+  embedding inputs, vectors, tokens, cache keys or a 422 message.
+- **Lifecycle events** for startup, runner start, handshake, restart, timeout
+  and cancel, model load, ready, release and unload, pulls, runtime installs,
+  role changes, pairing, token changes seen by the server, Bonjour, connection
+  limits and shutdown. Events emitted while a request is handled carry its id
+  in a `request` span. Pulls and installs carry `job_id`.
+- **Filters and formats.** `serve --log-level` / `ESTIA_LOG` and
+  `--log-format text|json` / `ESTIA_LOG_FORMAT`. The default is `info` for
+  Estia and `warn` for libraries. `RUST_LOG` is still read, before
+  `ESTIA_LOG`. An invalid `ESTIA_LOG` stops `serve`; an invalid `RUST_LOG`
+  directive is skipped with a warning. Other commands log Estia's warnings and
+  the runner's stderr.
+- **No prints in the libraries.** `estia-engine` and `estia-server` emit only
+  `tracing` events and install no subscriber; a program that embeds them sees
+  nothing until it installs one. The hand-written stderr logger and the `log`
+  dependency are gone; `mdns-sd` output still arrives, through `tracing-log`.
+- **Runner stderr** is read by Estia and logged line by line (target
+  `estia_engine::runner`) instead of passing straight through, so JSON logs
+  stay one object per line.
+- **Service.** `service install --log-level/--log-format` checks the value and
+  writes it into the service definition. `service logs` gains `-f/--follow`
+  and `-n/--lines`.
+
+Behaviour changes that come with it:
+
+- The server loads a model with an explicit `load` right after starting its
+  runner, so the load time can be logged. The first request waits the same
+  total time as before.
+- When `serve` mints the first admin token itself, it prints the token only
+  if stderr is a terminal. Otherwise it logs a warning without the token,
+  because stderr is then a log file; run `estia token new local --replace` to
+  get one.
+- On Linux, `service logs` reads the journal. It used to read files that
+  systemd never writes.
+
+### For builders
+
+- [docs/building-clients.md](docs/building-clients.md): a guide for putting an
+  app, assistant or tool on top of Estia: roles, tokens and scopes, pairing,
+  discovery, the prompt cache, streaming and cancelling, structured output,
+  tools, embeddings and fingerprints, priorities, limits, errors and request
+  ids, Host and Origin rules, web front-ends, and Rust.
+- [examples/](examples/README.md): a curl walkthrough
+  (`curl/quickstart.sh`); Python chat, retrieval over notes, JSON Schema
+  extraction, tools, pairing, and a chat with no SDK; JavaScript chat and
+  embeddings; and two Rust examples in `engine/examples/`, `remote_client`
+  (`RemoteEngine`) and `in_process` (`Engine` with no server). Each was run
+  against a live engine and prints the request id with any error.
+- [ROADMAP.md](ROADMAP.md): where Estia is today and what comes next, with the
+  check that closes each item.
+- [docs/design/llama-backend.md](docs/design/llama-backend.md): the design for
+  a llama.cpp backend (upstream `llama-server` as a child process behind a
+  protocol-v2 adapter). Not implemented.
+
 ### Hardening before release
 
 These change behaviour for anyone who used the pre-release builds inside
@@ -134,8 +206,18 @@ ModelCaddy.
 
 ### Known limits
 
-- No backend for Linux or Windows yet; a llama.cpp backend is planned.
+[ROADMAP.md](ROADMAP.md) says which of these are planned to change.
+
+- No backend for Linux or Windows yet; a llama.cpp backend is designed and
+  not written.
 - No TLS: LAN traffic, tokens included, is plain HTTP.
 - Image input is not passed through the API.
 - Role sampling settings (`temperature`, `max_tokens`, `pin`) are stored but
-  not applied.
+  not applied. The `embed` role cannot be rebound.
+- A `{"role": "tool"}` message does not reach Gemma: the chat template drops
+  it, because assistant `tool_calls` reach the runner as text. Send tool
+  results as a user message.
+- The JSON Schema in `response_format` is used to validate the output but is
+  not shown to the model. Put it in the prompt.
+- A non-streaming request is not cancelled when its client disconnects, and
+  there is no time limit on reading a request body.

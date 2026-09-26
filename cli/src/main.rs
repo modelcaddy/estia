@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tracing_subscriber::filter::{Directive, EnvFilter, LevelFilter};
 
 #[derive(Parser)]
 #[command(
@@ -182,6 +183,15 @@ enum Cmd {
         /// accepted.
         #[arg(long = "allow-host", value_name = "NAME", value_delimiter = ',')]
         allow_host: Vec<String>,
+        /// What to log: a level (`debug`) or comma-separated filter directives
+        /// (`estia_server=debug,mdns_sd=info`), on top of the default `info`
+        /// for Estia and `warn` for libraries. See docs/logging.md.
+        #[arg(long, env = "ESTIA_LOG", value_name = "FILTER")]
+        log_level: Option<String>,
+        /// Log format on stderr: `text` for people, `json` for log shippers
+        /// (one object per line).
+        #[arg(long, env = "ESTIA_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+        log_format: LogFormat,
     },
     /// Pairing: approve LAN clients (operator side) or request a token (client side).
     Pair {
@@ -223,16 +233,26 @@ enum ServiceAction {
         /// answers to (repeatable, or comma-separated).
         #[arg(long = "allow-host", value_name = "NAME", value_delimiter = ',')]
         allow_host: Vec<String>,
+        /// Passed to `serve --log-level` (see `estia serve --help`). Only this
+        /// flag is passed on; `ESTIA_LOG` in your shell is not.
+        #[arg(long, value_name = "FILTER")]
+        log_level: Option<String>,
+        /// Passed to `serve --log-format`: `text` (default) or `json`.
+        #[arg(long, value_enum)]
+        log_format: Option<LogFormat>,
     },
     Uninstall,
     Start,
     Stop,
     Restart,
     Status,
-    /// Tail the service logs.
+    /// Print the end of the service log (macOS: the log files; Linux: the journal).
     Logs {
-        #[arg(long, default_value_t = 40)]
+        #[arg(long, short = 'n', default_value_t = 40)]
         lines: usize,
+        /// Keep printing new lines as they are written, until Ctrl-C.
+        #[arg(long, short = 'f')]
+        follow: bool,
     },
 }
 
@@ -1014,15 +1034,27 @@ async fn serve(
     let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
     if !no_auth && tokens.is_empty() {
         let t = tokens.mint("local", &[estia_server::tokens::SCOPE_ADMIN])?;
-        eprintln!("minted the first token (name `local`, scope admin). Shown once — keep it:\n\n  {t}\n\n  Authorization: Bearer {t}\n");
+        // Printed for a person at a terminal only: a service's stderr is a
+        // log file, and tokens never go into logs.
+        if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            eprintln!(
+                "minted the first token (name `local`, scope admin). Shown once — keep it:\n\n  {t}\n\n  Authorization: Bearer {t}\n"
+            );
+        } else {
+            tracing::warn!(
+                name = "local",
+                "minted the first admin token; it is not printed because stderr is not a terminal. \
+                 Get a usable one with `estia token new local --replace`"
+            );
+        }
     }
     let state = std::sync::Arc::new(AppState::new(engine, tokens, !no_auth, addr));
     if no_auth {
-        eprintln!("warning: --no-auth — every loopback process can use this engine");
+        tracing::warn!("--no-auth: every process on this machine can use this engine without a token");
     }
     if lan {
-        eprintln!(
-            "LAN mode: clients pair with `estia pair request --engine http://<this-host>:{port}`; approve with `estia pair approve <id>`"
+        tracing::info!(
+            "LAN mode: devices pair with `estia pair request --engine http://<this machine>:{port}`; approve with `estia pair approve <id>`"
         );
     }
     let idle_unload = if idle_unload_minutes == 0 { None } else { Some(std::time::Duration::from_secs(idle_unload_minutes * 60)) };
@@ -1255,9 +1287,10 @@ fn stage_install(data_dir: &Path, runner: &Path) -> Result<(PathBuf, PathBuf)> {
 fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
     let logs = ctx.data_dir.join("logs");
     match action {
-        ServiceAction::Install { port, local, allow_host } => {
+        ServiceAction::Install { port, local, allow_host, log_level, log_format } => {
             // Checked before anything is staged: every path below lives under it.
             service_path(&ctx.data_dir)?;
+            let args = service_args(port, local, &allow_host, log_level.as_deref(), log_format)?;
             std::fs::create_dir_all(&logs)?;
             let runner = ctx
                 .runner()
@@ -1265,7 +1298,6 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
             let (exe, runner) = stage_install(&ctx.data_dir, &runner)?;
             let (exe_s, runner_s, data_s) = (service_path(&exe)?, service_path(&runner)?, service_path(&ctx.data_dir)?);
             println!("staged {} and {}", exe.display(), runner.display());
-            let args = service_args(port, local, &allow_host)?;
             if cfg!(target_os = "macos") {
                 let plist = launchd_plist_path();
                 std::fs::create_dir_all(plist.parent().unwrap())?;
@@ -1387,9 +1419,29 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
             }
         }
         ServiceAction::Status => println!("{}", service_status_line()),
-        ServiceAction::Logs { lines } => {
-            for name in ["estia.err.log", "estia.out.log"] {
-                let p = logs.join(name);
+        ServiceAction::Logs { lines, follow } => {
+            if !cfg!(target_os = "macos") {
+                // systemd sends the service's stderr to the journal.
+                let mut cmd = std::process::Command::new("journalctl");
+                cmd.args(["--user", "-u", "estia", "--no-pager", "-n", &lines.to_string()]);
+                if follow {
+                    cmd.arg("-f");
+                }
+                return run_in_place(cmd);
+            }
+            // Log lines go to stderr (estia.err.log); stdout is kept for anything else.
+            let files: Vec<PathBuf> = ["estia.err.log", "estia.out.log"].iter().map(|n| logs.join(n)).filter(|p| p.exists()).collect();
+            if files.is_empty() {
+                return Err(anyhow!("no service logs in {} (is the service installed? `estia service install`)", logs.display()));
+            }
+            if follow {
+                // `tail -F` follows by name, so it keeps going if a file is
+                // truncated or replaced; Ctrl-C ends it.
+                let mut cmd = std::process::Command::new("tail");
+                cmd.args(["-n", &lines.to_string(), "-F"]).args(&files);
+                return run_in_place(cmd);
+            }
+            for p in files {
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     println!("── {} ──", p.display());
                     let all: Vec<&str> = text.lines().collect();
@@ -1403,6 +1455,26 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
     Ok(())
 }
 
+/// Run a log viewer as this process (on Unix, `exec`), so Ctrl-C or a
+/// signal to `estia` reaches it and nothing is left behind.
+fn run_in_place(mut cmd: std::process::Command) -> Result<()> {
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec();
+        Err(anyhow!("run {program}: {e}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().with_context(|| format!("run {program}"))?;
+        if !status.success() {
+            return Err(anyhow!("{program} exited with {status}"));
+        }
+        Ok(())
+    }
+}
+
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
@@ -1410,10 +1482,16 @@ fn xml_escape(s: &str) -> String {
 /// A path as it goes into a service definition: UTF-8 (a lossy rendering
 /// would name a different file) and free of control characters (a newline
 /// starts a new directive in a unit file; XML 1.0 cannot carry most of them).
-/// The `estia` arguments a service runs with. Host names go into a plist or a
-/// systemd command line, so they are checked here rather than left for
-/// `serve` to skip.
-fn service_args(port: u16, local: bool, allow_host: &[String]) -> Result<Vec<String>> {
+/// The `estia` arguments a service runs with. Host names and the log filter
+/// go into a plist or a systemd command line, so they are checked here rather
+/// than left for `serve` to trip over in a restart loop.
+fn service_args(
+    port: u16,
+    local: bool,
+    allow_host: &[String],
+    log_level: Option<&str>,
+    log_format: Option<LogFormat>,
+) -> Result<Vec<String>> {
     let mut args = vec!["serve".to_string(), "--port".into(), port.to_string()];
     if !local {
         args.push("--lan".into());
@@ -1424,6 +1502,18 @@ fn service_args(port: u16, local: bool, allow_host: &[String]) -> Result<Vec<Str
         }
         args.push("--allow-host".into());
         args.push(name.to_string());
+    }
+    if let Some(filter) = log_level.map(str::trim).filter(|f| !f.is_empty()) {
+        if filter.chars().any(|c| c.is_control() || c.is_whitespace() || c == '\\' || c == '%' || c == '$') {
+            return Err(anyhow!("`{}` is not a log filter", safe(filter)));
+        }
+        log_filter(SERVE_LOG_DEFAULT, None, Some(filter)).map_err(|e| anyhow!("--log-level: {e}"))?;
+        args.push("--log-level".into());
+        args.push(filter.to_string());
+    }
+    if let Some(format) = log_format {
+        args.push("--log-format".into());
+        args.push(format.as_str().into());
     }
     Ok(args)
 }
@@ -1986,55 +2076,110 @@ async fn runtime(ctx: &Ctx, action: RuntimeAction) -> Result<()> {
     Ok(())
 }
 
-/// Stderr logger for the libraries the daemon leans on, off unless `RUST_LOG`
-/// is set (`RUST_LOG=mdns_sd=debug estia serve …`).
-///
-/// mdns-sd reports the things that make an engine undiscoverable — a socket it
-/// could not bind, an interface it skipped — through the `log` crate and
-/// nowhere else, so without a logger installed those failures are invisible and
-/// the registration still looks healthy. The filter is a comma-separated list
-/// of `target=level` (or a bare level for everything).
-struct StderrLogger {
-    filters: Vec<(String, log::LevelFilter)>,
-    default: log::LevelFilter,
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+/// How log events are written to stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum LogFormat {
+    /// One readable line per event, coloured on a terminal.
+    #[default]
+    Text,
+    /// One JSON object per line, for log shippers.
+    Json,
 }
 
-impl log::Log for StderrLogger {
-    fn enabled(&self, m: &log::Metadata) -> bool {
-        let level = self.filters.iter().find(|(t, _)| m.target().starts_with(t.as_str())).map(|(_, l)| *l).unwrap_or(self.default);
-        m.level() <= level
-    }
-    fn log(&self, r: &log::Record) {
-        if self.enabled(r.metadata()) {
-            eprintln!("[{} {}] {}", r.level(), r.target(), r.args());
+impl LogFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            LogFormat::Text => "text",
+            LogFormat::Json => "json",
         }
     }
-    fn flush(&self) {}
 }
 
-fn init_logging() {
-    let Ok(spec) = std::env::var("RUST_LOG") else { return };
-    let mut filters = Vec::new();
-    let mut default = log::LevelFilter::Off;
-    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        match part.split_once('=') {
-            Some((target, level)) => {
-                if let Ok(l) = level.parse() {
-                    filters.push((target.replace('-', "_"), l));
-                }
-            }
-            None => {
-                if let Ok(l) = part.parse() {
-                    default = l;
+/// `serve`: Estia's own events from `info`, libraries from `warn`.
+const SERVE_LOG_DEFAULT: &str = "warn,estia=info";
+/// Every other command prints its own output; it logs Estia's warnings and
+/// the runner's stderr (Python tracebacks among them), and no library output.
+const CLI_LOG_DEFAULT: &str = "estia=warn,estia_engine::runner=info";
+
+/// The filter: `defaults`, then `RUST_LOG`, then `ESTIA_LOG` / `--log-level`,
+/// each a comma-separated list of `tracing` filter directives; a later
+/// directive for the same target replaces an earlier one. A bare level
+/// (`debug`) sets every target, Estia's included, rather than only the
+/// libraries. Bad directives in `ESTIA_LOG` are an error; bad ones in
+/// `RUST_LOG`, which other programs read too, are skipped and returned.
+fn log_filter(defaults: &str, rust_log: Option<&str>, estia_log: Option<&str>) -> Result<(EnvFilter, Vec<String>), String> {
+    let targeted: Vec<&str> = defaults.split(',').filter_map(|d| d.split_once('=').map(|(t, _)| t.trim())).collect();
+    let mut filter = EnvFilter::default();
+    let mut skipped = Vec::new();
+    for (source, spec, strict) in [("defaults", Some(defaults), true), ("RUST_LOG", rust_log, false), ("ESTIA_LOG", estia_log, true)] {
+        let Some(spec) = spec else { continue };
+        for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let expanded: Vec<String> = match part.parse::<LevelFilter>() {
+                Ok(level) => std::iter::once(part.to_string()).chain(targeted.iter().map(|t| format!("{t}={level}"))).collect(),
+                Err(_) => vec![part.to_string()],
+            };
+            for d in expanded {
+                match d.parse::<Directive>() {
+                    Ok(d) => filter = filter.add_directive(d),
+                    Err(e) if strict => return Err(format!("`{}` is not a log filter directive ({e})", safe(part))),
+                    Err(_) => skipped.push(format!("{source}: {}", safe(part))),
                 }
             }
         }
     }
-    let max = filters.iter().map(|(_, l)| *l).chain(std::iter::once(default)).max().unwrap_or(log::LevelFilter::Off);
-    let logger = Box::leak(Box::new(StderrLogger { filters, default }));
-    if log::set_logger(logger).is_ok() {
-        log::set_max_level(max);
+    Ok((filter, skipped))
+}
+
+/// Install the `tracing` subscriber: events to stderr, as text or JSON lines.
+/// Records from crates that use `log` (mdns-sd) come through it too.
+fn init_logging(filter: EnvFilter, format: LogFormat) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let registry = tracing_subscriber::registry().with(filter);
+    let _ = match format {
+        LogFormat::Text => registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stderr)
+                    .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr())),
+            )
+            .try_init(),
+        LogFormat::Json => registry
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .flatten_event(true)
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_writer(std::io::stderr),
+            )
+            .try_init(),
+    };
+}
+
+/// Logging for this invocation: `serve` takes `--log-level` / `--log-format`
+/// (or `ESTIA_LOG` / `ESTIA_LOG_FORMAT`); other commands read the variables.
+fn setup_logging(cmd: &Cmd) -> Result<()> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let (defaults, level, format) = match cmd {
+        Cmd::Serve { log_level, log_format, .. } => (SERVE_LOG_DEFAULT, log_level.clone(), *log_format),
+        _ => {
+            let format = match env("ESTIA_LOG_FORMAT").as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("json") => LogFormat::Json,
+                _ => LogFormat::Text,
+            };
+            (CLI_LOG_DEFAULT, env("ESTIA_LOG"), format)
+        }
+    };
+    let (filter, skipped) =
+        log_filter(defaults, env("RUST_LOG").as_deref(), level.as_deref()).map_err(|e| anyhow!("ESTIA_LOG / --log-level: {e}"))?;
+    init_logging(filter, format);
+    for s in skipped {
+        tracing::warn!("ignored a log filter directive it could not parse: {s}");
     }
+    Ok(())
 }
 
 #[tokio::main]
@@ -2062,8 +2207,8 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run_cli() -> Result<()> {
-    init_logging();
     let cli = Cli::parse();
+    setup_logging(&cli.cmd)?;
     let mut ctx = Ctx::new(&cli)?;
     match cli.cmd {
         Cmd::Models => models(&ctx),
@@ -2092,7 +2237,7 @@ async fn run_cli() -> Result<()> {
         Cmd::Setup { roles, no_models } => setup(&ctx, &roles, no_models).await,
         Cmd::Service { action } => service(&ctx, action),
         Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
-        Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host } => {
+        Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host, log_level: _, log_format: _ } => {
             serve(&ctx, port, bind.as_deref(), lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host).await
         }
         Cmd::Token { action } => token(&ctx, action),
@@ -2251,14 +2396,92 @@ mod tests {
     /// break out of a plist string or a systemd word is refused up front.
     #[test]
     fn service_args_carry_allowed_hosts() {
-        assert_eq!(service_args(27200, true, &[]).unwrap(), ["serve", "--port", "27200"]);
+        assert_eq!(service_args(27200, true, &[], None, None).unwrap(), ["serve", "--port", "27200"]);
         assert_eq!(
-            service_args(1, false, &["studio.lan".into(), " *.home.arpa ".into(), "".into()]).unwrap(),
+            service_args(1, false, &["studio.lan".into(), " *.home.arpa ".into(), "".into()], None, None).unwrap(),
             ["serve", "--port", "1", "--lan", "--allow-host", "studio.lan", "--allow-host", "*.home.arpa"]
         );
         for bad in ["a b", "a\nExecStartPre=/bin/sh", "x\"y", "100%", "$HOME"] {
-            assert!(service_args(1, false, &[bad.into()]).is_err(), "{bad:?} accepted");
+            assert!(service_args(1, false, &[bad.into()], None, None).is_err(), "{bad:?} accepted");
         }
+    }
+
+    /// `service install --log-level/--log-format` reach `serve`; a filter that
+    /// would not parse, or could break out of a service file, is refused.
+    #[test]
+    fn service_args_carry_log_settings() {
+        assert_eq!(
+            service_args(1, true, &[], Some(" estia_server=debug,mdns_sd=info "), Some(LogFormat::Json)).unwrap(),
+            ["serve", "--port", "1", "--log-level", "estia_server=debug,mdns_sd=info", "--log-format", "json"]
+        );
+        assert_eq!(service_args(1, true, &[], Some(""), None).unwrap(), ["serve", "--port", "1"]);
+        for bad in ["estia=loud", "debug\nExecStartPre=/bin/sh", "a b", "$HOME", "100%"] {
+            assert!(service_args(1, true, &[], Some(bad), None).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    /// The events a filter lets through, out of ERROR to DEBUG from a few targets.
+    fn passes(f: EnvFilter) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                self.0.lock().unwrap().push(format!("{} {}", e.metadata().target(), e.metadata().level()));
+            }
+        }
+        let seen = Seen::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(f).with(seen.clone()), || {
+            macro_rules! probe {
+                ($($t:literal),*) => {$(
+                    tracing::event!(target: $t, tracing::Level::ERROR, "p");
+                    tracing::event!(target: $t, tracing::Level::WARN, "p");
+                    tracing::event!(target: $t, tracing::Level::INFO, "p");
+                    tracing::event!(target: $t, tracing::Level::DEBUG, "p");
+                )*};
+            }
+            probe!("estia_server::access", "estia_server", "estia_engine::session", "estia_engine::runner", "mdns_sd::x", "hyper::proto");
+        });
+        let v = seen.0.lock().unwrap().clone();
+        v
+    }
+
+    #[test]
+    fn log_filters_layer_and_bare_levels_cover_estia() {
+        let on = |v: &[String], t: &str, l: &str| v.iter().any(|e| e == &format!("{t} {l}"));
+        let f = |rust: Option<&str>, estia: Option<&str>| passes(log_filter(SERVE_LOG_DEFAULT, rust, estia).unwrap().0);
+
+        let v = f(None, None);
+        assert!(on(&v, "estia_server::access", "INFO") && on(&v, "estia_engine::session", "INFO"));
+        assert!(!on(&v, "estia_server::access", "DEBUG"));
+        assert!(!on(&v, "mdns_sd::x", "INFO") && on(&v, "mdns_sd::x", "WARN"), "libraries at warn");
+
+        let v = f(None, Some("debug"));
+        assert!(on(&v, "estia_server::access", "DEBUG"), "a bare level covers Estia too");
+        assert!(on(&v, "hyper::proto", "DEBUG"));
+
+        let v = f(None, Some("estia_server=debug"));
+        assert!(on(&v, "estia_server::access", "DEBUG"));
+        assert!(!on(&v, "estia_engine::session", "DEBUG"), "only the named crate");
+        assert!(on(&v, "estia_engine::session", "INFO"), "the rest keeps its default");
+
+        let v = f(Some("mdns_sd=debug"), Some("warn"));
+        assert!(on(&v, "mdns_sd::x", "DEBUG"), "RUST_LOG still honoured");
+        assert!(!on(&v, "estia_server::access", "INFO") && on(&v, "estia_server::access", "WARN"), "ESTIA_LOG comes last");
+
+        let v = f(None, Some("estia_server::access=off"));
+        assert!(!on(&v, "estia_server::access", "ERROR"));
+        assert!(on(&v, "estia_server", "INFO"));
+
+        let v = passes(log_filter(CLI_LOG_DEFAULT, None, None).unwrap().0);
+        assert!(on(&v, "estia_engine::runner", "INFO"), "other commands still show runner stderr");
+        assert!(!on(&v, "estia_server::access", "INFO") && on(&v, "estia_server::access", "WARN"));
+        assert!(!on(&v, "mdns_sd::x", "ERROR"));
+
+        let (_, skipped) = log_filter(SERVE_LOG_DEFAULT, Some("mdns_sd=loud,info"), None).unwrap();
+        assert_eq!(skipped, ["RUST_LOG: mdns_sd=loud"]);
+        assert!(log_filter(SERVE_LOG_DEFAULT, None, Some("estia=loud")).is_err());
     }
 
     #[test]

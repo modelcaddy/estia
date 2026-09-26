@@ -1,0 +1,16 @@
+{
+  "name": "estia-examples",
+  "private": true,
+  "description": "Estia from JavaScript through the OpenAI SDK. Node 18 or newer.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "chat": "node chat.mjs",
+    "embed": "node embed.mjs"
+  },
+  "dependencies": {
+    "openai": "^6.0.0"
+  }
+}

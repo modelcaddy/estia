@@ -18,7 +18,12 @@
 //! served only when its `Host` is an IP literal, `localhost`, a `.local` name,
 //! this machine's hostname or a name the operator allowed, and a state-changing
 //! request carrying an `Origin` must come from the same origin it is sent to.
+//!
+//! Outermost of all is the access log ([`access`]): every request gets an id
+//! (`X-Request-Id`) and one log line when its response ends. The crate only
+//! emits `tracing` events; the binary installs the subscriber.
 
+pub mod access;
 pub mod engine_api;
 pub mod jobs;
 pub mod openai;
@@ -141,22 +146,45 @@ impl AppState {
     /// Get or spawn the resident generation session for an artifact. Blocking
     /// (spawns a process on first use) — call from `spawn_blocking`.
     pub fn gen_session(&self, artifact: &Artifact) -> Result<Arc<GenSession>, ApiError> {
+        self.gen_session_timed(artifact).map(|(s, _)| s)
+    }
+
+    /// [`AppState::gen_session`], plus how long starting it took (runner,
+    /// handshake, model load) when this call started it.
+    pub(crate) fn gen_session_timed(&self, artifact: &Artifact) -> Result<(Arc<GenSession>, Option<u64>), ApiError> {
         if let Some(s) = self.gen.lock().unwrap().get(artifact.id) {
-            return Ok(Arc::clone(s));
+            return Ok((Arc::clone(s), None));
         }
-        let s = Arc::new(self.engine.spawn_gen_session(artifact.id)?);
+        let t0 = Instant::now();
+        let s = self.engine.spawn_gen_session(artifact.id)?;
+        // Load now rather than inside the first generation, so the log can say
+        // how long the load took. The first request waits the same either way.
+        s.load()?;
+        let ms = t0.elapsed().as_millis() as u64;
+        tracing::info!(model = %artifact.id, family = %artifact.family, ready_ms = ms, "generation model ready");
+        let s = Arc::new(s);
         self.gen.lock().unwrap().insert(artifact.id.to_string(), Arc::clone(&s));
-        Ok(s)
+        Ok((s, Some(ms)))
     }
 
     pub fn embed_session(&self, model: &EmbedModel) -> Result<Arc<EmbedSession>, ApiError> {
+        self.embed_session_timed(model).map(|(s, _)| s)
+    }
+
+    /// [`AppState::embed_session`], plus how long starting it took.
+    pub(crate) fn embed_session_timed(&self, model: &EmbedModel) -> Result<(Arc<EmbedSession>, Option<u64>), ApiError> {
         if let Some(s) = self.embed.lock().unwrap().get(model.id) {
-            return Ok(Arc::clone(s));
+            return Ok((Arc::clone(s), None));
         }
+        let t0 = Instant::now();
         let fingerprint = model.fingerprint_for(self.embed_backend());
-        let s = Arc::new(self.engine.spawn_embed_session(model.id, &fingerprint)?);
+        let s = self.engine.spawn_embed_session(model.id, &fingerprint)?;
+        s.load()?;
+        let ms = t0.elapsed().as_millis() as u64;
+        tracing::info!(model = %model.id, dims = model.dims, ready_ms = ms, "embedding model ready");
+        let s = Arc::new(s);
         self.embed.lock().unwrap().insert(model.id.to_string(), Arc::clone(&s));
-        Ok(s)
+        Ok((s, Some(ms)))
     }
 
     /// Artifact ids with a live session.
@@ -232,9 +260,15 @@ impl ApiError {
 }
 
 impl IntoResponse for ApiError {
+    /// Inside a request (always, for the router's handlers) the body also
+    /// carries `request_id`, and the access log notes the error.
     fn into_response(self) -> Response {
-        let body = serde_json::json!({"error": {"message": self.message, "type": self.kind, "code": self.status.as_u16()}});
-        (self.status, Json(body)).into_response()
+        let mut err = serde_json::json!({"message": self.message, "type": self.kind, "code": self.status.as_u16()});
+        if let Some(a) = access::Access::current() {
+            a.error(self.status.as_u16(), self.kind, &self.message);
+            err["request_id"] = serde_json::Value::String(a.id().to_string());
+        }
+        (self.status, Json(serde_json::json!({ "error": err }))).into_response()
     }
 }
 
@@ -286,6 +320,13 @@ pub fn required_scope(method: &Method, path: &str) -> Option<&'static str> {
 /// from the fallback rather than a 401. Attaches the [`Caller`] every handler
 /// sees.
 async fn auth(State(state): State<Arc<AppState>>, mut req: Request<Body>, next: Next) -> Response {
+    let access = access::Access::current();
+    let refuse = |reason: String, e: ApiError| {
+        if let Some(a) = &access {
+            a.refused(reason);
+        }
+        e.into_response()
+    };
     let caller = match required_scope(req.method(), req.uri().path()) {
         None => Caller::anonymous(),
         Some(_) if !state.require_auth => Caller::anonymous(),
@@ -293,15 +334,40 @@ async fn auth(State(state): State<Arc<AppState>>, mut req: Request<Body>, next: 
             let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
             let token = bearer.strip_prefix("Bearer ").unwrap_or("").trim();
             if token.is_empty() {
-                return ApiError::unauthorized("missing bearer token (Authorization: Bearer …)").into_response();
+                let why = if bearer.is_empty() { "missing bearer token" } else { "Authorization is not `Bearer <token>`" };
+                return refuse(why.into(), ApiError::unauthorized("missing bearer token (Authorization: Bearer …)"));
             }
             match state.tokens.verify(token) {
                 Some(record) if record.allows(scope) => Caller::token(&record),
-                Some(_) => return ApiError::forbidden(format!("token lacks the `{scope}` scope")).into_response(),
-                None => return ApiError::unauthorized("unknown token").into_response(),
+                Some(record) => {
+                    if let Some(a) = &access {
+                        a.caller(&record.name);
+                    }
+                    return refuse(
+                        format!("token lacks the `{scope}` scope"),
+                        ApiError::forbidden(format!("token lacks the `{scope}` scope")),
+                    );
+                }
+                None => {
+                    // The client is told only "unknown token"; the log says
+                    // whether it is one that was revoked while this server ran.
+                    let why = match state.tokens.revoked_name(token) {
+                        Some(name) => {
+                            if let Some(a) = &access {
+                                a.caller(&name);
+                            }
+                            "revoked token".to_string()
+                        }
+                        None => "unknown token".to_string(),
+                    };
+                    return refuse(why, ApiError::unauthorized("unknown token"));
+                }
             }
         }
     };
+    if let (Some(a), Some(name)) = (&access, &caller.name) {
+        a.caller(name);
+    }
     req.extensions_mut().insert(caller.clone());
     CURRENT_CALLER.scope(caller, next.run(req)).await
 }
@@ -529,11 +595,19 @@ fn machine_hostnames() -> Vec<String> {
 /// The DNS-rebinding and cross-origin guard; outermost, so it covers open
 /// routes (health, pairing, the client page) and unknown paths too.
 async fn host_guard(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+    let refused = |reason: String| {
+        if let Some(a) = access::Access::current() {
+            a.refused(reason);
+        }
+    };
     // HTTP/2 carries the authority in the URI rather than a Host header.
     let host = match req.headers().get(header::HOST) {
         Some(v) => match v.to_str() {
             Ok(s) => Some(s.to_string()),
-            Err(_) => return ApiError::forbidden("unreadable Host header").into_response(),
+            Err(_) => {
+                refused("unreadable Host header".into());
+                return ApiError::forbidden("unreadable Host header").into_response();
+            }
         },
         None => req.uri().authority().map(|a| a.to_string()),
     };
@@ -542,8 +616,10 @@ async fn host_guard(State(state): State<Arc<AppState>>, req: Request<Body>, next
     if let Some(h) = &host {
         if !state.hosts.read().unwrap_or_else(|e| e.into_inner()).allows(h) {
             let Some(HostName::Name(name)) = parse_host(h) else {
+                refused(format!("malformed Host header `{h}`"));
                 return ApiError::forbidden(format!("malformed Host header `{h}`")).into_response();
             };
+            refused(format!("host `{name}` not allowed (DNS-rebinding guard)"));
             return ApiError::forbidden(format!(
                 "this engine does not answer to the host name `{name}` (DNS-rebinding guard). Use an IP address, \
                  localhost or <machine>.local, or allow the name with `estia serve --allow-host {name}` \
@@ -560,6 +636,7 @@ async fn host_guard(State(state): State<Arc<AppState>>, req: Request<Body>, next
             let origin = origin.to_str().unwrap_or("");
             let ok = host.as_deref().is_some_and(|h| same_origin(origin, h));
             if !ok {
+                refused(format!("cross-origin {} from Origin `{origin}`", req.method()));
                 return ApiError::forbidden(format!(
                     "cross-origin request refused: Origin `{origin}` is not the origin this request was sent to (`{}`)",
                     host.as_deref().unwrap_or("")
@@ -610,6 +687,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), auth))
         .fallback(no_route)
         .layer(middleware::from_fn_with_state(Arc::clone(&state), host_guard))
+        // Outermost: request ids and the access log see every request,
+        // including the ones the guards refuse and unknown paths.
+        .layer(middleware::from_fn(access::middleware))
         .with_state(state)
 }
 
@@ -840,11 +920,16 @@ fn register(port: u16, instance: &str) -> anyhow::Result<Registration> {
     #[cfg(target_os = "macos")]
     {
         match register_via_dns_sd(port, instance) {
-            Ok(c) => return Ok(Registration::System(c)),
-            Err(e) => eprintln!("warning: registering via dns-sd failed ({e}); falling back to our own sockets"),
+            Ok(c) => {
+                tracing::debug!(instance = %instance, port, via = "dns-sd", "Bonjour registration");
+                return Ok(Registration::System(c));
+            }
+            Err(e) => tracing::warn!(error = %e, "registering via dns-sd failed; falling back to our own multicast sockets"),
         }
     }
-    Ok(Registration::Rust(Box::new(register_via_mdns_sd(port, instance)?)))
+    let d = register_via_mdns_sd(port, instance)?;
+    tracing::debug!(instance = %instance, port, via = "mdns-sd", "Bonjour registration");
+    Ok(Registration::Rust(Box::new(d)))
 }
 
 /// How often the advertiser looks for a reason to re-register.
@@ -941,7 +1026,7 @@ impl Advertiser {
         match self.rebuild() {
             Ok(()) => Some(reason),
             Err(e) => {
-                eprintln!("warning: Bonjour re-registration failed ({reason}): {e}");
+                tracing::warn!(reason = %reason, error = %e, "Bonjour re-registration failed");
                 None
             }
         }
@@ -1046,16 +1131,31 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     };
     std::fs::create_dir_all(&data_dir)?;
     std::fs::write(engine_record_path(&data_dir), serde_json::to_string_pretty(&record)?)?;
-    eprintln!("estia serving on http://{bound}  (api v{API_VERSION}; Ctrl-C to stop)");
+    tracing::info!(
+        version = %env!("CARGO_PKG_VERSION"),
+        api_version = API_VERSION,
+        protocol_version = estia_engine::proto::PROTOCOL_VERSION,
+        url = %format!("http://{bound}"),
+        bind = %bound,
+        auth = state.require_auth,
+        lan = opts.lan,
+        advertise = opts.advertise && !bound.ip().is_loopback(),
+        idle_unload_s = opts.idle_unload.map(|d| d.as_secs()),
+        allowed_hosts = %if opts.allowed_hosts.is_empty() { "-".to_string() } else { opts.allowed_hosts.join(",") },
+        data_dir = %data_dir.display(),
+        runner = %state.engine.resident_runner().display(),
+        pid = std::process::id(),
+        "estia serving"
+    );
     let advertiser = if opts.advertise && !bound.ip().is_loopback() {
         let instance = opts.name.clone().unwrap_or_else(hostname);
         match Advertiser::start(bound.port(), instance.clone()) {
             Ok(a) => {
-                eprintln!("advertising {MDNS_SERVICE_TYPE} as `{instance}` on port {}", bound.port());
+                tracing::info!(service = MDNS_SERVICE_TYPE, instance = %instance, port = bound.port(), "advertising over Bonjour");
                 Some(Arc::new(std::sync::Mutex::new(Some(a))))
             }
             Err(e) => {
-                eprintln!("warning: Bonjour advertisement failed: {e}");
+                tracing::warn!(error = %e, "Bonjour advertisement failed; pairing by address still works");
                 None
             }
         }
@@ -1071,7 +1171,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
                 let Ok(mut guard) = a.lock() else { return };
                 let Some(ad) = guard.as_mut() else { return };
                 if let Some(why) = ad.tick() {
-                    eprintln!("re-registered Bonjour advertisement ({why})");
+                    tracing::info!(reason = %why, "re-registered the Bonjour advertisement");
                 }
             }
         })
@@ -1083,13 +1183,14 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 let dropped = st.reap_idle(idle);
                 for d in dropped {
-                    eprintln!("idle {}s: released {d}", idle.as_secs());
+                    tracing::info!(model = %d, idle_s = idle.as_secs(), "released idle model");
                 }
             }
         });
     }
-    let app = router(state);
+    let app = router(Arc::clone(&state));
     let result = serve_router(listener, app, ConnLimits::default(), shutdown_signal()).await;
+    let loaded = state.loaded();
     let _ = std::fs::remove_file(engine_record_path(&data_dir));
     if let Some(t) = advert_task {
         t.abort();
@@ -1098,8 +1199,13 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         if let Ok(mut guard) = a.lock() {
             if let Some(ad) = guard.take() {
                 ad.stop();
+                tracing::info!("stopped the Bonjour advertisement");
             }
         }
+    }
+    match &result {
+        Ok(()) => tracing::info!(uptime_s = state.started.elapsed().as_secs(), loaded = %loaded.join(","), "estia stopped"),
+        Err(e) => tracing::error!(error = %e, "estia stopped with an error"),
     }
     result?;
     Ok(())
@@ -1204,9 +1310,9 @@ impl Drop for PeerSlot {
 /// Serve `app` on `listener` over HTTP/1.1 until `shutdown` resolves, with
 /// the limits `axum::serve` lacks: a request-head timeout, a per-peer
 /// connection cap and a total cap below the open-files limit. Accept errors
-/// are printed (there is no tracing subscriber to catch them). On shutdown,
-/// in-flight requests get ten seconds; a long SSE stream does not hold the
-/// process hostage.
+/// and refused connections are logged (`warn`). On shutdown, in-flight
+/// requests get ten seconds; a long SSE stream does not hold the process
+/// hostage.
 pub async fn serve_router(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -1216,6 +1322,10 @@ pub async fn serve_router(
     use tower_service::Service as _;
     let soft = raise_fd_limit();
     let total = limits.total.unwrap_or_else(|| soft.saturating_sub(FD_HEADROOM).clamp(16, 4_096) as usize);
+    tracing::debug!(open_files = soft, max_connections = total, per_client = limits.per_peer, "connection limits");
+    // A client over its connection cap is logged at most every 10 s, with a count.
+    let mut refused_since_log: u64 = 0;
+    let mut last_refusal_log: Option<Instant> = None;
     let budget = Arc::new(tokio::sync::Semaphore::new(total));
     let peers: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> = Arc::default();
     let mut http = hyper::server::conn::http1::Builder::new();
@@ -1234,7 +1344,7 @@ pub async fn serve_router(
             r = listener.accept() => match r {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("accept failed: {e}");
+                    tracing::warn!(error = %e, "accept failed");
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     continue;
                 }
@@ -1243,6 +1353,17 @@ pub async fn serve_router(
         };
         let Some(slot) = PeerSlot::take(&peers, peer.ip(), &limits) else {
             // This peer holds its share already; close at once.
+            refused_since_log += 1;
+            if last_refusal_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+                tracing::warn!(
+                    peer = %peer.ip(),
+                    per_client = limits.per_peer,
+                    refused = refused_since_log,
+                    "connection refused: this client already holds its share of connections"
+                );
+                refused_since_log = 0;
+                last_refusal_log = Some(Instant::now());
+            }
             continue;
         };
         let _ = stream.set_nodelay(true);
@@ -1256,7 +1377,10 @@ pub async fn serve_router(
         });
     }
     drop(listener);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), graceful.shutdown()).await;
+    tracing::info!("shutting down: no new connections; waiting up to 10 s for requests in flight");
+    if tokio::time::timeout(std::time::Duration::from_secs(10), graceful.shutdown()).await.is_err() {
+        tracing::warn!("requests still in flight after 10 s; closing them");
+    }
     Ok(())
 }
 
@@ -1265,14 +1389,16 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = term.recv() => {},
-        }
+        let signal = tokio::select! {
+            _ = tokio::signal::ctrl_c() => "SIGINT",
+            _ = term.recv() => "SIGTERM",
+        };
+        tracing::info!(signal = %signal, "shutdown requested");
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+        tracing::info!(signal = "ctrl-c", "shutdown requested");
     }
 }
 

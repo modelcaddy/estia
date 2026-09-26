@@ -30,6 +30,12 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
 tokio-stream.workspace = true
+# Access log and lifecycle events; the binary installs the subscriber.
+# http-body wraps response bodies so a streamed response is logged when it ends.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+http-body = "1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
+# Captures the access log in tests.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std", "registry"] }

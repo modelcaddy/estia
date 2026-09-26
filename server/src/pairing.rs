@@ -15,6 +15,10 @@
 //! from one address, so a hostile client cannot flood the operator with cards
 //! or lock everyone else out. Names are checked here, at the source, because
 //! the operator reads them in a terminal: see [`validate_name`].
+//!
+//! Each step is logged (`info`): requested, approved, denied, token
+//! collected, expired. An approved token that expires uncollected is a `warn`,
+//! because the token stays valid until revoked.
 
 use crate::tokens::{lock_exclusive, write_private, FileLock, TokenStore, ALL_SCOPES};
 use serde::{Deserialize, Serialize};
@@ -175,6 +179,9 @@ pub struct PairingStore {
     tokens_path: PathBuf,
     /// Serialises this process's writers; the lock file serialises processes.
     guard: Mutex<()>,
+    /// Pairings already logged as expired, so the sweep that every read runs
+    /// reports each one once.
+    expired_seen: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Held for a whole load → modify → save.
@@ -190,6 +197,33 @@ impl PairingStore {
             lock_path: data_dir.join("pairings.lock"),
             tokens_path: data_dir.join("tokens.json"),
             guard: Mutex::new(()),
+            expired_seen: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Log pairings the sweep dropped, once each.
+    fn note_expired(&self, dropped: Vec<Pairing>) {
+        if dropped.is_empty() {
+            return;
+        }
+        let mut seen = self.expired_seen.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() > 4096 {
+            seen.clear();
+        }
+        for p in dropped {
+            if !seen.insert(p.id.clone()) {
+                continue;
+            }
+            match p.status {
+                PairingStatus::Pending => tracing::info!(id = %p.id, name = p.name.as_str(), "pairing request expired undecided"),
+                PairingStatus::Approved if !p.claimed => tracing::warn!(
+                    id = %p.id,
+                    name = p.name.as_str(),
+                    token_name = p.token_name.as_deref(),
+                    "approved pairing expired before its token was collected; the token stays valid until revoked (estia token revoke)"
+                ),
+                _ => tracing::debug!(id = %p.id, name = p.name.as_str(), "pairing record dropped"),
+            }
         }
     }
 
@@ -211,10 +245,13 @@ impl PairingStore {
         };
         let cutoff = now().saturating_sub(PAIRING_TTL_SECS);
         // Sweep: pending requests expire; decided ones stay until claimed or expired.
-        v.retain(|p| {
+        let keep = |p: &Pairing| {
             p.created_unix >= cutoff
                 || (p.status == PairingStatus::Approved && !p.claimed && p.created_unix >= cutoff.saturating_sub(PAIRING_TTL_SECS))
-        });
+        };
+        let (kept, dropped): (Vec<Pairing>, Vec<Pairing>) = v.into_iter().partition(keep);
+        v = kept;
+        self.note_expired(dropped);
         Ok(v)
     }
 
@@ -268,6 +305,13 @@ impl PairingStore {
         };
         v.push(p.clone());
         self.save(&v)?;
+        tracing::info!(
+            id = %p.id,
+            name = p.name.as_str(),
+            scopes = %p.scopes.join(","),
+            from = p.from.as_deref().map(tracing::field::display),
+            "pairing requested"
+        );
         Ok(p)
     }
 
@@ -295,6 +339,7 @@ impl PairingStore {
             let _ = tokens.revoke(&token_name);
             return Err(e);
         }
+        tracing::info!(id = %out.id, name = out.name.as_str(), scopes = %out.scopes.join(","), token_name = token_name.as_str(), "pairing approved");
         Ok(out)
     }
 
@@ -338,6 +383,7 @@ impl PairingStore {
         p.token_plain = None;
         let out = p.clone();
         self.save(&v)?;
+        tracing::info!(id = %out.id, name = out.name.as_str(), revoked = out.revoked, token_name = out.token_name.as_deref(), "pairing denied");
         Ok(out)
     }
 
@@ -363,7 +409,9 @@ impl PairingStore {
         }
         p.claimed = true;
         let token = p.token_plain.take();
+        let (id, name) = (p.id.clone(), p.name.clone());
         self.save(&v)?;
+        tracing::info!(id = %id, name = name.as_str(), "pairing token collected");
         Ok((status, token))
     }
 }

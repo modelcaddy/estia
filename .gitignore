@@ -25,3 +25,10 @@ __pycache__/
 .idea/
 .vscode/
 *.swp
+
+# Examples: local environments and the files the examples write
+examples/python/.venv/
+examples/javascript/node_modules/
+examples/javascript/package-lock.json
+examples/python/rag-index.json
+examples/python/estia-token

@@ -418,7 +418,10 @@ where
                         Ok(()) => break Ok(idx),
                         Err(_) if paused.load(Ordering::SeqCst) => break Err(anyhow!("{DOWNLOAD_PAUSED_MARKER}")),
                         Err(e) if attempt >= PARALLEL_CHUNK_ATTEMPTS => break Err(e),
-                        Err(_) => tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await,
+                        Err(e) => {
+                            tracing::debug!(model = %cancel_id, chunk = idx, attempt, error = %e, "chunk download failed; retrying");
+                            tokio::time::sleep(Duration::from_millis(600 * attempt as u64)).await
+                        }
                     }
                 };
                 let failed = result.is_err();
@@ -814,6 +817,10 @@ where
     // Bytes already on disk from an interrupted attempt count as done, so a
     // resumed download doesn't restart its progress bar at zero.
     let already_on_disk = dir_size(&temp_destination).unwrap_or(0);
+    if already_on_disk > 0 {
+        tracing::info!(model = %model_id, bytes_on_disk = already_on_disk, "resuming a partial download");
+    }
+    tracing::debug!(model = %model_id, repo = %repo_id, revision = %revision, files = file_count, bytes = planned_bytes, "download plan");
 
     // Fail before transferring gigabytes we can't store. `df` is best-effort,
     // so an unreadable probe just skips the check.
@@ -894,7 +901,8 @@ where
                         // refetch clean rather than reporting tampering. A
                         // from-scratch download that fails still hard-errors —
                         // that check is the point of verifying at all.
-                        Err(_) if reused && !last_attempt => {
+                        Err(err) if reused && !last_attempt => {
+                            tracing::warn!(model = %model_id, file = %file.path, error = %err, "a resumed file failed verification; downloading it again");
                             tokio::fs::remove_file(&target).await.ok();
                             tokio::fs::remove_file(chunk_sidecar_path(&target)).await.ok();
                         }
@@ -908,7 +916,8 @@ where
                         }
                     }
                 }
-                Err(_) if !last_attempt => {
+                Err(err) if !last_attempt => {
+                    tracing::warn!(model = %model_id, file = %file.path, attempt, error = %err, "download attempt failed; retrying");
                     // Leave the partial in place on purpose: the next attempt
                     // resumes from it instead of re-fetching what already landed.
                     tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;

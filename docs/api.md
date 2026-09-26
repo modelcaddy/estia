@@ -109,10 +109,11 @@ Embedding requests take an embedding model id or `embed`.
 
 ## Errors
 
-Errors raised by the handlers use OpenAI's shape:
+Errors raised by the handlers use OpenAI's shape, plus the request id (see
+[Request ids](#request-ids)):
 
 ```json
-{"error": {"message": "model `gemma4-e2b-it-4bit-mlx` is not downloaded at …", "type": "not_found_error", "code": 404}}
+{"error": {"message": "model `gemma4-e2b-it-4bit-mlx` is not downloaded at …", "type": "not_found_error", "code": 404, "request_id": "0938df2480a78ff1"}}
 ```
 
 | Status | When |
@@ -123,11 +124,33 @@ Errors raised by the handlers use OpenAI's shape:
 | 404 | Unknown path, unknown model, model not downloaded, unknown job, unknown pairing id on poll |
 | 422 | Structured output still invalid after the retry; embedding fingerprint mismatch |
 | 429 | `POST /engine/pair` while 24 requests are pending, or 4 from the same address (type `rate_limit_error`) |
-| 500 | Runner failure; the pairing store could not be read or written (details in the server's log) |
+| 500 | Runner failure; the pairing store could not be read or written (details in the server's log, under the request id) |
 
 A body that is not JSON, lacks `Content-Type: application/json`, or does not
 fit the route's fields is rejected before the handler runs, with a plain-text
-400, 415 or 422 from the HTTP framework.
+400, 415 or 422 from the HTTP framework. These responses still carry the
+`X-Request-Id` header.
+
+## Request ids
+
+Every response, on every route and every status, carries an `X-Request-Id`
+header. The id also appears:
+
+- in every JSON error body, as `error.request_id`;
+- in the last event of a streamed chat completion that fails after it
+  started: `data: {"error": {"message", "type", "request_id"}}`, then
+  `data: [DONE]`;
+- in the error event of a failed `/engine/generate` stream:
+  `{"error": "…", "request_id": "…"}`;
+- on every line the engine logs while it handles the request (see
+  [logging.md](logging.md#request-ids)).
+
+A client may send its own `X-Request-Id`. The server keeps it when it is 1 to
+64 characters of ASCII letters, digits, `.`, `_`, `:` and `-`, and otherwise
+replaces it with 16 random hex digits. Log the id next to any error you show
+or report, so the operator can find the request. The OpenAI SDKs expose it:
+`response._request_id` and `error.request_id` in Python, `error.requestID` in
+JavaScript.
 
 ## POST /v1/chat/completions
 
@@ -173,8 +196,11 @@ With `--no-auth` every request shares one namespace.
 declared, the server holds the first characters back to tell a tool call from
 prose; a tool call, or any JSON-mode output, is sent in the final chunk
 instead of token by token. The final chunk carries `finish_reason`, `usage` and
-`x_estia` (`cached_tokens`, `template`, `ms`). If the client disconnects, the
-generation is cancelled in the runner.
+`x_estia` (`cached_tokens`, `template`, `ms`). A stream that fails after it
+started ends with `data: {"error": {"message", "type", "request_id"}}` and
+`data: [DONE]`. If the client disconnects, the generation is cancelled in the
+runner. A non-streaming request is not cancelled when its client disconnects:
+the generation runs to the end.
 
 ## POST /v1/embeddings
 
@@ -290,8 +316,8 @@ Response:
 
 `meta` is `null` for a raw `prompt`. With `stream: true` the events are
 `{"token": "…"}` and then `{"done": true, "text": …, "meta": …, "model": …,
-"family": …, "backend": …, "ms": …}`, or `{"error": "…"}`. There is no
-`[DONE]` sentinel on this route.
+"family": …, "backend": …, "ms": …}`, or `{"error": "…", "request_id": "…"}`.
+There is no `[DONE]` sentinel on this route.
 
 ## POST /engine/embed
 
@@ -364,6 +390,10 @@ if an approved token is still uncollected); denying it after that is a 400
 that points to `estia token revoke`.
 
 ## Clients
+
+[building-clients.md](building-clients.md) is the guide for writing one, and
+[`examples/`](../examples/README.md) has runnable programs in shell, Python,
+JavaScript and Rust.
 
 - Any OpenAI SDK: set the base URL to `http://<host>:27200/v1` and the API key
   to the token.
