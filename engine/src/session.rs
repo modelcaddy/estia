@@ -12,7 +12,7 @@
 //!   writes) would otherwise block `read_line` forever while holding the
 //!   process lock and freeze every caller. A persistent reader thread forwards
 //!   lines over a channel so the wait is bounded with `recv_timeout`; on
-//!   overrun the child is killed and the call fails.
+//!   overrun the child is stopped and the call fails.
 //! - **Bounded respawn.** A broken pipe or EOF means the child died. The call
 //!   respawns it once and retries; a second failure propagates. Never a loop.
 //! - **Streams do not retry.** Once a token has reached the caller, a retry
@@ -205,16 +205,31 @@ struct Proc {
 
 impl Drop for Proc {
     fn drop(&mut self) {
-        // Kill → stdout closes → the reader's read_line hits EOF → join.
+        // Stop → stdout closes → the reader's read_line hits EOF → join.
         let pid = self.child.id();
-        let already = self.child.try_wait().ok().flatten();
-        let _ = self.child.kill();
-        let status = self.child.wait().ok();
+        let status = stop_child(&mut self.child);
         if let Some(h) = self.reader.take() {
             let _ = h.join();
         }
-        tracing::debug!(model = %self.label, pid, exit = %exit_text(already.or(status)), "runner stopped");
+        tracing::debug!(model = %self.label, pid, exit = %exit_text(status), "runner stopped");
     }
+}
+
+/// Stop a runner: SIGTERM, up to [`STOP_GRACE`] for it to exit, then SIGKILL.
+/// The grace lets a runner clean up after itself: the llama adapter stops its
+/// llama-server and removes its socket and record. Returns how the child
+/// ended, when known.
+fn stop_child(child: &mut Child) -> Option<std::process::ExitStatus> {
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
+    }
+    if ask_to_stop(child.id()) {
+        if let Some(status) = exit_status_within(child, STOP_GRACE) {
+            return Some(status);
+        }
+    }
+    let _ = child.kill();
+    child.wait().ok()
 }
 
 /// How a child ended, for a log line: `code 1`, `signal 9`, `running`.
@@ -231,6 +246,30 @@ fn exit_text(status: Option<std::process::ExitStatus>) -> String {
         }
     }
     status.to_string()
+}
+
+/// How long a runner gets to exit after SIGTERM before it is killed. The llama
+/// adapter notices the signal within 100 ms and gives its llama-server up to
+/// 3 s; the Python runner has no handler and exits at once.
+const STOP_GRACE: Duration = Duration::from_secs(4);
+
+/// Send SIGTERM to a runner. `false` if it could not be sent (or on Windows,
+/// where the runner is killed outright).
+#[cfg(unix)]
+fn ask_to_stop(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(not(unix))]
+fn ask_to_stop(_pid: u32) -> bool {
+    false
 }
 
 /// The child's exit status, waiting up to `within` for it to be reaped. A
@@ -569,15 +608,14 @@ impl Session {
     }
 
     /// Write one request line, wait up to `timeout` for one response line. On
-    /// timeout the child is killed (so the caller's retry respawns it).
+    /// timeout the child is stopped (so the caller's retry respawns it).
     fn exchange(p: &mut Proc, line: &str, timeout: Duration) -> Result<String> {
         Self::write_line(&p.stdin, line)?;
         match p.line_rx.recv_timeout(timeout) {
             Ok(resp) => Ok(resp),
             Err(RecvTimeoutError::Timeout) => {
-                tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner did not answer in time; killing it");
-                let _ = p.child.kill();
-                let _ = p.child.wait();
+                tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner did not answer in time; stopping it");
+                stop_child(&mut p.child);
                 Err(SessionError::Timeout { secs: timeout.as_secs() })
             }
             Err(RecvTimeoutError::Disconnected) => Err(SessionError::Eof),
@@ -679,9 +717,8 @@ impl Session {
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_line.elapsed() >= timeout {
-                        tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner stream silent too long; killing it");
-                        let _ = p.child.kill();
-                        let _ = p.child.wait();
+                        tracing::warn!(model = %p.label, pid = p.child.id(), secs = timeout.as_secs(), "runner stream silent too long; stopping it");
+                        stop_child(&mut p.child);
                         break Err(SessionError::StreamSilence { secs: timeout.as_secs() });
                     }
                 }
@@ -723,14 +760,14 @@ impl Session {
         self.in_flight() == 0 && self.last_used.lock().unwrap_or_else(PoisonError::into_inner).elapsed() >= timeout
     }
 
-    /// In-flight-gated soft teardown: if idle past `timeout`, kill the child in
+    /// In-flight-gated soft teardown: if idle past `timeout`, stop the child in
     /// place (freeing its memory) and return `true`. The next call transparently
     /// respawns it through the broken-pipe path. Returns `false` while a call
     /// is in flight or before `timeout`.
     ///
     /// The counter is re-read under the process lock to close the race where a
     /// call increments it after the first check but before locking; even if
-    /// that slips through, the killed pipe only triggers a respawn on that
+    /// that slips through, the closed pipe only triggers a respawn on that
     /// call, so correctness holds either way.
     pub fn maybe_shutdown(&self, timeout: Duration) -> bool {
         if !self.is_idle(timeout) {
@@ -741,8 +778,7 @@ impl Session {
             return false;
         }
         tracing::info!(model = %p.label, pid = p.child.id(), idle_s = timeout.as_secs(), "runner stopped after idle");
-        let _ = p.child.kill();
-        let _ = p.child.wait();
+        stop_child(&mut p.child);
         true
     }
 }

@@ -54,6 +54,214 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  llama:
+    # The llama.cpp adapter (crate estia-llama) against a real upstream
+    # llama-server. The build is the one engine/src/runtime/llama_pins.rs pins,
+    # and its SHA-256 is checked here against that file, so a PR that bumps
+    # the pin is tested by this job without editing it. The models are tiny:
+    # tinygemma3 (47 MB, has a chat template, answers gibberish) tests the
+    # protocol mechanics, not output quality; all-MiniLM-L6-v2 Q8_0 (25 MB,
+    # 384 dimensions) tests embeddings. Gemma 4's template and tool calls need
+    # a real Gemma 4 file and are not tested here.
+    name: llama (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The x64 CPU build. Upstream builds it on Ubuntu 22.04.
+          - os: ubuntu-latest
+            pin: linux x86_64 cpu
+          # The Apple Silicon build: Metal, with the CPU backend included.
+          - os: macos-15
+            pin: macos aarch64 metal
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # Hugging Face files, pinned to a commit and checked against the SHA-256
+      # the Hub reports for them (the LFS oid).
+      CHAT_MODEL_URL: https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/c287502cd9e278dac8eed805c112cce5d0081e0b/tinygemma3-Q8_0.gguf
+      CHAT_MODEL_SHA256: 7566ae7219c93ea2ecc692a931ee122d30c55261d0e2c3347acb8b939d2e9abd
+      EMBED_MODEL_URL: https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-Q8_0.gguf
+      EMBED_MODEL_SHA256: 263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Find the pinned llama.cpp build
+        id: pin
+        env:
+          PIN: ${{ matrix.pin }}
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import os, re, sys
+
+          want = tuple(os.environ["PIN"].split())  # (os, arch, accel)
+          src = open("engine/src/runtime/llama_pins.rs").read()
+          build = re.search(r'pub const LLAMA_BUILD: &str = "([^"]+)";', src)[1]
+          base = re.search(r'pub const LLAMA_RELEASE_BASE: &str = "([^"]+)";', src)[1]
+          found = []
+          for body in re.findall(r"LlamaAsset \{(.*?)\}", src, re.S):
+              f = dict(re.findall(r'\b(os|arch|accel|file|sha256): "([^"]*)"', body))
+              if (f.get("os"), f.get("arch"), f.get("accel")) == want:
+                  found.append(f)
+          if len(found) != 1:
+              sys.exit(f"llama_pins.rs: expected one {want} asset, found {len(found)}")
+          a = found[0]
+          if build not in a["file"] or not base.endswith("/" + build):
+              sys.exit(f"llama_pins.rs: {a['file']} and {base} do not name build {build}")
+          if not re.fullmatch(r"[0-9a-f]{64}", a["sha256"]):
+              sys.exit(f"llama_pins.rs: bad sha256 for {a['file']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"build={build}\nfile={a['file']}\nurl={base}/{a['file']}\nsha256={a['sha256']}\n")
+          print(f"{build}: {a['file']} {a['sha256']}")
+          EOF
+          echo "LLAMA_ASSETS=$RUNNER_TEMP/llama-assets" >> "$GITHUB_ENV"
+
+      - name: Restore the llama.cpp build and test models
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.LLAMA_ASSETS }}
+          key: llama-${{ runner.os }}-${{ steps.pin.outputs.file }}-${{ steps.pin.outputs.sha256 }}-${{ env.CHAT_MODEL_SHA256 }}-${{ env.EMBED_MODEL_SHA256 }}
+
+      - name: Download and verify
+        # Every file is hashed on every run, cached or not.
+        env:
+          LLAMA_URL: ${{ steps.pin.outputs.url }}
+          LLAMA_SHA256: ${{ steps.pin.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$LLAMA_ASSETS"
+          sha256() {
+            if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+          }
+          fetch() {
+            local url="$1" want="$2" dest="$LLAMA_ASSETS/${1##*/}"
+            if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then
+              echo "cached: ${dest##*/}"
+              return
+            fi
+            rm -f "$dest"
+            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 -o "$dest.part" "$url"
+            local got
+            got="$(sha256 "$dest.part")"
+            if [ "$got" != "$want" ]; then
+              rm -f "$dest.part"
+              echo "::error::${dest##*/}: SHA-256 $got, expected $want"
+              exit 1
+            fi
+            mv "$dest.part" "$dest"
+            echo "downloaded: ${dest##*/}"
+          }
+          fetch "$LLAMA_URL" "$LLAMA_SHA256"
+          fetch "$CHAT_MODEL_URL" "$CHAT_MODEL_SHA256"
+          fetch "$EMBED_MODEL_URL" "$EMBED_MODEL_SHA256"
+          ls -l "$LLAMA_ASSETS"
+
+      - name: Save the llama.cpp build and test models
+        # Saved before the tests run, so a red run does not download again.
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.LLAMA_ASSETS }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Unpack llama.cpp
+        env:
+          LLAMA_FILE: ${{ steps.pin.outputs.file }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/llama"
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          tar -xzf "$LLAMA_ASSETS/$LLAMA_FILE" -C "$dir"
+          # The archive holds one top-level directory, llama-<build>/.
+          server="$(find "$dir" -maxdepth 2 -type f -name llama-server)"
+          if [ -z "$server" ] || [ "$(printf '%s\n' "$server" | wc -l)" -ne 1 ] || [ ! -x "$server" ]; then
+            echo "::error::expected one executable llama-server in $LLAMA_FILE, found: ${server:-none}"
+            exit 1
+          fi
+          {
+            echo "ESTIA_LLAMA_SERVER=$server"
+            echo "ESTIA_LLAMA_TEST_MODEL=$LLAMA_ASSETS/${CHAT_MODEL_URL##*/}"
+            echo "ESTIA_LLAMA_TEST_EMBED_MODEL=$LLAMA_ASSETS/${EMBED_MODEL_URL##*/}"
+          } >> "$GITHUB_ENV"
+
+      - name: Shared libraries (Linux)
+        # The Ubuntu build needs, outside its own directory, only libgomp.so.1
+        # (OpenMP, for the CPU backend), libssl.so.3 and libcrypto.so.3, plus
+        # glibc 2.34+ and libstdc++ from GCC 12+. No libcurl. The runner image
+        # normally has all of them; install them if not. Every library is
+        # checked, because llama-server loads its CPU backend variants
+        # (libggml-cpu-*.so) with dlopen.
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          dir="$(dirname "$ESTIA_LLAMA_SERVER")"
+          missing() {
+            for f in "$dir"/llama-server "$dir"/*.so*; do ldd "$f" || true; done \
+              | awk '/not found/ {print $1}' | sort -u | tr '\n' ' '
+          }
+          m="$(missing)"
+          if [ -n "$m" ]; then
+            echo "Missing: $m"
+            # openssl depends on the runtime library for this release
+            # (libssl3 on 22.04, libssl3t64 on 24.04).
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends libgomp1 openssl
+            m="$(missing)"
+            if [ -n "$m" ]; then
+              echo "::error::llama-server needs libraries this runner does not have: $m"
+              exit 1
+            fi
+          fi
+
+      - name: llama-server starts
+        # An unsigned binary's first start on macOS can stall while it is
+        # scanned. Pay for that here, not inside a test's deadline.
+        timeout-minutes: 5
+        run: |
+          "$ESTIA_LLAMA_SERVER" --version
+          "$ESTIA_LLAMA_SERVER" --list-devices
+
+      - name: Test estia-llama against llama-server
+        # The tests skip themselves, with a note, when an ESTIA_LLAMA_*
+        # variable is missing. --show-output prints what passing tests wrote,
+        # so a skip fails the job here instead of passing it silently.
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/llama-tests.log"
+          cargo test -p estia-llama --locked -- --show-output 2>&1 | tee "$log"
+          if grep -q '^skipping ' "$log"; then
+            echo "::error::estia-llama tests were skipped: $(grep '^skipping ' "$log" | head -3 | tr '\n' ' ')"
+            exit 1
+          fi
+
+      - name: No llama-server left running
+        # The adapter must stop its llama-server however it ends, and the tests
+        # must stop their adapters. Anything alive 10 seconds after the tests
+        # is an orphan: a llama-server, an adapter (estia-llama) or the macOS
+        # orphan guard (/bin/sh ... estia-llama-guard). The brackets keep the
+        # pattern from matching a shell whose command line contains it.
+        if: ${{ !cancelled() }}
+        run: |
+          pattern='[l]lama-server|[e]stia-llama'
+          for _ in $(seq 1 20); do
+            pgrep -f "$pattern" >/dev/null || exit 0
+            sleep 0.5
+          done
+          echo "::error::processes were left running after the tests"
+          ps -o pid,ppid,etime,command -p "$(pgrep -f "$pattern" | paste -sd, -)" || true
+          pkill -KILL -f "$pattern" || true
+          exit 1
+
   msrv:
     # The oldest Rust the workspace claims to build with: `rust-version` in
     # the root Cargo.toml.
@@ -93,7 +301,7 @@ jobs:
       - name: LICENSE and NOTICE in every crate
         run: |
           set -euo pipefail
-          for crate in estia-proto estia-engine estia-server estia; do
+          for crate in estia-proto estia-engine estia-llama estia-server estia; do
             files="$(cargo package --list --locked -p "$crate")"
             for f in LICENSE NOTICE README.md; do
               grep -qxF "$f" <<<"$files" || { echo "$crate does not package $f" >&2; exit 1; }

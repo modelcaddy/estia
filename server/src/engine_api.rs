@@ -2,7 +2,7 @@
 
 use crate::access::{spawn_blocking_in_span, Access};
 use crate::jobs::JobStatus;
-use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, task_name, to_messages, OaiMessage};
+use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, runner_format, task_name, to_messages, OaiMessage};
 use crate::pairing::PairingError;
 use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION};
 use axum::{
@@ -13,10 +13,11 @@ use axum::{
     },
     Json,
 };
-use estia_engine::models::{find_artifact, find_embed_model, DownloadSpec, EMBEDDING_MODELS, GENERATION_MODELS};
+use estia_engine::models::{embed_models, generation_artifacts};
 use estia_engine::proto::Message;
+use estia_engine::runtime::{llama_pins::LLAMA_BUILD, RuntimeState};
 use estia_engine::structured::{self, Structured};
-use estia_engine::{CancelToken, Priority, Roles};
+use estia_engine::{Backend, CancelToken, Priority, Roles};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -70,7 +71,6 @@ fn pairing_error(e: PairingError, missing: fn(String) -> ApiError) -> ApiError {
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let rt = state.engine.runtime().status();
     Json(json!({
         "ok": true,
         "engine": "estia",
@@ -80,9 +80,51 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "bind": state.bind.to_string(),
         "auth_required": state.require_auth,
         "uptime_s": state.started.elapsed().as_secs(),
-        "backends": [{"id": "mlx-python", "runtime_installed": rt.state == estia_engine::runtime::RuntimeState::Installed}],
+        "backend": state.backend().id(),
+        "backends": backends(&state),
         "loaded": state.loaded(),
     }))
+}
+
+/// Both backends, the active one first: whether it is active, whether it can
+/// run on this machine, and whether its runtime is installed. Open route, so
+/// no paths. For llama.cpp, `server` says where `llama-server` comes from:
+/// `installed` (the pinned build), `custom` (`ESTIA_LLAMA_SERVER`), or null.
+fn backends(state: &AppState) -> Vec<Value> {
+    let active = state.backend();
+    let mut order = vec![active];
+    order.extend(Backend::ALL.into_iter().filter(|b| *b != active));
+    order
+        .into_iter()
+        .map(|b| match b {
+            Backend::MlxPython => json!({
+                "id": b.id(),
+                "active": b == active,
+                "supported": b.supported_here(),
+                "runtime_installed": state.engine.runtime().status().state == RuntimeState::Installed,
+            }),
+            Backend::LlamaCpp => {
+                let rt = state.engine.llama_runtime();
+                let custom = matches!(state.engine.config().llama.as_ref().map(|l| &l.server), Some(estia_engine::LlamaServer::Path(_)));
+                let server = if custom {
+                    Some("custom")
+                } else if rt.is_installed() {
+                    Some("installed")
+                } else {
+                    None
+                };
+                json!({
+                    "id": b.id(),
+                    "active": b == active,
+                    "supported": b.supported_here(),
+                    "runtime_installed": rt.is_installed(),
+                    "build": LLAMA_BUILD,
+                    "variant": rt.active_variant(),
+                    "server": server,
+                })
+            }
+        })
+        .collect()
 }
 
 pub async fn get_defaults(State(state): State<Arc<AppState>>) -> Json<Roles> {
@@ -111,13 +153,19 @@ pub async fn put_defaults(State(state): State<Arc<AppState>>, Json(roles): Json<
     Ok(Json(checked))
 }
 
+/// Every generation artifact (built-in and imported) and every embedding
+/// model. `runnable` says whether this engine's backend loads it; an
+/// embedding model's `artifact`, `format`, `fingerprint` and install state
+/// are those of the artifact this backend loads, and `artifacts` lists them all.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     let store = state.engine.store();
-    let gen: Vec<Value> = GENERATION_MODELS
-        .iter()
+    let backend = state.backend();
+    let gen: Vec<Value> = generation_artifacts()
+        .into_iter()
         .map(|a| {
             json!({
-                "id": a.id, "family": a.family, "kind": "generation", "format": format!("{:?}", a.format).to_lowercase(),
+                "id": a.id, "family": a.family, "kind": "generation", "format": a.format.id(), "backend": a.backend().id(),
+                "runnable": a.format == backend.format(), "imported": crate::catalog::is_imported(store, a.id),
                 "label": a.label, "repo_id": a.repo_id, "revision": a.revision, "license": a.license,
                 "context_length": a.context_length, "capabilities": a.capabilities,
                 "installed": store.is_installed(a.id), "bytes_on_disk": store.bytes_on_disk(a.id),
@@ -126,18 +174,31 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
             })
         })
         .collect();
-    let emb: Vec<Value> = EMBEDDING_MODELS
-        .iter()
+    let emb: Vec<Value> = embed_models()
+        .into_iter()
         .map(|e| {
+            let artifact = e.artifact_for(backend);
+            let id = artifact.map(|a| a.id).unwrap_or(e.id);
+            let artifacts: Vec<Value> = e
+                .artifacts
+                .iter()
+                .map(|a| json!({"id": a.id, "format": a.format.id(), "backend": a.backend().id(), "installed": store.is_installed(a.id)}))
+                .collect();
             json!({
-                "id": e.id, "kind": "embedding", "format": "mlx", "label": e.label, "repo_id": e.repo_id, "revision": e.revision,
+                "id": e.id, "kind": "embedding", "artifact": artifact.map(|a| a.id), "format": artifact.map(|a| a.format.id()),
+                "runnable": artifact.is_some(), "imported": crate::catalog::is_imported(store, e.id),
+                "label": e.label, "repo_id": artifact.map(|a| a.repo_id).unwrap_or(e.repo_id),
+                "revision": artifact.map(|a| a.revision).unwrap_or(e.revision),
                 "license": e.license, "dims": e.dims, "arch": e.arch.model_type(), "multilingual": e.multilingual,
-                "fingerprint": e.fingerprint_for(state.embed_backend()),
-                "installed": store.is_installed(e.id), "bytes_on_disk": store.bytes_on_disk(e.id), "required_disk_bytes": e.required_disk_bytes,
+                "fingerprint": state.engine.embed_fingerprint(e),
+                "installed": store.is_installed(id), "bytes_on_disk": store.bytes_on_disk(id),
+                "required_disk_bytes": artifact.map(|a| a.required_disk_bytes).unwrap_or(e.required_disk_bytes),
+                "pulling": state.jobs.running_pull(id).map(|j| j.id),
+                "artifacts": artifacts,
             })
         })
         .collect();
-    Json(json!({"generation": gen, "embedding": emb, "models_dir": store.models_dir()}))
+    Json(json!({"backend": backend.id(), "generation": gen, "embedding": emb, "models_dir": store.models_dir()}))
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,13 +207,8 @@ pub struct PullRequest {
 }
 
 pub async fn pull_model(State(state): State<Arc<AppState>>, Json(req): Json<PullRequest>) -> Result<Response, ApiError> {
-    let spec = if let Some(a) = find_artifact(&req.id) {
-        DownloadSpec::from(a)
-    } else if let Some(e) = find_embed_model(&req.id) {
-        DownloadSpec { id: e.id.into(), repo_id: e.repo_id.into(), revision: e.revision.into(), required_disk_bytes: e.required_disk_bytes }
-    } else {
-        return Err(ApiError::not_found(format!("unknown model `{}`", req.id)));
-    };
+    // An embedding model id or a family pulls this backend's artifact.
+    let spec = crate::catalog::pull_spec(&state.engine, &req.id)?;
     if let Some(job) = state.jobs.running_pull(&spec.id) {
         if let Some(a) = Access::current() {
             a.job(&job.id);
@@ -233,7 +289,7 @@ impl PullMilestones {
 }
 
 pub async fn delete_model(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    if find_artifact(&id).is_none() && find_embed_model(&id).is_none() {
+    if !crate::catalog::removable(state.engine.store(), &id) {
         return Err(ApiError::not_found(format!("unknown model `{id}`")));
     }
     let removed = state.engine.store().remove(&id).await?;
@@ -270,20 +326,47 @@ fn job_stream(state: &AppState, job_id: &str) -> Result<Response, ApiError> {
     Ok(Sse::new(UnboundedReceiverStream::new(out)).keep_alive(KeepAlive::default()).into_response())
 }
 
-/// Install the Python runtime the MLX backends run in, as a job (admin). The
-/// same work as `estia setup`'s first step, so a browser or a host application
-/// can set a fresh machine up without a terminal.
-pub async fn install_runtime(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
-    const ID: &str = "python-runtime";
-    if let Some(job) = state.jobs.running("runtime", ID) {
+/// Body of `POST /engine/runtime/install`; every field is optional.
+#[derive(Debug, Default, Deserialize)]
+pub struct RuntimeInstallRequest {
+    /// `mlx-python` or `llama-cpp` (aliases `mlx`, `llama`). Default: the
+    /// engine's backend.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// llama.cpp only: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`,
+    /// `rocm`, …; default: probe this machine.
+    #[serde(default)]
+    pub variant: Option<String>,
+}
+
+/// Install a backend's runtime as a job (admin): the Python + MLX packages
+/// for `mlx-python`, the pinned `llama-server` build for `llama-cpp`. The
+/// same work as `estia setup`'s first step, so a browser or a host
+/// application can set a fresh machine up without a terminal.
+pub async fn install_runtime(State(state): State<Arc<AppState>>, body: Option<Json<RuntimeInstallRequest>>) -> Result<Response, ApiError> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let backend = match req.backend.as_deref() {
+        Some(b) => b.parse::<Backend>().map_err(ApiError::bad_request)?,
+        None => state.backend(),
+    };
+    if !backend.supported_here() {
+        return Err(ApiError::bad_request(format!("the {backend} backend cannot run on this machine")));
+    }
+    let id = match backend {
+        Backend::MlxPython => "python-runtime",
+        Backend::LlamaCpp => "llama-runtime",
+    };
+    if let Some(job) = state.jobs.running("runtime", id) {
         return Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job.id, "already_running": true}))).into_response());
     }
-    let (job_id, view) = state.jobs.create("runtime", ID);
+    let (job_id, view) = state.jobs.create("runtime", id);
     if let Some(a) = Access::current() {
         a.job(&job_id);
     }
-    tracing::info!(job_id = %job_id, "runtime install started");
-    let runtime = state.engine.runtime().clone();
+    tracing::info!(job_id = %job_id, backend = %backend, variant = ?req.variant, "runtime install started");
+    let python = state.engine.runtime().clone();
+    let llama = state.engine.llama_runtime().clone();
+    let variant = req.variant.clone();
     let view2 = view.clone();
     let span = tracing::info_span!(parent: None, "job", job_id = %job_id);
     let (jid, end_jid) = (job_id.clone(), job_id.clone());
@@ -292,43 +375,56 @@ pub async fn install_runtime(State(state): State<Arc<AppState>>) -> Result<Respo
             let t0 = Instant::now();
             let mut phase: &'static str = "";
             let mut phase_started = Instant::now();
-            let result = runtime
-                .install(move |p| {
-                    if p.phase != phase {
-                        if !phase.is_empty() {
-                            tracing::debug!(job_id = %jid, phase = %phase, ms = phase_started.elapsed().as_millis() as u64, "runtime install phase done");
-                        }
-                        tracing::info!(job_id = %jid, phase = %p.phase, step = %p.message, "runtime install phase");
-                        phase = p.phase;
-                        phase_started = Instant::now();
+            let progress = move |p: estia_engine::runtime::SetupProgress| {
+                if p.phase != phase {
+                    if !phase.is_empty() {
+                        tracing::debug!(job_id = %jid, phase = %phase, ms = phase_started.elapsed().as_millis() as u64, "runtime install phase done");
                     }
-                    view2.send_modify(|v| v.setup = Some(p))
-                })
-                .await;
-            match &result {
-                Ok(summary) => tracing::info!(
-                    job_id = %end_jid,
-                    python = %summary.python_version,
-                    mlx_lm = %summary.mlx_lm_version,
-                    secs = t0.elapsed().as_secs(),
-                    "runtime install finished"
-                ),
-                Err(e) => tracing::warn!(job_id = %end_jid, error = %format!("{e:#}"), "runtime install failed"),
+                    tracing::info!(job_id = %jid, phase = %p.phase, step = %p.message, "runtime install phase");
+                    phase = p.phase;
+                    phase_started = Instant::now();
+                }
+                view2.send_modify(|v| v.setup = Some(p))
+            };
+            let result: anyhow::Result<Value> = match backend {
+                Backend::MlxPython => python.install(progress).await.map(|summary| {
+                    tracing::info!(
+                        job_id = %end_jid,
+                        python = %summary.python_version,
+                        mlx_lm = %summary.mlx_lm_version,
+                        secs = t0.elapsed().as_secs(),
+                        "runtime install finished"
+                    );
+                    serde_json::to_value(summary).unwrap_or_default()
+                }),
+                Backend::LlamaCpp => llama.install(variant.as_deref(), progress).await.map(|summary| {
+                    tracing::info!(
+                        job_id = %end_jid,
+                        build = %summary.build,
+                        variant = %summary.variant,
+                        secs = t0.elapsed().as_secs(),
+                        "runtime install finished"
+                    );
+                    serde_json::to_value(summary).unwrap_or_default()
+                }),
+            };
+            if let Err(e) = &result {
+                tracing::warn!(job_id = %end_jid, error = %format!("{e:#}"), "runtime install failed");
             }
             view.send_modify(|v| match &result {
                 Ok(summary) => {
                     v.status = JobStatus::Done;
-                    v.result = serde_json::to_value(summary).ok();
+                    v.result = Some(summary.clone());
                 }
                 Err(e) => {
                     v.status = JobStatus::Failed;
-                    v.error = Some(e.to_string());
+                    v.error = Some(format!("{e:#}"));
                 }
             });
         }
         .instrument(span),
     );
-    Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job_id}))).into_response())
+    Ok((axum::http::StatusCode::ACCEPTED, Json(json!({"job_id": job_id, "backend": backend.id()}))).into_response())
 }
 
 pub async fn list_jobs(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -385,6 +481,7 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     if let Some(a) = &access {
         a.generation(&name, artifact.id, streaming, max_tokens);
     }
+    let backend = state.embed_backend();
     let st = Arc::clone(&state);
     let (session, load_ms) = spawn_blocking_in_span(move || st.gen_session_timed(artifact)).await??;
     if let (Some(a), Some(ms)) = (&access, load_ms) {
@@ -393,17 +490,38 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
 
     // Either a raw prompt (the resident runner's `generate_stream`) or messages
     // (protocol v2 `chat_stream` through the template).
-    let messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m));
-    let prompt = req.prompt.clone();
+    let mut messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m));
+    let mut prompt = req.prompt.clone();
     if messages.is_none() && prompt.is_none() {
         return Err(ApiError::bad_request("prompt or messages is required"));
     }
     let tools = req.tools.clone().filter(|t| !t.is_empty());
+    let caps = session.capabilities();
+    let parses_calls = caps.parses_tool_calls;
+    // Only the collected (non-streamed) path returns structured output.
+    let constrain = if streaming { None } else { runner_format(&caps, &format, tools.is_some()) };
+    // A runner that constrains decoding does so in `chat`, so a raw prompt
+    // goes there as one user turn: the llama adapter renders `generate` that
+    // way anyway.
+    if constrain.is_some() && caps.chat {
+        if let Some(p) = prompt.take() {
+            messages = Some(vec![Message::new("user", p)]);
+        }
+    }
     let cache_key = req
         .cache_key
         .clone()
         .or_else(|| messages.as_ref().map(|m| derive_cache_key(artifact.id, m)))
         .map(|k| crate::Caller::current().scoped_key(&k));
+    // A runner that cannot constrain decoding (MLX) is shown the schema in
+    // the prompt instead: in the system prompt, or after a raw prompt.
+    if constrain.is_none() && tools.is_none() {
+        if let Some(m) = messages.as_mut() {
+            *m = structured::with_prompt_hint(m, &format);
+        } else if let Some(p) = prompt.as_mut() {
+            *p = structured::prompt_with_hint(p, &format);
+        }
+    }
 
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
@@ -456,7 +574,7 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                         a.finish("stop");
                     }
                     let _ = send(
-                        json!({"done": true, "text": text, "meta": meta, "model": artifact.id, "family": artifact.family, "backend": "mlx-python", "ms": t0.elapsed().as_millis()}),
+                        json!({"done": true, "text": text, "meta": meta, "model": artifact.id, "family": artifact.family, "backend": backend, "ms": t0.elapsed().as_millis()}),
                     );
                 }
                 Err(estia_engine::SessionError::Cancelled { .. }) => {
@@ -488,7 +606,15 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                 (Some(m), _) => {
                     let mut all = m.clone();
                     all.extend_from_slice(extra_turns);
-                    let o = s.chat_with(&all, tools.as_deref(), cache_key.as_deref(), None, Some(max_tokens), Some(temperature), prio)?;
+                    let o = s.chat_with(
+                        &all,
+                        tools.as_deref(),
+                        cache_key.as_deref(),
+                        constrain.as_ref(),
+                        Some(max_tokens),
+                        Some(temperature),
+                        prio,
+                    )?;
                     (o.text, Some(o.meta))
                 }
                 (None, Some(p)) => {
@@ -528,8 +654,11 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
                 }
             }
         }
-        let tool_calls: Vec<Value> =
-            if tools.is_some() { toolcalls::parse(&text).iter().enumerate().map(|(i, c)| c.to_openai(i)).collect() } else { Vec::new() };
+        let tool_calls: Vec<Value> = if tools.is_some() {
+            toolcalls::from_output(parses_calls, &text, meta.as_ref().and_then(|m| m.tool_calls.as_deref()))
+        } else {
+            Vec::new()
+        };
         if let Some(a) = &acc {
             a.finish(if tool_calls.is_empty() { "stop" } else { "tool_calls" });
         }
@@ -541,7 +670,7 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
             "attempts": attempt,
             "tool_calls": tool_calls,
             "meta": meta,
-            "model": artifact.id, "family": artifact.family, "backend": "mlx-python",
+            "model": artifact.id, "family": artifact.family, "backend": backend,
             "ms": t0.elapsed().as_millis(),
         }))
     })
@@ -571,7 +700,7 @@ pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequ
     }
     check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
-    let fingerprint = model.fingerprint_for(state.embed_backend());
+    let fingerprint = state.embed_fingerprint(model)?;
     if let Some(expected) = &req.expect_fingerprint {
         if expected != &fingerprint {
             return Err(ApiError::unprocessable(format!("fingerprint mismatch: host serves `{fingerprint}`, expected `{expected}`")));

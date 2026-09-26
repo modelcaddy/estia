@@ -26,9 +26,10 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util", "
 # Structured events (runner lifecycle, downloads). The library only emits;
 # the binary that embeds it installs a subscriber (see docs/logging.md).
 tracing = { version = "0.1", default-features = false, features = ["std"] }
-# Python MLX backend runtime installer (runtime::python): unpacks a
-# python-build-standalone tarball. Optional so a build that must not download
-# executable code (for example a sandboxed, store-distributed app) contains none of it.
+# Runtime installers (runtime::python, runtime::llama): unpack the
+# python-build-standalone and llama.cpp tarballs. Optional so a build that must
+# not download executable code (for example a sandboxed, store-distributed app)
+# contains none of it.
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 
@@ -36,3 +37,7 @@ tar = { version = "0.4", optional = true }
 default = []
 # The downloaded-Python + mlx runtime installer.
 python-mlx = ["dep:flate2", "dep:tar"]
+# The llama.cpp runtime installer (runtime::llama): downloads upstream's
+# prebuilt llama-server. Off for hosts that must not download executable
+# code; they pass their own llama-server path to the engine instead.
+llama-runtime = ["dep:flate2", "dep:tar"]

@@ -122,19 +122,17 @@ fn run() -> Result<(), Error> {
         })?;
     println!("\n  [{}]", describe(&second.meta));
 
-    // 3. Structured output. The runner cannot constrain decoding, so describe
-    //    the shape in the prompt and validate afterwards. On failure, send the
-    //    retry hint as the next user turn and try once more.
+    // 3. Structured output. The MLX runner cannot constrain decoding, so show
+    //    the model the schema (`with_prompt_hint` puts it in the system
+    //    prompt) and validate afterwards. On failure, send the retry hint as
+    //    the next user turn and try once more.
     let schema = json!({
         "type": "object",
         "properties": {"city": {"type": "string"}, "country": {"type": "string"}},
         "required": ["city", "country"]
     });
-    let format = OutputFormat::JsonSchema { schema: schema.clone() };
-    let ask = [
-        Message::new("system", format!("Answer with one JSON object matching this JSON Schema, and nothing else: {schema}")),
-        Message::new("user", "Where is the Acropolis?"),
-    ];
+    let format = OutputFormat::JsonSchema { schema };
+    let ask = structured::with_prompt_hint(&[Message::new("user", "Where is the Acropolis?")], &format);
     let out = gen.chat_with(&ask, None, None, None, Some(80), Some(0.0), Priority::Interactive)?;
     match structured::enforce(&out.text, &format) {
         Ok(s) => println!("\nJSON: {} (repaired: {}, repairs: {:?})", s.value, s.repaired, s.repairs),

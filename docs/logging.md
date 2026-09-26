@@ -80,7 +80,7 @@ output and log only Estia's warnings and the runner's stderr. They read
 | `estia_server::tokens` | tokens added to or removed from `tokens.json` while the server runs |
 | `estia_engine::session` | runner processes: started, failed and restarted, timed out, cancelled, stopped |
 | `estia_engine::resident` | runner handshake, model load and unload |
-| `estia_engine::runner` | each line a runner writes to stderr (Python warnings and tracebacks) |
+| `estia_engine::runner` | each line a runner writes to stderr: Python warnings and tracebacks, or on llama.cpp the adapter's own lines (`[estia-llama] …`) and `llama-server`'s log (`[llama-server <pid>] …`) |
 | `estia_engine::models::hf` | download retries and resumes |
 | `estia_engine::engine` | idle release through `Engine::reap_idle` (programs that embed the engine) |
 | `estia` | the CLI's own notices |
@@ -240,7 +240,7 @@ does not apply to the request is left out.
 | `model load failed` | warn | `model`, `kind`, `error` |
 | `released idle model` | info | `model`, `idle_s` (`serve --idle-unload-minutes`) |
 | `runner failed; starting a new one` | warn | `model`, `pid`, `exit` (`code N` or `signal N`), `cause` |
-| `runner did not answer in time; killing it`, `runner stream silent too long; killing it` | warn | `model`, `pid`, `secs` |
+| `runner did not answer in time; stopping it`, `runner stream silent too long; stopping it` | warn | `model`, `pid`, `secs` |
 | `runner exited mid-stream` | warn | `model`, `pid`, `exit` |
 | `generation cancelled` | info | `model`, `pid`, `acknowledged` (the runner confirmed the cancel) |
 | `runner stopped` | debug | `model`, `pid`, `exit` |
@@ -301,7 +301,11 @@ names, the `model` a client asked for, host names and origins of refused
 requests, file paths under the data directory, and 5xx error messages, which
 come from the engine or the runner. Runner stderr is passed through as the
 runner wrote it: the runner itself does not print prompts, but a Python
-library it loads could print anything. Hide it with
+library it loads could print anything. On llama.cpp, `llama-server`'s log is
+passed through too, at `info` whatever its own level: several lines per
+request (slot and timing lines) and more at each model load. It printed no
+prompt text in our runs. The CLI's own commands (`run`, `chat`, `embed`, …)
+hide it unless `ESTIA_LOG` asks for it. Hide it with
 `ESTIA_LOG=estia_engine::runner=off`.
 
 ## Embedding the crates

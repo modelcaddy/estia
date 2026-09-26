@@ -30,6 +30,9 @@ The concepts behind them are explained in
    estia serve        # http://127.0.0.1:27200
    ```
 
+   The examples work on either backend, MLX or llama.cpp: they ask for roles
+   (`fast`, `embed`), never for artifact ids.
+
 2. You have a token.
 
    On the engine's machine, mint one per app with only the scopes it needs.

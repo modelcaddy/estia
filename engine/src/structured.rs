@@ -11,10 +11,12 @@
 //!
 //! Where a backend can constrain decoding to a schema (`llama` via a grammar,
 //! `mlx` later via a logits processor) the runner does that and this module
-//! only validates. Where it cannot, this module is the enforcement: parse,
-//! validate, and hand the caller enough to retry once with the error
-//! appended to the prompt ([`Structured::retry_hint`]).
+//! only validates. Where it cannot, the model is shown the schema in its
+//! prompt ([`with_prompt_hint`], [`prompt_with_hint`]) and this module is the
+//! enforcement: parse, validate, and hand the caller enough to retry once
+//! with the error appended to the prompt ([`Structured::retry_hint`]).
 
+use crate::proto::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -79,6 +81,47 @@ impl Structured {
             ),
             StructuredError::BadSchema(_) => String::new(),
         }
+    }
+}
+
+/// What a model is told when its runner cannot constrain decoding: the shape
+/// wanted, and the schema when there is one. `None` for plain text. The
+/// output is still parsed and validated afterwards.
+pub fn prompt_hint(format: &OutputFormat) -> Option<String> {
+    match format {
+        OutputFormat::Text => None,
+        OutputFormat::Json => Some("Answer with one JSON object and nothing else: no prose, no code fences.".to_string()),
+        OutputFormat::JsonSchema { schema } => Some(format!(
+            "Answer with one JSON value that matches this JSON Schema, and nothing else: no prose, no code fences.\nJSON Schema: {schema}"
+        )),
+    }
+}
+
+/// `messages` with [`prompt_hint`] in the system prompt: appended to a
+/// leading system message, or added in front as one. Unchanged for plain
+/// text.
+pub fn with_prompt_hint(messages: &[Message], format: &OutputFormat) -> Vec<Message> {
+    let mut out = messages.to_vec();
+    let Some(hint) = prompt_hint(format) else {
+        return out;
+    };
+    match out.first_mut() {
+        Some(first) if first.role == "system" => {
+            if !first.content.trim().is_empty() {
+                first.content.push_str("\n\n");
+            }
+            first.content.push_str(&hint);
+        }
+        _ => out.insert(0, Message::new("system", hint)),
+    }
+    out
+}
+
+/// A raw prompt with [`prompt_hint`] after it. Unchanged for plain text.
+pub fn prompt_with_hint(prompt: &str, format: &OutputFormat) -> String {
+    match prompt_hint(format) {
+        Some(hint) => format!("{prompt}\n\n{hint}"),
+        None => prompt.to_string(),
     }
 }
 
@@ -274,6 +317,31 @@ pub fn enforce(text: &str, format: &OutputFormat) -> Result<Structured, Structur
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prompt_hint_shows_the_schema_in_the_system_prompt() {
+        let schema = json!({"type": "object", "required": ["n"]});
+        let format = OutputFormat::JsonSchema { schema: schema.clone() };
+        let hint = prompt_hint(&format).unwrap();
+        assert!(hint.contains(&schema.to_string()), "{hint}");
+        assert!(prompt_hint(&OutputFormat::Json).unwrap().contains("JSON object"));
+        assert_eq!(prompt_hint(&OutputFormat::Text), None);
+
+        // No system message: one is added in front.
+        let user = vec![Message::new("user", "hi")];
+        let out = with_prompt_hint(&user, &format);
+        assert_eq!((out.len(), out[0].role.as_str(), out[0].content.as_str()), (2, "system", hint.as_str()));
+        assert_eq!(out[1], user[0]);
+        // A leading system message keeps its text and gets the hint after it.
+        let with_system = vec![Message::new("system", "Be terse."), Message::new("user", "hi")];
+        let out = with_prompt_hint(&with_system, &format);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content, format!("Be terse.\n\n{hint}"));
+        // Plain text: untouched.
+        assert_eq!(with_prompt_hint(&with_system, &OutputFormat::Text), with_system);
+        assert_eq!(prompt_with_hint("p", &OutputFormat::Text), "p");
+        assert_eq!(prompt_with_hint("p", &format), format!("p\n\n{hint}"));
+    }
 
     #[test]
     fn clean_json_strips_fences_and_preamble() {

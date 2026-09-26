@@ -89,7 +89,7 @@ The server speaks HTTP/1.1 only.
 | GET | `/engine/jobs` | `models:read` | All jobs |
 | GET | `/engine/jobs/{id}` | `models:read` | One job |
 | GET | `/engine/jobs/{id}/events` | `models:read` | Server-sent events for one job until it ends |
-| POST | `/engine/runtime/install` | `admin` | Install the Python MLX runtime as a job |
+| POST | `/engine/runtime/install` | `admin` | Install a backend's runtime as a job: Python and MLX, or the pinned llama.cpp build |
 | POST | `/engine/pair` | none | Ask for a token (pairing request) |
 | GET | `/engine/pair/{id}` | none | Poll a pairing request; returns the token once |
 | GET | `/engine/pairings` | `admin` | Pending and recent pairing requests |
@@ -104,8 +104,18 @@ token.
 
 Model ids, families and roles are explained in the README under
 [Roles](../README.md#roles). Wherever a generation request takes `model`, it
-accepts an artifact id, a family or a role, in that order of precedence.
-Embedding requests take an embedding model id or `embed`.
+accepts an artifact id, a family or a role, in that order of precedence. A
+family or role resolves to the artifact in the running backend's format
+(`gemma4-e2b-it-4bit-mlx` on `mlx-python`, `gemma4-e2b-it-qat-q4_0-gguf` on
+`llama-cpp`); an artifact id in the other format is a 400. Embedding requests
+take an embedding model id, an imported embedding model's id, or `embed`.
+
+The backend is one of:
+
+| Id | What runs the models |
+|---|---|
+| `mlx-python` | MLX on Apple Silicon, through the Python runner |
+| `llama-cpp` | upstream `llama-server`, through the `estia-llama` adapter |
 
 ## Errors
 
@@ -118,13 +128,13 @@ Errors raised by the handlers use OpenAI's shape, plus the request id (see
 
 | Status | When |
 |---|---|
-| 400 | Empty `messages` or `input`, more than 256 embedding inputs, neither `prompt` nor `messages`, unknown `response_format` type or embedding `task`, unknown scope, a pairing name that breaks the [name rules](#pairing), an unknown pairing id on approve or deny, a pairing that cannot be approved or denied |
+| 400 | Empty `messages` or `input`, more than 256 embedding inputs, neither `prompt` nor `messages`, unknown `response_format` type or embedding `task`, an artifact id in the other backend's format, pulling an imported model, unknown scope, a pairing name that breaks the [name rules](#pairing), an unknown pairing id on approve or deny, a pairing that cannot be approved or denied |
 | 401 | Missing, unknown or revoked token |
 | 403 | Token lacks the scope; `Host` not allowed or cross-origin write (type `permission_error`, see [Host and Origin checks](#host-and-origin-checks)) |
-| 404 | Unknown path, unknown model, model not downloaded, unknown job, unknown pairing id on poll |
+| 404 | Unknown path, unknown model, a model with no artifact for the running backend, model not downloaded, unknown job, unknown pairing id on poll |
 | 422 | Structured output still invalid after the retry; embedding fingerprint mismatch |
 | 429 | `POST /engine/pair` while 24 requests are pending, or 4 from the same address (type `rate_limit_error`) |
-| 500 | Runner failure; the pairing store could not be read or written (details in the server's log, under the request id) |
+| 500 | Runner failure, including a request the model's chat template refuses (llama-server's message is passed on); the pairing store could not be read or written (details in the server's log, under the request id) |
 
 A body that is not JSON, lacks `Content-Type: application/json`, or does not
 fit the route's fields is rejected before the handler runs, with a plain-text
@@ -159,8 +169,8 @@ Supported request fields:
 | Field | Notes |
 |---|---|
 | `model` | Role, family or artifact id |
-| `messages` | `system`, `user`, `assistant`, `tool`. `content` may be a string or an array of parts. Text parts are joined. Other parts, such as images, are replaced by a marker like `[image_url omitted]`: image input is not passed to the model yet. An assistant message's `tool_calls` are passed back to the model as JSON text. |
-| `tools` | OpenAI tool schemas. The model answers in its own call syntax and the server converts it to `tool_calls`. Gemma 4's native syntax and a `{"tool_call": {"name", "arguments"}}` object are recognised. |
+| `messages` | `system`, `user`, `assistant`, `tool`. `content` may be a string or an array of parts. Text parts are joined. Other parts, such as images, are replaced by a marker like `[image_url omitted]`: image input is not passed to the model yet. An assistant message's `tool_calls` reach the model's chat template as structured calls, so the `{"role": "tool", "tool_call_id": …}` results after it are rendered too. |
+| `tools` | OpenAI tool schemas, rendered by the model's chat template. The model's calls come back as `tool_calls`. On `llama-cpp`, llama-server parses them; on `mlx-python` the server parses Gemma 4's native syntax and a `{"tool_call": {"name", "arguments"}}` object. |
 | `response_format` | `text`, `json_object`, or `json_schema` with `json_schema.schema`. See [Structured output](#structured-output). |
 | `max_completion_tokens`, `max_tokens` | Default 1024, at most 8192 (larger values are lowered) |
 | `temperature` | Default 0.2 |
@@ -187,16 +197,20 @@ With `--no-auth` every request shares one namespace.
 
 - `usage.prompt_tokens_details.cached_tokens`: prompt tokens served from the
   cache.
-- `x_estia`: `family`, `backend`, `cached_tokens`, `template` (`native` or
-  `manual`), `repaired` and `repairs` (for JSON output), `ms`.
+- `x_estia`: `family`, `backend` (`mlx-python` or `llama-cpp`),
+  `cached_tokens`, `template` (`native` or `manual`), `generation_tps` (the
+  runner's decode speed, when it reports one), `repaired` and `repairs` (for
+  JSON output), `ms`.
 - `finish_reason` is `tool_calls` when tool calls were parsed, otherwise
   `stop`.
 
 **Streaming.** Prose streams as `delta.content` chunks. When `tools` are
-declared, the server holds the first characters back to tell a tool call from
-prose; a tool call, or any JSON-mode output, is sent in the final chunk
-instead of token by token. The final chunk carries `finish_reason`, `usage` and
-`x_estia` (`cached_tokens`, `template`, `ms`). A stream that fails after it
+declared on `mlx-python`, the server holds the first characters back to tell a
+tool call from prose; on `llama-cpp` prose streams at once, because
+llama-server separates the calls itself. Tool calls, each with an `index`, and
+any JSON-mode output are sent in the final chunk instead of token by token.
+The final chunk carries `finish_reason`, `usage` and `x_estia` (`backend`,
+`cached_tokens`, `template`, `generation_tps`, `ms`). A stream that fails after it
 started ends with `data: {"error": {"message", "type", "request_id"}}` and
 `data: [DONE]`. If the client disconnects, the generation is cancelled in the
 runner. A non-streaming request is not cancelled when its client disconnects:
@@ -206,7 +220,7 @@ the generation runs to the end.
 
 | Field | Notes |
 |---|---|
-| `model` | `embed` (currently `embeddinggemma-300m-4bit`) or an embedding model id |
+| `model` | `embed` (the model the `embed` role is bound to, else `embeddinggemma-300m-4bit`) or an embedding model id |
 | `input` | A string or an array of at most 256 strings |
 | `task` | Estia extension: `document` (default), `query`, `clustering`, or `none`. The model's own prefix for that task is prepended. `none` sends the inputs unchanged. |
 | `expect_fingerprint` | Estia extension: refuse with 422 unless the server would produce vectors with this fingerprint |
@@ -216,22 +230,26 @@ The response has OpenAI's `data[].embedding` float arrays. `encoding_format` is
 ignored; vectors are always floats. `usage` is reported as zero. `x_estia`
 carries `fingerprint`, `dims` and `task`.
 
-A **fingerprint** is `<model id>@<backend>`, for example
-`embeddinggemma-300m-4bit@mlx-python`. The same model run by two backends gives
-vectors that cannot be compared, so store the fingerprint with your index and
-send it back as `expect_fingerprint`.
+A **fingerprint** is `<artifact id>@<backend>`, for example
+`embeddinggemma-300m-4bit@mlx-python` on MLX,
+`embeddinggemma-300m-q8_0-gguf@llama-cpp` for the same model on llama.cpp, and
+`<id>@llama-cpp` for an imported model. The same model run by two backends
+gives vectors that cannot be compared, so store the fingerprint with your index
+and send it back as `expect_fingerprint`.
 
 ## GET /v1/models
 
 The roles in the role table come first, each with
-`x_estia: {"role": true, "family": …}`. These are the generation roles
-(`text`, `fast`, `vision` and any others bound with `estia roles set` or
-`PUT /engine/defaults`). `embed` is not listed as a role: it is fixed to
-`embeddinggemma-300m-4bit` and is not in the table, but `"model": "embed"`
-works on the embedding routes. Then come every generation model (`x_estia`:
-`family`, `format`, `installed`, `context_length`) and every embedding model
-(`x_estia`: `kind`, `dims`, `installed`). Models that are not downloaded are
-listed too; check `installed`.
+`x_estia: {"role": true, "family": …}`. These are the roles bound with
+`estia roles set` or `PUT /engine/defaults` (`text`, `fast`, `vision`, and
+`embed` once it is bound). Unbound, `"model": "embed"` still works on the
+embedding routes. Then come every generation model, built-in and imported
+(`x_estia`: `family`, `format`, `backend`, `runnable`, `imported`,
+`installed`, `context_length`), and every embedding model (`x_estia`: `kind`,
+`dims`, `runnable`, `artifact`, `format`, `fingerprint`, `imported`,
+`installed`). `runnable` says whether the running backend can load it: MLX
+artifacts are listed on a llama.cpp engine but not runnable, and the other way
+round. Models that are not downloaded are listed too; check `installed`.
 
 ## GET /engine/health
 
@@ -239,11 +257,21 @@ Open, so clients can check an engine before they have a token.
 
 ```json
 {"ok": true, "engine": "estia", "version": "0.1.0", "api_version": 1, "protocol_version": 2,
- "bind": "127.0.0.1:27200", "auth_required": true, "uptime_s": 3,
- "backends": [{"id": "mlx-python", "runtime_installed": false}], "loaded": []}
+ "bind": "127.0.0.1:27200", "auth_required": true, "uptime_s": 3, "backend": "llama-cpp",
+ "backends": [{"id": "llama-cpp", "active": true, "supported": true, "runtime_installed": true,
+               "build": "b11146", "variant": "metal", "server": "installed"},
+              {"id": "mlx-python", "active": false, "supported": true, "runtime_installed": false}],
+ "loaded": ["tinygemma3"]}
 ```
 
-`version` is the crate version of the server that answered.
+`version` is the crate version of the server that answered. `backend` is the
+backend this engine runs. `backends` lists both, the active one first:
+`supported` says whether it can run on this machine and `runtime_installed`
+whether its runtime is installed. For `llama-cpp`, `build` is the pinned
+llama.cpp build, `variant` the installed variant (`cpu`, `metal`, `vulkan`,
+`cuda-12`, `cuda-13`, `rocm`, or null), and `server` where `llama-server`
+comes from: `installed`, `custom` (`ESTIA_LLAMA_SERVER`), or null when there
+is none.
 
 ## GET, PUT /engine/defaults
 
@@ -263,19 +291,31 @@ yet.
 
 ## Models and jobs
 
-`GET /engine/models` returns `{"generation": […], "embedding": […],
-"models_dir": …}`. Each entry has `id`, `kind`, `format`, `label`, `repo_id`,
-`revision`, `license`, `installed`, `bytes_on_disk` and `required_disk_bytes`.
-Generation entries add `family`, `context_length`, `capabilities`,
-`partial_bytes` and `pulling` (the running job id, if any). Embedding entries
-add `dims`, `arch`, `multilingual` and `fingerprint`.
+`GET /engine/models` returns `{"backend": …, "generation": […], "embedding":
+[…], "models_dir": …}`. Each entry has `id`, `kind`, `format`, `runnable`,
+`imported`, `label`, `repo_id`, `revision`, `license`, `installed`,
+`bytes_on_disk`, `required_disk_bytes` and `pulling` (the running job id, if
+any). Generation entries add `family`, `backend`, `context_length`,
+`capabilities` and `partial_bytes`. Embedding entries describe the model and
+its artifact for the running backend: `artifact`, `dims`, `arch`,
+`multilingual`, `fingerprint`, and `artifacts`, every artifact of the model
+(`id`, `format`, `backend`, `installed`). For an imported model linked with
+`estia import --link`, `bytes_on_disk` is the link's size.
 
-`POST /engine/models/pull` with `{"id": "gemma4-e2b-it-4bit-mlx"}` answers
+`POST /engine/models/pull` with `{"id": "gemma4-e2b"}` answers
 `202 {"job_id": …}`, or `{"job_id": …, "already_running": true}` if that model
-is already downloading. Downloads come from Hugging Face, resume after an
-interruption, and check SHA-256 where the repository publishes one.
+is already downloading. `id` is an artifact id (that artifact, in either
+format), or a family, role, embedding model id or `embed` (the running
+backend's artifact of it). Imported models cannot be pulled (400). Downloads
+come from Hugging Face, resume after an interruption, and check SHA-256 where
+the repository publishes one; GGUF artifacts download only their listed files,
+pinned to a commit.
 
-`POST /engine/runtime/install` works the same way for the Python runtime.
+`POST /engine/runtime/install` works the same way for a backend's runtime.
+Its body is optional: `{"backend": "llama-cpp", "variant": "cpu"}`. `backend`
+defaults to the engine's own (`mlx` and `llama` work too); `variant` is for
+llama.cpp only and defaults to probing the machine. A backend that cannot run
+on this machine is a 400.
 
 A job looks like:
 
@@ -299,7 +339,7 @@ OpenAI's envelope.
 | Field | Notes |
 |---|---|
 | `model` | Default `text` |
-| `prompt` or `messages` | One is required. The runner treats `prompt` as a single user turn. `messages` go through the model's chat template and get tools, the prompt cache and token counts. |
+| `prompt` or `messages` | One is required. The runner treats `prompt` as a single user turn. `messages` go through the model's chat template and get tools, the prompt cache and token counts. On `llama-cpp`, a `prompt` with a JSON `format` is sent through chat as one user turn, so decoding is constrained and `meta` is filled in. |
 | `tools` | As in chat completions (with `messages`) |
 | `cache_key` | Prompt-cache key; derived from `messages` when absent. Scoped to the caller's token, as in chat completions. |
 | `format` | Same shape as OpenAI's `response_format` |
@@ -310,11 +350,11 @@ Response:
 
 ```json
 {"text": "…", "json": {…}, "repaired": false, "repairs": [], "attempts": 1, "tool_calls": [],
- "meta": {"prompt_tokens": 28, "cached_tokens": 0, "generation_tokens": 29, "template": "native"},
+ "meta": {"prompt_tokens": 28, "cached_tokens": 0, "generation_tokens": 29, "generation_tps": 76.1, "template": "native"},
  "model": "gemma4-e2b-it-4bit-mlx", "family": "gemma4-e2b", "backend": "mlx-python", "ms": 1038}
 ```
 
-`meta` is `null` for a raw `prompt`. With `stream: true` the events are
+`meta` is `null` for a raw `prompt` that went to the runner's `generate`. With `stream: true` the events are
 `{"token": "…"}` and then `{"done": true, "text": …, "meta": …, "model": …,
 "family": …, "backend": …, "ms": …}`, or `{"error": "…", "request_id": "…"}`.
 There is no `[DONE]` sentinel on this route.
@@ -332,8 +372,23 @@ Response: `{"vectors": [[…]], "fingerprint": …, "model": …, "dims": …, "
 
 ## Structured output
 
-The MLX runner cannot constrain decoding, so the server enforces JSON after
-generation:
+How the model is held to the requested shape depends on the backend:
+
+- **`llama-cpp`**: the server passes `format` to the adapter, which sends
+  llama-server a `response_format`. Decoding is constrained by a grammar built
+  from the JSON Schema, so the output parses and fits the schema's structure;
+  `attempts: 1` and `repaired: false` are the norm. The grammar cannot stop
+  `max_tokens` from cutting the output short, though: a long string that runs
+  into the limit leaves unfinished JSON, which fails validation and is
+  retried. Bound long fields with `maxLength`, or leave room in `max_tokens`.
+  llama.cpp supports a subset of JSON Schema. With `tools` in the same request
+  no format is passed (llama-server refuses a grammar together with tools).
+- **`mlx-python`**: the runner cannot constrain decoding. Unless `tools` are
+  declared, the server adds an instruction with the schema to the system
+  prompt (after your own system message, or as a new one), or after a raw
+  `prompt`. The prompt-cache key is derived before the instruction is added.
+
+Either way the server then enforces JSON after generation:
 
 1. Parse the output. If that fails, repair it step by step: strip code fences
    and any preamble, fix invalid backslash escapes, fix unescaped interior

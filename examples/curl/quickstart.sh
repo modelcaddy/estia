@@ -123,10 +123,9 @@ call POST /engine/embed "{\"inputs\": [\"where is the spare key?\"], \"task\": \
 show 260
 
 step "8. JSON Schema output: response_format json_schema. The engine validates, repairs and retries once."
-say "The model does not see the schema; describe the shape in the prompt too."
+say "The model is held to the schema: llama.cpp constrains decoding to it; on MLX the engine puts it in the system prompt."
 call POST /v1/chat/completions "{\"model\": \"$MODEL\", \"temperature\": 0, \"max_tokens\": 120,
-  \"messages\": [{\"role\": \"system\", \"content\": \"Answer with JSON only: {\\\"city\\\": string, \\\"country\\\": string}\"},
-                 {\"role\": \"user\", \"content\": \"Where is the Acropolis?\"}],
+  \"messages\": [{\"role\": \"user\", \"content\": \"Where is the Acropolis?\"}],
   \"response_format\": {\"type\": \"json_schema\", \"json_schema\": {\"name\": \"place\", \"schema\":
     {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"country\": {\"type\": \"string\"}},
      \"required\": [\"city\", \"country\"]}}}}"

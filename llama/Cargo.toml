@@ -6,13 +6,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "../README.md"
+readme.workspace = true
 keywords = ["llm", "inference", "llama-cpp", "gguf", "local"]
 categories = ["command-line-utilities", "science"]
 
+[[bin]]
+name = "estia-llama"
+path = "src/main.rs"
+
 [dependencies]
 estia-proto = { path = "../proto", version = "0.1.0" }
-serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
-tracing = "0.1"
+# The API key for llama-server.
+getrandom.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# kill(2), signal handlers, and PR_SET_PDEATHSIG on Linux.
+libc = "0.2"

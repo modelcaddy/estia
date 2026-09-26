@@ -10,11 +10,15 @@
 //!   with the model it serves.
 //! - [`OneShot`]: one process per request, for the older runners that read
 //!   stdin to EOF.
-//! - [`models`]: the artifact registry (families with per-backend artifacts),
-//!   the Hugging Face downloader with resume and SHA-256 verification, and the
-//!   on-disk [`models::ModelStore`].
-//! - [`runtime`]: the Python MLX backend's runtime installer (`python-mlx`
-//!   feature).
+//! - [`models`]: the artifact registry (families with per-backend artifacts:
+//!   MLX and GGUF), the Hugging Face downloader with resume and SHA-256
+//!   verification, the on-disk [`models::ModelStore`], and imported GGUF
+//!   files ([`models::custom`]).
+//! - [`runtime`]: backend runtime installers: the Python MLX runtime
+//!   (`python-mlx` feature) and upstream llama.cpp's `llama-server`
+//!   (`llama-runtime` feature).
+//! - [`Backend`]: `mlx-python` or `llama-cpp`, one per engine
+//!   ([`EngineConfig::backend`]).
 //! - [`Roles`]: stable names a client asks for (`text`, `fast`, `embed`, …),
 //!   bound to model families.
 //! - [`structured`]: JSON output repair and JSON Schema validation.
@@ -40,7 +44,7 @@ pub mod session;
 pub mod structured;
 
 pub use backend::{Backend, BACKEND_LLAMA_CPP};
-pub use engine::{Engine, EngineConfig, EngineError, Reaped};
+pub use engine::{Engine, EngineConfig, EngineError, LlamaLaunch, LlamaServer, Reaped};
 pub use error::SessionError;
 pub use estia_proto as proto;
 pub use handles::{EmbedHandle, GenHandle};

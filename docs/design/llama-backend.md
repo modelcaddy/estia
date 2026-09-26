@@ -1,6 +1,8 @@
 # Design: a llama.cpp backend
 
-Status: proposal, written 2026-09-26. Nothing on this page is implemented.
+Status: written 2026-09-26 as a proposal; slices L1 to L7 are now built, with
+the live checks that need large downloads or other machines still open. See
+[Status](#status).
 
 Estia runs models only through MLX on Apple Silicon today. This page decides
 how Estia should run them through [llama.cpp](https://github.com/ggml-org/llama.cpp),
@@ -11,6 +13,139 @@ to know what will change for an app that sits on top of Estia.
 Facts about upstream projects were checked on 2026-09-26 against the sources
 listed at the end. Facts about Estia were checked against this repository at
 commit `09ba222`. Where something was not verified, the text says so.
+
+## Status
+
+Updated 2026-09-27. The code for L1 to L7 is in the tree: the `estia-llama`
+crate, GGUF artifacts and imports in the engine, the `llama-runtime`
+installer, `--backend` in the CLI and server, and the CI job. Where the
+implementation differs from the text below, the text is kept and the
+difference noted here.
+
+| Slice | State | Evidence |
+|---|---|---|
+| L1 adapter | Done | `cargo test -p estia-llama` with `ESTIA_LLAMA_SERVER`, `ESTIA_LLAMA_TEST_MODEL` and `ESTIA_LLAMA_TEST_EMBED_MODEL` set: 6 integration tests against `llama-server` b11146 pass (load, stream, cancel, JSON Schema, a 256-input batch, cache isolation, cleanup on SIGTERM and on a killed parent), plus 39 unit tests |
+| L2 registry and store | Built; Gemma 4 GGUF not run | Artifacts, pinned commits, explicit file lists, `model.gguf` naming; file names, sizes and hashes match the Hugging Face API. The downloader was tested on a 453 KB file. The 3.35 GB `gemma4-e2b-it-qat-q4_0-gguf` was not pulled |
+| L3 tools and structured output | Built; Gemma 4 tools untested | `format` goes to runners that list it under `structured`; `meta.tool_calls` and `parses_tool_calls`; explicit sampling; thinking off. JSON Schema output on tinygemma3: 10 of 10 `attempts: 1`, `repaired: false`. Tool results reach the template (checked with a tool-capable template, below); a parsed tool call from `llama-server` is unit-tested only |
+| L4 embeddings | Built; EmbeddingGemma GGUF not run | 384-dimension unit vectors from all-MiniLM-L6-v2 Q8_0, fingerprint `minilm@llama-cpp`, 422 on an MLX fingerprint, 256 inputs in one batch |
+| L5 runtime install | Built; macOS arm64 only | `estia runtime install --backend llama` verifies the SHA-256, unpacks, runs `--version` (`build 11146`). Probe order and CUDA pairing are unit-tested; no GPU fallback after `--list-devices` yet |
+| L6 cache isolation | Partly | One slot; reused only by the cache key whose request filled it and succeeded. Several slots: not done |
+| L7 CI and releases | Partly | The `llama` job (ubuntu-latest CPU, macos-15 Metal) is written and its steps passed locally; it has not run on GitHub. No new release archives |
+| L8, L9 | Not started | |
+
+Differences from the text below:
+
+- The adapter declares `runner: "estia-llama"` and `version` is the crate
+  version, without the build number.
+- One model per adapter: a request for another model, or the same file as
+  the other kind, replaces the running `llama-server`.
+- `generate` sends the prompt as one user turn through
+  `/v1/chat/completions`, as the table says; `/completion` is not used.
+- The prompt cache keeps one conversation per model (`-np 1`), not eight as
+  the Python runner does.
+- The embedding role can be rebound (`estia roles set embed <model>`), and
+  `estia import` registers a user's own GGUF file; neither was in the plan.
+- On MLX, where decoding cannot be constrained, the server now puts the JSON
+  Schema in the system prompt.
+- The engine now stops every runner with SIGTERM and a 4 s grace before
+  SIGKILL (idle unload, shutdown, deadlines), so the adapter always gets to
+  stop its `llama-server` and remove its socket and record.
+- On macOS the first starts of a freshly installed `llama-server` are slow:
+  in the run below, the install's own `--version` check and the next three
+  starts took 24 to 30 s each (macOS checking the unsigned binary; almost no
+  CPU), and later starts 0.7 s. The check during install did not make the
+  next start fast.
+
+Live run on an Apple M1 Pro (macOS 15.7.3), late on 2026-09-26, scratch data
+directory, port 27361, with the two CI test models. The archive was put in
+the installer's resume directory first, so the install did not download it
+again; the hash check, unpack and `--version` ran as usual. An earlier run
+downloaded it (11 MB).
+
+```text
+$ estia --data-dir <d> runtime install --backend llama              # 29.6 s
+  "variant": "metal", "version": "version: 0.5.0-dev (build 11146, commit 7fe450e19)", "reason": "Apple Silicon: Metal"
+$ estia --data-dir <d> --backend llama import tinygemma3-Q8_0.gguf --id tinygemma3 --link
+imported tinygemma3 (generation, gemma3) · context 32768 (the file declares 131072) · template yes
+$ estia --data-dir <d> --backend llama import all-MiniLM-L6-v2-Q8_0.gguf --id minilm --link
+imported minilm (embedding, bert) · 384-dim, mean pooling · fingerprint minilm@llama-cpp
+$ estia --data-dir <d> roles set fast tinygemma3 && estia --data-dir <d> roles set embed minilm
+$ estia --data-dir <d> serve --backend llama --port 27361
+INFO estia serving ... backend=llama-cpp runner=.../estia → .../runtime/llama/b11146-metal/llama-server
+INFO runner handshake model=tinygemma3 runner=estia-llama protocol=2 capabilities=generate,stream,embed,cancel,load,chat,tools,prompt_cache,count_tokens,structured:json,structured:json_schema
+INFO [estia-llama] started llama-server 50996 for .../models/tinygemma3/model.gguf (generation) on unix:.../run/llama-50995.sock
+INFO model loaded model=tinygemma3 kind=generation load_ms=25924        # first start after install; later 700 to 900 ms
+```
+
+- `GET /engine/health`: `"backend": "llama-cpp"`, first entry
+  `{"id": "llama-cpp", "active": true, "build": "b11146", "variant": "metal", "server": "installed", "runtime_installed": true}`.
+- Chat, non-streaming and streaming: `x_estia.backend: "llama-cpp"`,
+  `generation_tps` 110 to 160, final chunk with `usage`, then `[DONE]`. The
+  same conversation sent again with the same `user` reported 18 of 23 prompt
+  tokens cached; another `user` right after it, 0.
+- Cancel: a `max_tokens: 4096` stream dropped by `curl --max-time 1` was logged
+  `generation cancelled ... acknowledged=true` and `finish=cancelled`,
+  `llama-server` logged `stop: cancel task`, and the next request answered in
+  39 ms.
+- JSON Schema: ten `/engine/generate` calls at temperature 0.7 with a schema
+  of an integer, a boolean, an enum and a string with `maxLength`, each
+  `attempts: 1`, `repaired: false`; one with a raw `prompt` too;
+  `/v1/chat/completions` with `json_schema` and with `json_object` returned
+  valid JSON, `repaired: false`. `examples/python/structured.py` returned
+  schema-valid JSON three times out of three. With a plain `string` field the
+  tiny model often wrote until `max_tokens` inside the string: the grammar
+  keeps the output on the schema's path but cannot close it early, so the
+  first attempt was cut off, and the retry passed or ended in a 422.
+- Tools: a request with `tools` reaches `llama-server` (tinygemma3 answers in
+  prose; its Gemma 3 template has no tool support, and a follow-up with a
+  `tool` message is refused with HTTP 500 `Conversation roles must
+  alternate`). With `ESTIA_LLAMA_ARGS="--chat-template-file <a Hermes-style
+  template with tools>"`, the same `/v1/chat/completions` round trip was
+  accepted: the question with the tool declared was 190 prompt tokens, the
+  follow-up with the assistant's `tool_calls` and a short `tool` result 267,
+  and with a longer result 317, so the calls and results reach the template.
+  A tool call parsed by `llama-server` and returned in `meta.tool_calls` was
+  not produced live (the tiny model never calls a tool).
+- Embeddings: 384-dimension vectors of norm 1.0, fingerprint
+  `minilm@llama-cpp`; a 256-input batch in order in 0.54 s; 257 inputs → 400;
+  `expect_fingerprint: "embeddinggemma-300m-4bit@mlx-python"` → 422
+  `fingerprint mismatch`. An MLX artifact id → 400; an embedding model with no
+  GGUF artifact → 404; pulling an import → 400.
+- `/v1/models` lists the MLX artifacts with `runnable: false` and the GGUF
+  ones, built-in and imported, with `runnable: true`.
+- `/client` in a browser (`--no-auth`): the Connect tab shows
+  `backend llama-cpp (llama.cpp b11146, metal)`, the Setup tab describes the
+  llama.cpp runtime and marks MLX models "(other backend)", the model picker
+  leaves them out, and the Chat tab streamed an answer from
+  `fast (role → tinygemma3)`.
+- SIGTERM on `estia serve`: `estia stopped ... loaded=minilm,tinygemma3`,
+  each adapter logged `signal 15: stopping llama-server and exiting`,
+  `pgrep llama-server` found nothing, and `run/` was empty.
+- MLX on the same build, port 27362: chat (`Athens`, `generation_tps` 98),
+  embeddings (768 dimensions, `embeddinggemma-300m-4bit@mlx-python`, 422 on a
+  `@llama-cpp` fingerprint), `structured.py` valid in 10 runs of 10, and
+  `tools.py` answered from the tool result for 5 questions of 5.
+
+What remains:
+
+- **Gemma 4 GGUF (L2, L3).** Pull `gemma4-e2b-it-qat-q4_0-gguf` (3.35 GB),
+  run the BENCH.md `get_weather` request and check the `tool_calls` entry and
+  the answer after a `tool` message; run ten JSON Schema generations.
+  Also check whether Gemma 4 on llama.cpp ends its turn right after a tool
+  result, as the 4-bit MLX E2B does (the MLX runner now retries in a new
+  turn; the adapter has no such retry).
+- **EmbeddingGemma GGUF (L4).** Pull `embeddinggemma-300m-q8_0-gguf`, check 768
+  dimensions and the fingerprint, and list its tensors for the dense layers.
+- **Linux and GPUs (L5, L7).** The CI job on GitHub; a GPU fallback after
+  `--list-devices`; an NVIDIA machine picking CUDA; release archives for Linux
+  and Intel macOS.
+- **More slots (L6), benchmarks and the Mac default (L8), images (L9).**
+- **Smaller:** `service install` does not copy `ESTIA_LLAMA_SERVER` or
+  `ESTIA_LLAMA_ARGS` into the service definition; a template error from
+  `llama-server` is a 500, not a 400; the adapter creates no Windows job
+  object; `finish_reason` from the adapter is not read, so `length` never
+  reaches clients; a plain `load` can take longer than the engine's 300 s
+  line deadline without a keepalive (the adapter waits up to 600 s).
 
 ## Summary
 

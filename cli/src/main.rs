@@ -1,16 +1,25 @@
 //! `estia` — the terminal front for the Estia engine: set a machine up,
-//! install the service, run the HTTP daemon, pair LAN clients, list and pull
-//! models, install the runtime, generate (with an optional JSON schema), chat,
-//! embed, and bench.
+//! install the service, run the HTTP daemon, pair LAN clients, list, pull and
+//! import models, install a backend's runtime, generate (with an optional JSON
+//! schema), chat, embed, and bench.
+//!
+//! One backend per data directory: `mlx-python` (Apple Silicon) or
+//! `llama-cpp` (everywhere), from `--backend`, `ESTIA_BACKEND`, `config.json`
+//! or the machine's default. On llama.cpp this binary is also the runner: the
+//! engine starts `estia runner llama …`, the llama.cpp adapter.
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use estia_engine::models::embed::{find_embed_model, EmbedModel, BACKEND_MLX_PYTHON, EMBEDDING_MODELS};
-use estia_engine::models::{find_artifact, find_family_default, Artifact, DownloadSpec, Format, ModelStore, GENERATION_MODELS};
-use estia_engine::runtime::PythonRuntime;
+use estia_engine::models::custom::{ImportMode, ImportOptions};
+use estia_engine::models::embed::embed_models;
+use estia_engine::models::registry::family_known;
+use estia_engine::models::{find_artifact, generation_artifacts, Artifact, DownloadSpec, ModelKind, ModelStore};
+use estia_engine::proto::Message;
+use estia_engine::runtime::{LlamaRuntime, PythonRuntime};
 use estia_engine::structured::{self, OutputFormat, Structured, StructuredError};
-use estia_engine::{CancelToken, Engine, EngineConfig, Priority, RoleBinding, Roles};
+use estia_engine::{Backend, CancelToken, Engine, EngineConfig, LlamaLaunch, LlamaServer, Priority, RoleBinding, Roles};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -32,6 +41,13 @@ struct Cli {
     /// Python interpreter for the runner. Default: the installed runtime, else `python3`.
     #[arg(long, global = true, env = "ESTIA_PYTHON")]
     python: Option<PathBuf>,
+    /// Which backend runs models: `mlx-python` (Apple Silicon) or `llama-cpp`
+    /// (aliases `mlx`, `llama`). Default: `backend` in config.json, else MLX
+    /// on Apple Silicon and llama.cpp everywhere else. On llama.cpp,
+    /// `ESTIA_LLAMA_SERVER` names your own llama-server and `ESTIA_LLAMA_ARGS`
+    /// adds llama-server arguments (`-ngl 0`).
+    #[arg(long, global = true, env = "ESTIA_BACKEND", value_name = "BACKEND")]
+    backend: Option<Backend>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -46,6 +62,10 @@ enum Cmd {
         /// Skip model pulls (runtime + token + config only).
         #[arg(long)]
         no_models: bool,
+        /// llama.cpp only: the build to install (`cpu`, `metal`, `vulkan`,
+        /// `cuda-12`, `cuda-13`, `rocm`, …). Default: probe this machine.
+        #[arg(long)]
+        variant: Option<String>,
     },
     /// Run the engine at login (launchd on macOS, systemd --user on Linux).
     Service {
@@ -66,10 +86,46 @@ enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// List known models and whether they are installed.
+    /// List known and imported models, their format, and whether they are installed.
     Models,
-    /// Download a model by id (generation or embedding).
+    /// Download a model: an artifact id, or a family, role or embedding model
+    /// id (this backend's artifact of it).
     Pull { id: String },
+    /// Register a local GGUF file as a model (llama-cpp backend). Its metadata
+    /// fills in the kind, context and width; bind it with `estia roles set`.
+    Import {
+        /// The `.gguf` file.
+        file: PathBuf,
+        /// Model id (lowercase letters, digits, `.`, `_`, `-`). Default: from
+        /// the file's name.
+        #[arg(long)]
+        id: Option<String>,
+        /// `generation` or `embedding`. Default: from the file's metadata.
+        #[arg(long, value_parser = ["generation", "embedding"])]
+        kind: Option<String>,
+        /// The family roles bind to. Default: the id.
+        #[arg(long)]
+        family: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        /// Context length to run it with. Default: the file's, capped at 32768.
+        #[arg(long = "ctx", value_name = "TOKENS")]
+        context_length: Option<u32>,
+        /// Embedding models: vector width, when a projection head changes it.
+        #[arg(long)]
+        dims: Option<usize>,
+        /// Embedding models: text put before queries and before documents.
+        #[arg(long)]
+        query_prefix: Option<String>,
+        #[arg(long)]
+        doc_prefix: Option<String>,
+        /// Link to the file where it is instead of copying it.
+        #[arg(long)]
+        link: bool,
+        /// Replace an earlier import with the same id.
+        #[arg(long)]
+        replace: bool,
+    },
     /// Remove an installed model and any partial download.
     Rm { id: String },
     /// Data dir, runtime, runner, installed models.
@@ -118,13 +174,22 @@ enum Cmd {
         #[arg(long, default_value_t = 128)]
         max_tokens: u32,
     },
-    /// The Python runtime for the MLX backend.
+    /// The backend's runtime: Python + MLX (`mlx-python`), or the pinned
+    /// llama.cpp build (`llama-cpp`). Pick one with `--backend`.
     Runtime {
         #[command(subcommand)]
         action: RuntimeAction,
     },
     /// Handshake with the runner: protocol version and capabilities. Loads no model.
     RunnerCheck,
+    /// Run a backend's runner on stdin/stdout (what the engine starts):
+    /// `estia runner llama --server <llama-server> --run-dir <dir> [--ctx <n>] [-- <args>]`.
+    #[command(hide = true)]
+    Runner {
+        kind: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
     /// Chat (protocol v2): stdin is a JSON array of {role, content} messages, or plain
     /// text for a single user turn. Rendered by the model's own chat template.
     Chat {
@@ -240,6 +305,7 @@ enum ServiceAction {
         /// Passed to `serve --log-format`: `text` (default) or `json`.
         #[arg(long, value_enum)]
         log_format: Option<LogFormat>,
+        // `--backend` (global) is passed to `serve` too when given.
     },
     Uninstall,
     Start,
@@ -328,20 +394,51 @@ enum RolesAction {
 #[derive(Subcommand)]
 enum RuntimeAction {
     Status,
-    Install,
+    Install {
+        /// llama.cpp only: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`,
+        /// `rocm`, … Default: probe this machine (`ESTIA_LLAMA_VARIANT`).
+        #[arg(long)]
+        variant: Option<String>,
+    },
     Remove,
 }
 
+/// `config.json`. Other keys in the file are kept when it is written.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FileConfig {
     #[serde(default)]
     roles: Option<Roles>,
+    /// Chosen by `estia setup`; `--backend` / `ESTIA_BACKEND` override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend: Option<Backend>,
+}
+
+/// The backend for this invocation and where the choice came from: the
+/// flag or `ESTIA_BACKEND`, then `config.json`, then the machine's default
+/// (MLX on Apple Silicon, llama.cpp elsewhere).
+fn choose_backend(flag: Option<Backend>, file: Option<Backend>) -> (Backend, &'static str) {
+    match (flag, file) {
+        (Some(b), _) => (b, "--backend / ESTIA_BACKEND"),
+        (None, Some(b)) => (b, "config.json"),
+        (None, None) => (Backend::platform_default(), "default for this machine"),
+    }
+}
+
+/// Extra llama-server arguments from `ESTIA_LLAMA_ARGS`, split on whitespace.
+fn llama_extra_args() -> Vec<String> {
+    std::env::var("ESTIA_LLAMA_ARGS").map(|v| v.split_whitespace().map(str::to_string).collect()).unwrap_or_default()
 }
 
 struct Ctx {
     data_dir: PathBuf,
     store: ModelStore,
     runtime: PythonRuntime,
+    llama_runtime: LlamaRuntime,
+    backend: Backend,
+    /// Where `backend` came from, for `estia status`.
+    backend_source: &'static str,
+    /// `--backend` / `ESTIA_BACKEND` when given: what `service install` passes on.
+    backend_flag: Option<Backend>,
     /// `--runner` / `ESTIA_RUNNER`, if given.
     runner_arg: Option<PathBuf>,
     /// Resolved on first use: resolving may write the compiled-in runner into
@@ -410,20 +507,29 @@ fn find_runner(explicit: Option<PathBuf>, data_dir: &Path) -> Option<PathBuf> {
 impl Ctx {
     fn new(cli: &Cli) -> Result<Self> {
         let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
-        let store = ModelStore::new(data_dir.join("models")).with_user_agent(format!("estia/{}", env!("CARGO_PKG_VERSION")));
-        let runtime = PythonRuntime::new(data_dir.join("runtime")).with_user_agent(format!("estia/{}", env!("CARGO_PKG_VERSION")));
-        let roles = match std::fs::read_to_string(data_dir.join("config.json")) {
-            Ok(text) => serde_json::from_str::<FileConfig>(&text).context("parse config.json")?.roles.unwrap_or_else(Roles::defaults),
-            Err(_) => Roles::defaults(),
+        let agent = format!("estia/{}", env!("CARGO_PKG_VERSION"));
+        let store = ModelStore::new(data_dir.join("models")).with_user_agent(agent.clone());
+        let runtime = PythonRuntime::new(data_dir.join("runtime")).with_user_agent(agent.clone());
+        let llama_runtime = LlamaRuntime::new(data_dir.join("runtime")).with_user_agent(agent);
+        let file = match std::fs::read_to_string(data_dir.join("config.json")) {
+            Ok(text) => serde_json::from_str::<FileConfig>(&text).context("parse config.json")?,
+            Err(_) => FileConfig::default(),
         };
+        let (backend, backend_source) = choose_backend(cli.backend, file.backend);
+        // Imported models resolve (and roles bind to them) like built-ins.
+        store.load_imported();
         Ok(Self {
             data_dir,
             store,
             runtime,
+            llama_runtime,
+            backend,
+            backend_source,
+            backend_flag: cli.backend,
             runner_arg: cli.runner.clone(),
             runner_found: std::sync::OnceLock::new(),
             python: cli.python.clone(),
-            roles,
+            roles: file.roles.unwrap_or_else(Roles::defaults),
         })
     }
 
@@ -431,43 +537,84 @@ impl Ctx {
         self.runner_found.get_or_init(|| find_runner(self.runner_arg.clone(), &self.data_dir)).clone()
     }
 
-    fn save_roles(&self) -> Result<()> {
+    /// Write `config.json`: `roles`, and `backend` when given, over whatever
+    /// else the file holds.
+    fn save_config(&self, backend: Option<Backend>) -> Result<()> {
         std::fs::create_dir_all(&self.data_dir)?;
-        let cfg = FileConfig { roles: Some(self.roles.clone()) };
-        std::fs::write(self.data_dir.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
+        let path = self.data_dir.join("config.json");
+        let mut cfg: serde_json::Value =
+            std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_else(|| serde_json::json!({}));
+        if !cfg.is_object() {
+            cfg = serde_json::json!({});
+        }
+        cfg["roles"] = serde_json::to_value(&self.roles)?;
+        if let Some(b) = backend {
+            cfg["backend"] = serde_json::to_value(b)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?;
         Ok(())
+    }
+
+    fn save_roles(&self) -> Result<()> {
+        self.save_config(None)
     }
 
     fn python(&self) -> PathBuf {
         self.python.clone().or_else(|| self.runtime.python_path()).unwrap_or_else(|| PathBuf::from("python3"))
     }
 
-    fn engine(&self) -> Result<Engine> {
-        let runner =
-            self.runner().ok_or_else(|| anyhow!("no runner script found — pass --runner or set ESTIA_RUNNER to estia-runner.py"))?;
-        let cfg =
-            EngineConfig::new(self.store.clone(), self.runtime.clone(), runner).with_python(self.python()).with_roles(self.roles.clone());
-        Ok(Engine::new(cfg))
+    /// `<data dir>/run`: the llama adapter's sockets, key files and pid records.
+    fn run_dir(&self) -> PathBuf {
+        self.data_dir.join("run")
     }
 
-    /// Role name, family, or artifact id → the artifact to load.
-    fn resolve_generation(&self, name: &str) -> Result<&'static Artifact> {
-        if let Some(a) = find_artifact(name) {
-            return Ok(a);
-        }
-        if let Some(a) = find_family_default(name, Format::Mlx) {
-            return Ok(a);
-        }
-        let (res, artifact) = self.roles.resolve_artifact(name, Format::Mlx).map_err(|e| anyhow!("{name}: {e}"))?;
-        if res.served_by != res.asked {
-            eprintln!("role `{}` is unbound; served by `{}` ({})", res.asked, res.served_by, artifact.id);
+    /// An engine that starts runners on this invocation's backend.
+    fn engine(&self) -> Result<Engine> {
+        let cfg = match self.backend {
+            Backend::MlxPython => {
+                if !Backend::MlxPython.supported_here() {
+                    return Err(anyhow!("the mlx-python backend needs Apple Silicon; use --backend llama-cpp"));
+                }
+                let runner = self
+                    .runner()
+                    .ok_or_else(|| anyhow!("no runner script found — pass --runner or set ESTIA_RUNNER to estia-runner.py"))?;
+                EngineConfig::new(self.store.clone(), self.runtime.clone(), runner).with_python(self.python())
+            }
+            Backend::LlamaCpp => {
+                // This binary is the adapter: `estia runner llama …`.
+                let exe = std::env::current_exe().context("locate the estia binary, which runs the llama.cpp adapter")?;
+                let mut launch =
+                    LlamaLaunch::new(exe, self.run_dir()).prefix_arg("runner").prefix_arg("llama").with_server(LlamaServer::from_env());
+                for a in llama_extra_args() {
+                    launch = launch.server_arg(a);
+                }
+                EngineConfig::new(self.store.clone(), self.runtime.clone(), PathBuf::new()).with_llama(launch)
+            }
+        };
+        Ok(Engine::new(cfg.with_roles(self.roles.clone()).with_llama_runtime(self.llama_runtime.clone())))
+    }
+
+    /// An engine for resolving names and listing models only: it never
+    /// starts a runner, so it needs no runtime or runner script.
+    fn resolver(&self) -> Engine {
+        let cfg = EngineConfig::new(self.store.clone(), self.runtime.clone(), PathBuf::new())
+            .with_backend(self.backend)
+            .with_roles(self.roles.clone())
+            .with_llama_runtime(self.llama_runtime.clone());
+        Engine::new(cfg)
+    }
+
+    /// Role name, family or artifact id → this backend's artifact.
+    fn resolve_generation(&self, engine: &Engine, name: &str) -> Result<&'static Artifact> {
+        let artifact = engine.resolve_generation(name).map_err(|e| anyhow!("{e}"))?;
+        if find_artifact(name).is_none() && !family_known(name) {
+            if let Ok(res) = self.roles.resolve(name) {
+                if res.served_by != res.asked {
+                    eprintln!("role `{}` is unbound; served by `{}` ({})", res.asked, res.served_by, artifact.id);
+                }
+            }
         }
         Ok(artifact)
-    }
-
-    fn resolve_embedding(&self, name: Option<&str>) -> Result<&'static EmbedModel> {
-        let id = name.unwrap_or("embeddinggemma-300m-4bit");
-        find_embed_model(id).ok_or_else(|| anyhow!("unknown embedding model `{id}`"))
     }
 }
 
@@ -558,71 +705,96 @@ fn read_stdin() -> Result<String> {
 }
 
 async fn pull(ctx: &Ctx, id: &str) -> Result<()> {
-    let spec = if let Some(a) = find_artifact(id) {
-        DownloadSpec::from(a)
-    } else if let Some(e) = find_embed_model(id) {
-        DownloadSpec {
-            id: e.id.to_string(),
-            repo_id: e.repo_id.to_string(),
-            revision: e.revision.to_string(),
-            required_disk_bytes: e.required_disk_bytes,
-        }
-    } else {
-        return Err(anyhow!("unknown model id `{id}` (see `estia models`)"));
-    };
+    let spec = estia_server::catalog::pull_spec(&ctx.resolver(), id).map_err(|e| anyhow!("{e} (see `estia models`)"))?;
     eprintln!("pulling {} from {}@{} ({} required)", spec.id, spec.repo_id, spec.revision, gb(spec.required_disk_bytes));
     let summary = ctx.store.download(&spec, print_progress).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
 
+/// One row of `estia models`.
+fn model_row(ctx: &Ctx, a: &Artifact, family: &str, kind: &str, extra: &str) -> String {
+    let imported = estia_server::catalog::is_imported(&ctx.store, a.id);
+    let (state, size) = if ctx.store.is_installed(a.id) && imported {
+        // The model's own size: a linked import takes no space here.
+        ("installed", gb(a.required_disk_bytes))
+    } else if ctx.store.is_installed(a.id) {
+        ("installed", ctx.store.bytes_on_disk(a.id).map(gb).unwrap_or_default())
+    } else if let Some(b) = ctx.store.partial_bytes_on_disk(a.id) {
+        ("partial", format!("{} of {}", gb(b), gb(a.required_disk_bytes)))
+    } else {
+        ("missing", gb(a.required_disk_bytes))
+    };
+    let runs = if a.format == ctx.backend.format() { "*" } else { " " };
+    let source = if imported { "imported" } else { "built-in" };
+    format!("{runs} {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} {size}{extra}", safe(a.id), safe(family), kind, a.format.id(), source, state)
+}
+
 fn models(ctx: &Ctx) -> Result<()> {
-    println!("{:<36} {:<16} {:<6} {:<10} size", "id", "family", "format", "state");
-    for a in GENERATION_MODELS {
-        let (state, size) = if ctx.store.is_installed(a.id) {
-            ("installed", ctx.store.bytes_on_disk(a.id).map(gb).unwrap_or_default())
-        } else if let Some(b) = ctx.store.partial_bytes_on_disk(a.id) {
-            ("partial", format!("{} of {}", gb(b), gb(a.required_disk_bytes)))
-        } else {
-            ("missing", gb(a.required_disk_bytes))
-        };
-        println!("{:<36} {:<16} {:<6} {:<10} {}", a.id, a.family, format!("{:?}", a.format).to_lowercase(), state, size);
+    println!("backend {} ({}) · * = runs on it", ctx.backend, ctx.backend_source);
+    println!("  {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} size", "id", "family / model", "kind", "format", "source", "state");
+    for a in generation_artifacts() {
+        println!("{}", model_row(ctx, a, a.family, "gen", ""));
     }
-    for e in EMBEDDING_MODELS {
-        let (state, size) = if ctx.store.is_installed(e.id) {
-            ("installed", ctx.store.bytes_on_disk(e.id).map(gb).unwrap_or_default())
-        } else {
-            ("missing", gb(e.required_disk_bytes))
-        };
-        println!("{:<36} {:<16} {:<6} {:<10} {} ({}-dim, {})", e.id, "embed", "mlx", state, size, e.dims, e.arch.model_type());
+    for e in embed_models() {
+        for a in e.artifacts {
+            let fp = if a.format == ctx.backend.format() {
+                format!(" · {}", safe(&format!("{}@{}", a.id, ctx.backend)))
+            } else {
+                String::new()
+            };
+            let extra = format!(" ({}-dim{fp})", e.dims);
+            println!("{}", model_row(ctx, a, e.id, "embed", &extra));
+        }
     }
     Ok(())
+}
+
+/// The llama.cpp runtime in one line: a user's own `llama-server`, the
+/// installed pinned build, or how to install it.
+fn llama_runtime_line(ctx: &Ctx) -> String {
+    if let LlamaServer::Path(p) = LlamaServer::from_env() {
+        return format!("ESTIA_LLAMA_SERVER={}{}", safe(&p.display().to_string()), if p.is_file() { "" } else { " (missing!)" });
+    }
+    let st = ctx.llama_runtime.status();
+    match (&st.variant, &st.server_path) {
+        (Some(v), Some(path)) => format!("llama.cpp {} ({v}) · {}", st.build, safe(path)),
+        _ => format!("not installed  (estia runtime install --backend llama-cpp: {})", st.build),
+    }
 }
 
 fn status(ctx: &Ctx) -> Result<()> {
     println!("data dir : {}", ctx.data_dir.display());
     println!("models   : {}", ctx.store.models_dir().display());
-    let rt = ctx.runtime.status();
-    println!(
-        "runtime  : {:?}{}",
-        rt.state,
-        rt.python_version
-            .as_deref()
-            .map(|v| format!(" (python {v}, mlx-lm {})", rt.mlx_lm_version.as_deref().unwrap_or("?")))
-            .unwrap_or_default()
-    );
-    println!("python   : {}", ctx.python().display());
-    println!("runner   : {}", ctx.runner().as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none found)".into()));
-    let installed: Vec<&str> = GENERATION_MODELS
-        .iter()
-        .map(|a| a.id)
-        .chain(EMBEDDING_MODELS.iter().map(|e| e.id))
-        .filter(|id| ctx.store.is_installed(id))
+    println!("backend  : {} ({})", ctx.backend, ctx.backend_source);
+    println!("llama.cpp: {}", llama_runtime_line(ctx));
+    // The MLX lines only where MLX can run.
+    if Backend::MlxPython.supported_here() {
+        let rt = ctx.runtime.status();
+        println!(
+            "mlx      : {:?}{}",
+            rt.state,
+            rt.python_version
+                .as_deref()
+                .map(|v| format!(" (python {v}, mlx-lm {})", rt.mlx_lm_version.as_deref().unwrap_or("?")))
+                .unwrap_or_default()
+        );
+        if ctx.backend == Backend::MlxPython {
+            println!("python   : {}", ctx.python().display());
+            println!("runner   : {}", ctx.runner().as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "(none found)".into()));
+        }
+    }
+    let mut installed: Vec<String> = generation_artifacts()
+        .into_iter()
+        .chain(embed_models().into_iter().flat_map(|e| e.artifacts.iter()))
+        .filter(|a| ctx.store.is_installed(a.id))
+        .map(|a| if a.format == ctx.backend.format() { safe(a.id) } else { format!("{} ({})", safe(a.id), a.format.id()) })
         .collect();
+    installed.dedup();
     println!("installed: {}", if installed.is_empty() { "(none)".to_string() } else { installed.join(", ") });
     println!("roles    :");
     for (role, b) in ctx.roles.iter() {
-        println!("  {:<8} → {}{}", role, b.family, if b.pin { " (pinned)" } else { "" });
+        println!("  {:<8} → {}{}", safe(role), safe(&b.family), if b.pin { " (pinned)" } else { "" });
     }
     match estia_server::another_engine_running(&ctx.data_dir) {
         Some(rec) => {
@@ -640,7 +812,12 @@ fn status(ctx: &Ctx) -> Result<()> {
                 .and_then(|h| h["loaded"].as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str()).map(safe).collect::<Vec<_>>().join(", "))
                 .unwrap_or_default();
-            println!("daemon   : running · pid {} · {} · up {up} · loaded [{loaded}]", rec.pid, host_port(&rec.bind, rec.port));
+            let backend = health.as_ref().map(|h| jtext(&h["backend"])).unwrap_or_else(|| "?".into());
+            println!(
+                "daemon   : running · pid {} · {} · backend {backend} · up {up} · loaded [{loaded}]",
+                rec.pid,
+                host_port(&rec.bind, rec.port)
+            );
             if rec.bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
                 for ip in lan_ips() {
                     let url = http_url(&ip, rec.port);
@@ -659,6 +836,88 @@ fn status(ctx: &Ctx) -> Result<()> {
         println!("pairings : {} pending — estia pair list / estia pair approve <id>", pending.len());
     }
     println!("service  : {}", service_status_line());
+    Ok(())
+}
+
+// One parameter per `estia import` flag.
+#[allow(clippy::too_many_arguments)]
+fn import(
+    ctx: &Ctx,
+    file: &Path,
+    id: Option<String>,
+    kind: Option<String>,
+    family: Option<String>,
+    label: Option<String>,
+    context_length: Option<u32>,
+    dims: Option<usize>,
+    query_prefix: Option<String>,
+    doc_prefix: Option<String>,
+    link: bool,
+    replace: bool,
+) -> Result<()> {
+    let kind = match kind.as_deref() {
+        Some("generation") => Some(ModelKind::Generation),
+        Some("embedding") => Some(ModelKind::Embedding),
+        Some(other) => return Err(anyhow!("--kind is generation or embedding, not `{}`", safe(other))),
+        None => None,
+    };
+    let opts = ImportOptions {
+        id,
+        kind,
+        family,
+        label,
+        context_length,
+        embedding_dims: dims,
+        query_prefix,
+        doc_prefix,
+        mode: if link { ImportMode::Symlink } else { ImportMode::Copy },
+        replace,
+    };
+    if !link {
+        eprintln!("copying and hashing {} …", file.display());
+    }
+    let m = ctx.store.import_gguf(file, opts)?;
+    let kind = match m.kind {
+        ModelKind::Generation => "generation",
+        ModelKind::Embedding => "embedding",
+    };
+    println!("imported {} ({kind}, {})", safe(&m.id), safe(m.architecture.as_deref().unwrap_or("unknown architecture")));
+    println!("  file     : {}", ctx.store.load_path(&m.id).display());
+    match m.mode {
+        ImportMode::Symlink => println!("  source   : {} (linked: moving it breaks the import)", safe(&m.source_path)),
+        ImportMode::Copy => println!("  source   : {} (copied)", safe(&m.source_path)),
+    }
+    println!("  size     : {} · sha256 {}", gb(m.bytes), &m.sha256[..m.sha256.len().min(16)]);
+    match m.kind {
+        ModelKind::Generation => {
+            println!("  family   : {}", safe(&m.family));
+            println!(
+                "  context  : {}{}",
+                m.context_length.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                m.declared_context_length.map(|c| format!(" (the file declares {c})")).unwrap_or_default()
+            );
+            println!(
+                "  template : {}{}",
+                if m.has_chat_template { "yes" } else { "none (chat will fail)" },
+                if m.tools { ", tools" } else { "" }
+            );
+            println!("  use it   : estia chat --model {} · estia roles set fast {}", safe(&m.id), safe(&m.family));
+        }
+        ModelKind::Embedding => {
+            println!(
+                "  vectors  : {}-dim, {} pooling · fingerprint {}",
+                m.embedding_dims.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+                m.pooling.map(|p| p.llama_arg()).unwrap_or("mean"),
+                safe(&m.fingerprint().unwrap_or_default())
+            );
+            println!("  use it   : estia embed --model {} · estia roles set embed {}", safe(&m.id), safe(&m.id));
+        }
+    }
+    if ctx.backend != Backend::LlamaCpp {
+        println!(
+            "  note     : imported GGUF models run on the llama-cpp backend (--backend llama-cpp, or `estia setup --backend llama-cpp`)"
+        );
+    }
     Ok(())
 }
 
@@ -716,8 +975,8 @@ fn run(
     background: bool,
     cancel_after_ms: Option<u64>,
 ) -> Result<()> {
-    let artifact = ctx.resolve_generation(model)?;
     let engine = ctx.engine()?;
+    let artifact = ctx.resolve_generation(&engine, model)?;
     let prompt = read_stdin()?;
     if prompt.is_empty() {
         return Err(anyhow!("empty prompt on stdin"));
@@ -733,7 +992,13 @@ fn run(
     let prio = if background { Priority::Background } else { Priority::Interactive };
     let started = Instant::now();
     let session = engine.spawn_gen_session(artifact.id)?;
-    eprintln!("model {} · backend {} · spawned in {} ms", artifact.id, BACKEND_MLX_PYTHON, started.elapsed().as_millis());
+    eprintln!("model {} · backend {} · spawned in {} ms", artifact.id, engine.backend(), started.elapsed().as_millis());
+    // A runner that constrains decoding (llama.cpp) does so in `chat`: the
+    // prompt goes there as one user turn. The output is validated either way.
+    let caps = session.capabilities();
+    let constrain = estia_server::openai::runner_format(&caps, &format, false).filter(|_| caps.chat);
+    // Any other runner (MLX) is shown the schema after the prompt instead.
+    let prompt = if constrain.is_none() { structured::prompt_with_hint(&prompt, &format) } else { prompt };
 
     let stream_out = !no_stream && !format.wants_json();
     let mut out = std::io::stdout();
@@ -748,7 +1013,7 @@ fn run(
         }
         let t0 = Instant::now();
         let mut first: Option<u128> = None;
-        let text = match session.generate_stream_with(prompt, Some(max_tokens), Some(temperature), prio, Some(&cancel), |tok| {
+        let on_token = |tok: &str| {
             if first.is_none() {
                 first = Some(t0.elapsed().as_millis());
             }
@@ -756,7 +1021,24 @@ fn run(
                 let _ = out.write_all(tok.as_bytes());
                 let _ = out.flush();
             }
-        }) {
+        };
+        let result = match &constrain {
+            Some(f) => session
+                .chat_stream_with(
+                    &[Message::new("user", prompt)],
+                    None,
+                    None,
+                    Some(f),
+                    Some(max_tokens),
+                    Some(temperature),
+                    prio,
+                    Some(&cancel),
+                    on_token,
+                )
+                .map(|o| o.text),
+            None => session.generate_stream_with(prompt, Some(max_tokens), Some(temperature), prio, Some(&cancel), on_token),
+        };
+        let text = match result {
             Ok(text) => text,
             Err(estia_engine::SessionError::Cancelled { partial }) => {
                 eprintln!("\ncancelled after {} ms with {} chars delivered", t0.elapsed().as_millis(), partial.chars().count());
@@ -804,10 +1086,10 @@ fn run(
 }
 
 fn embed(ctx: &Ctx, model: Option<&str>) -> Result<()> {
-    let spec = ctx.resolve_embedding(model)?;
     let engine = ctx.engine()?;
-    let fingerprint = spec.fingerprint_for(BACKEND_MLX_PYTHON);
-    let session = engine.spawn_embed_session(spec.id, &fingerprint)?;
+    let (spec, _) = engine.resolve_embedding(model).map_err(|e| anyhow!("{e}"))?;
+    let session = engine.spawn_embed_model(spec)?;
+    let fingerprint = session.fingerprint().to_string();
     let inputs: Vec<String> = std::io::stdin().lock().lines().map_while(Result::ok).filter(|l| !l.trim().is_empty()).collect();
     if inputs.is_empty() {
         return Err(anyhow!("no input lines on stdin"));
@@ -826,10 +1108,10 @@ fn embed(ctx: &Ctx, model: Option<&str>) -> Result<()> {
 }
 
 fn bench(ctx: &Ctx, model: &str, embed_model: Option<&str>, max_tokens: u32) -> Result<()> {
-    let artifact = ctx.resolve_generation(model)?;
     let engine = ctx.engine()?;
+    let artifact = ctx.resolve_generation(&engine, model)?;
     println!("machine   : {} · {}", std::env::consts::ARCH, std::env::consts::OS);
-    println!("backend   : {}", BACKEND_MLX_PYTHON);
+    println!("backend   : {}", engine.backend());
 
     // Generation: an explicit load (protocol v2) so the first generation is
     // measured warm-ish, then a second one fully warm. On a v1 runner the
@@ -844,17 +1126,42 @@ fn bench(ctx: &Ctx, model: &str, embed_model: Option<&str>, max_tokens: u32) -> 
         let t0 = Instant::now();
         let mut first: Option<u128> = None;
         let mut pieces = 0usize;
-        let text = session.generate_stream_with(prompt, Some(max_tokens), Some(0.0), Priority::Interactive, None, |_| {
+        let on_token = |_: &str| {
             pieces += 1;
             if first.is_none() {
                 first = Some(t0.elapsed().as_millis());
             }
-        })?;
+        };
+        // Chat when the runner has it: its meta line carries token counts
+        // and the decode rate the runner measured.
+        let (text, meta) = if session.capabilities().chat {
+            let o = session.chat_stream_with(
+                &[Message::new("user", prompt)],
+                None,
+                None,
+                None,
+                Some(max_tokens),
+                Some(0.0),
+                Priority::Interactive,
+                None,
+                on_token,
+            )?;
+            (o.text, Some(o.meta))
+        } else {
+            (session.generate_stream_with(prompt, Some(max_tokens), Some(0.0), Priority::Interactive, None, on_token)?, None)
+        };
         let total = t0.elapsed().as_millis().max(1);
         let chars = text.chars().count();
         let decode_ms = total.saturating_sub(first.unwrap_or(0)).max(1);
+        let tokens = match meta.as_ref().and_then(|m| m.generation_tokens) {
+            Some(n) => {
+                let tps = meta.as_ref().and_then(|m| m.generation_tps).unwrap_or(n as f64 * 1000.0 / decode_ms as f64);
+                format!(" · {n} tokens · ≈{tps:.1} tokens/s")
+            }
+            None => String::new(),
+        };
         println!(
-            "generate {:<4}: {} · first token {} ms · total {} ms · {} chars · ≈{:.1} chars/s decode ({} pieces)",
+            "generate {:<4}: {} · first token {} ms · total {} ms · {} chars · ≈{:.1} chars/s decode ({} pieces){tokens}",
             label,
             artifact.id,
             first.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
@@ -866,8 +1173,8 @@ fn bench(ctx: &Ctx, model: &str, embed_model: Option<&str>, max_tokens: u32) -> 
     }
 
     // Embedding: one warm batch of 32 short units.
-    let spec = ctx.resolve_embedding(embed_model)?;
-    let esession = engine.spawn_embed_session(spec.id, &spec.fingerprint_for(BACKEND_MLX_PYTHON))?;
+    let (spec, eartifact) = engine.resolve_embedding(embed_model).map_err(|e| anyhow!("{e}"))?;
+    let esession = engine.spawn_embed_model(spec)?;
     let units: Vec<String> =
         (0..32).map(|i| format!("title: none | text: sample sentence number {i} about the sea and the shore")).collect();
     if esession.load()?.is_none() {
@@ -878,7 +1185,7 @@ fn bench(ctx: &Ctx, model: &str, embed_model: Option<&str>, max_tokens: u32) -> 
     let ms = t0.elapsed().as_millis().max(1);
     println!(
         "embed warm    : {} · {} units × {} dims in {} ms · ≈{:.1} units/s",
-        spec.id,
+        eartifact.id,
         v.len(),
         v.first().map(|x| x.len()).unwrap_or(0),
         ms,
@@ -889,23 +1196,31 @@ fn bench(ctx: &Ctx, model: &str, embed_model: Option<&str>, max_tokens: u32) -> 
 
 fn runner_check(ctx: &Ctx) -> Result<()> {
     let engine = ctx.engine()?;
-    let runner = engine.resident_runner().to_path_buf();
+    // No model is named, so the llama adapter gets no `--ctx`; nothing loads.
+    let launch = engine.launch_for("")?;
+    let command: Vec<String> = std::iter::once(launch.program().display().to_string())
+        .chain(launch.args().iter().map(|a| a.to_string_lossy().into_owned()))
+        .collect();
     let t0 = Instant::now();
-    let session = estia_engine::Session::spawn(
-        estia_engine::Launch::new(ctx.python()).arg(runner.clone()),
-        estia_engine::SessionConfig::default(),
-        std::sync::Arc::new(estia_engine::NoopObserver),
-    )?;
+    let session =
+        estia_engine::Session::spawn(launch, estia_engine::SessionConfig::default(), std::sync::Arc::new(estia_engine::NoopObserver))?;
     let spawned = t0.elapsed().as_millis();
     let hello = session.hello()?;
     let ping_ok = session.call_unobserved(&estia_engine::proto::Request::Ping).is_ok();
-    println!("runner   : {}", runner.display());
-    println!("python   : {}", ctx.python().display());
+    println!("backend  : {} ({})", engine.backend(), ctx.backend_source);
+    println!("command  : {}", safe(&command.join(" ")));
+    if engine.backend() == Backend::LlamaCpp {
+        let server = engine.llama_server_path()?;
+        let version = estia_engine::runtime::llama::server_version(&server, estia_engine::runtime::llama::FIRST_RUN_TIMEOUT)
+            .map(|v| safe(&v))
+            .unwrap_or_else(|e| format!("? ({})", safe(&format!("{e:#}"))));
+        println!("server   : {} · {version}", server.display());
+    }
     println!("spawn    : {spawned} ms");
     println!("ping     : {}", if ping_ok { "ok" } else { "FAILED" });
     match hello {
         Some(h) => {
-            println!("protocol : v{} ({} {})", h.protocol, h.runner, h.version);
+            println!("protocol : v{} ({} {})", h.protocol, safe(&h.runner), safe(&h.version));
             println!("{}", serde_json::to_string_pretty(&h.capabilities)?);
             if h.protocol > estia_engine::proto::PROTOCOL_VERSION {
                 eprintln!(
@@ -932,9 +1247,8 @@ fn chat(
     temperature: f32,
     two_turns: bool,
 ) -> Result<()> {
-    use estia_engine::proto::Message;
-    let artifact = ctx.resolve_generation(model)?;
     let engine = ctx.engine()?;
+    let artifact = ctx.resolve_generation(&engine, model)?;
     let input = read_stdin()?;
     let mut messages: Vec<Message> = if input.trim_start().starts_with('[') {
         serde_json::from_str(&input).context("stdin is not a JSON array of messages")?
@@ -985,15 +1299,20 @@ fn chat(
         println!();
         let m = &outcome.meta;
         eprintln!(
-            "turn {}: first token {} ms · total {} ms · prompt {} tokens ({} cached) · generated {} · template {}",
+            "turn {}: first token {} ms · total {} ms · prompt {} tokens ({} cached) · generated {}{} · template {}",
             turn + 1,
             first.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
             t0.elapsed().as_millis(),
             m.prompt_tokens.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
             m.cached_tokens.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
             m.generation_tokens.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
+            m.generation_tps.map(|t| format!(" (≈{t:.1} tokens/s)")).unwrap_or_default(),
             m.template.as_deref().unwrap_or("?")
         );
+        // A runner that parses tool calls itself (llama.cpp) reports them here.
+        for c in m.tool_calls.iter().flatten() {
+            eprintln!("tool call: {}", safe(&c.to_string()));
+        }
         if turn + 1 < turns {
             messages.push(Message::new("assistant", outcome.text.clone()));
             messages.push(Message::new("user", "Now say the same thing in exactly five words."));
@@ -1003,8 +1322,8 @@ fn chat(
 }
 
 fn tokens(ctx: &Ctx, model: &str) -> Result<()> {
-    let artifact = ctx.resolve_generation(model)?;
     let engine = ctx.engine()?;
+    let artifact = ctx.resolve_generation(&engine, model)?;
     let text = read_stdin()?;
     let session = engine.spawn_gen_session(artifact.id)?;
     match session.count_tokens(&text)? {
@@ -1108,52 +1427,107 @@ fn local_url(bind: &str, port: u16) -> String {
     }
 }
 
-async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
+/// Progress of a runtime install on one line of stderr.
+fn print_setup_progress(p: &estia_engine::runtime::SetupProgress) {
+    let pct = match (p.bytes_done, p.bytes_total) {
+        (Some(d), Some(t)) if t > 0 => format!("{:>3}%", d.min(t) * 100 / t),
+        _ => "    ".to_string(),
+    };
+    eprint!("\r  {:<24} {pct} {:<60}", p.phase, safe(&p.message.chars().take(60).collect::<String>()));
+}
+
+/// Make the backend's runtime ready: the Python + MLX packages, or the pinned
+/// `llama-server` (unless `ESTIA_LLAMA_SERVER` names one). Prints one line.
+async fn ensure_runtime(ctx: &Ctx, variant: Option<&str>) -> Result<()> {
+    match ctx.backend {
+        Backend::MlxPython => {
+            if ctx.runtime.is_installed() {
+                let st = ctx.runtime.status();
+                println!(
+                    "✓ runtime  : installed (python {}, mlx-lm {})",
+                    st.python_version.unwrap_or_else(|| "?".into()),
+                    st.mlx_lm_version.unwrap_or_else(|| "?".into())
+                );
+            } else {
+                println!("… runtime  : installing Python + MLX (~700 MB, several minutes)");
+                ctx.runtime.preflight(estia_engine::runtime::RUNTIME_APPROX_BYTES)?;
+                let summary = ctx.runtime.install(|p| print_setup_progress(&p)).await?;
+                eprintln!();
+                println!("✓ runtime  : python {} / mlx-lm {}", summary.python_version, summary.mlx_lm_version);
+            }
+        }
+        Backend::LlamaCpp => {
+            if let LlamaServer::Path(server) = LlamaServer::from_env() {
+                let info = tokio::task::block_in_place(|| {
+                    estia_engine::runtime::inspect_server(&server, estia_engine::runtime::llama::FIRST_RUN_TIMEOUT)
+                })
+                .with_context(|| format!("ESTIA_LLAMA_SERVER={}", server.display()))?;
+                println!(
+                    "✓ runtime  : your llama-server {} ({}){}",
+                    server.display(),
+                    safe(&info.version),
+                    if info.pinned { "" } else { " — not the build Estia is tested with" }
+                );
+            } else if ctx.llama_runtime.is_installed() && variant.is_none() {
+                let st = ctx.llama_runtime.status();
+                println!("✓ runtime  : llama.cpp {} ({})", st.build, st.variant.unwrap_or_default());
+            } else {
+                let probe = LlamaRuntime::probe();
+                let size = probe.download_bytes.map(|b| format!(", {} MB", b / 1_000_000)).unwrap_or_default();
+                println!("… runtime  : installing llama.cpp {}{size}", variant.or(probe.variant.as_deref()).unwrap_or("?"));
+                let summary = ctx.llama_runtime.install(variant, |p| print_setup_progress(&p)).await?;
+                eprintln!();
+                println!("✓ runtime  : llama.cpp {} ({}) · {}", summary.build, summary.variant, safe(&summary.reason));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&str>) -> Result<()> {
     use estia_server::tokens::{TokenStore, SCOPE_ADMIN};
     println!("estia setup — data dir {}", ctx.data_dir.display());
+    if !ctx.backend.supported_here() {
+        return Err(anyhow!("the {} backend cannot run on this machine; use --backend llama-cpp", ctx.backend));
+    }
+    if variant.is_some() && ctx.backend != Backend::LlamaCpp {
+        return Err(anyhow!("--variant is for the llama-cpp backend"));
+    }
     std::fs::create_dir_all(&ctx.data_dir)?;
+    println!("✓ backend  : {} ({})", ctx.backend, ctx.backend_source);
 
     // 1. Runtime.
-    if ctx.runtime.is_installed() {
-        let st = ctx.runtime.status();
-        println!(
-            "✓ runtime  : installed (python {}, mlx-lm {})",
-            st.python_version.unwrap_or_else(|| "?".into()),
-            st.mlx_lm_version.unwrap_or_else(|| "?".into())
-        );
-    } else {
-        println!("… runtime  : installing Python + MLX (~700 MB, several minutes)");
-        ctx.runtime.preflight(estia_engine::runtime::RUNTIME_APPROX_BYTES)?;
-        let summary =
-            ctx.runtime.install(|p| eprint!("\r  {:<32} {:<60}", p.phase, safe(&p.message.chars().take(60).collect::<String>()))).await?;
-        eprintln!();
-        println!("✓ runtime  : python {} / mlx-lm {}", summary.python_version, summary.mlx_lm_version);
-    }
+    ensure_runtime(ctx, variant).await?;
 
-    // 2. Models for the requested roles.
+    // 2. Models for the requested roles, in this backend's format.
     if !no_models {
-        let mut wanted: Vec<DownloadSpec> = Vec::new();
+        let engine = ctx.resolver();
+        let mut wanted: Vec<&'static Artifact> = Vec::new();
         for role in roles {
-            if role == "embed" {
-                let e = ctx.resolve_embedding(None)?;
-                wanted.push(DownloadSpec {
-                    id: e.id.into(),
-                    repo_id: e.repo_id.into(),
-                    revision: e.revision.into(),
-                    required_disk_bytes: e.required_disk_bytes,
-                });
+            let found = if role == estia_engine::roles::EMBED {
+                engine.resolve_embedding(None).map(|(_, a)| a)
             } else {
-                match ctx.roles.resolve_artifact(role, Format::Mlx) {
-                    Ok((_, a)) => wanted.push(DownloadSpec::from(a)),
-                    Err(e) => println!("! role `{role}`: {e} — skipped"),
-                }
+                engine.resolve_generation(role)
+            };
+            match found {
+                Ok(a) => wanted.push(a),
+                Err(e) => println!("! role `{}`: {} — skipped", safe(role), safe(&e.to_string())),
             }
         }
         wanted.dedup_by(|a, b| a.id == b.id);
-        for spec in wanted {
-            if ctx.store.is_installed(&spec.id) {
-                println!("✓ model    : {} ({})", spec.id, gb(ctx.store.bytes_on_disk(&spec.id).unwrap_or(0)));
+        for a in wanted {
+            if ctx.store.is_installed(a.id) {
+                // An import's own size: a linked one takes no space here.
+                let (bytes, how) = if a.repo_id.is_empty() {
+                    (a.required_disk_bytes, ", imported")
+                } else {
+                    (ctx.store.bytes_on_disk(a.id).unwrap_or(0), "")
+                };
+                println!("✓ model    : {} ({}{how})", a.id, gb(bytes));
+            } else if a.repo_id.is_empty() {
+                println!("! model    : {} is imported but its file is missing (moved?) — `estia import` it again", safe(a.id));
             } else {
+                let spec = DownloadSpec::from(a);
                 println!("… model    : pulling {} ({} required)", spec.id, gb(spec.required_disk_bytes));
                 ctx.store.download(&spec, print_progress).await?;
                 println!("✓ model    : {}", spec.id);
@@ -1161,13 +1535,10 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
         }
     }
 
-    // 3. Roles file and first token.
-    if !ctx.data_dir.join("config.json").exists() {
-        ctx.save_roles()?;
-        println!("✓ roles    : defaults written to config.json");
-    } else {
-        println!("✓ roles    : config.json present");
-    }
+    // 3. config.json (roles and the backend) and the first token.
+    let had_config = ctx.data_dir.join("config.json").exists();
+    ctx.save_config(Some(ctx.backend))?;
+    println!("✓ config   : {} config.json (backend {})", if had_config { "updated" } else { "wrote" }, ctx.backend);
     let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
     if tokens.is_empty() {
         let t = tokens.mint("local", &[SCOPE_ADMIN])?;
@@ -1175,7 +1546,7 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
     } else {
         println!("✓ token    : {} token(s) in tokens.json (estia token new <name> for another)", tokens.list().len());
     }
-    if ctx.runner().is_none() {
+    if ctx.backend == Backend::MlxPython && ctx.runner().is_none() {
         println!("! runner   : estia-runner.py not found — pass --runner or set ESTIA_RUNNER");
     }
     println!(
@@ -1186,7 +1557,7 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
 
   to let other devices on your network use it (plain HTTP; each device pairs for a token):
   estia serve --lan              or: estia service install
-  from the other device: estia discover · estia pair request --engine http://<this-mac>:27200"
+  from the other device: estia discover · estia pair request --engine http://<this machine>:27200"
     );
     Ok(())
 }
@@ -1290,7 +1661,7 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
         ServiceAction::Install { port, local, allow_host, log_level, log_format } => {
             // Checked before anything is staged: every path below lives under it.
             service_path(&ctx.data_dir)?;
-            let args = service_args(port, local, &allow_host, log_level.as_deref(), log_format)?;
+            let args = service_args(port, local, &allow_host, log_level.as_deref(), log_format, ctx.backend_flag)?;
             std::fs::create_dir_all(&logs)?;
             let runner = ctx
                 .runner()
@@ -1491,8 +1862,14 @@ fn service_args(
     allow_host: &[String],
     log_level: Option<&str>,
     log_format: Option<LogFormat>,
+    backend: Option<Backend>,
 ) -> Result<Vec<String>> {
     let mut args = vec!["serve".to_string(), "--port".into(), port.to_string()];
+    // Only an explicit choice; otherwise the service reads config.json.
+    if let Some(b) = backend {
+        args.push("--backend".into());
+        args.push(b.id().into());
+    }
     if !local {
         args.push("--lan".into());
     }
@@ -1597,9 +1974,10 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
         println!("estia dashboard · {} · {}", safe(&base), clock_now());
         match &health {
             Some(h) => println!(
-                "engine   : v{} api v{} · up {}s · bind {} · auth {}",
+                "engine   : v{} api v{} · backend {} · up {}s · bind {} · auth {}",
                 jtext(&h["version"]),
                 jtext(&h["api_version"]),
+                jtext(&h["backend"]),
                 jtext(&h["uptime_s"]),
                 jtext(&h["bind"]),
                 if h["auth_required"].as_bool().unwrap_or(true) { "required" } else { "OFF" }
@@ -2053,24 +2431,44 @@ fn token(ctx: &Ctx, action: TokenAction) -> Result<()> {
 }
 
 async fn runtime(ctx: &Ctx, action: RuntimeAction) -> Result<()> {
-    match action {
-        RuntimeAction::Status => {
+    match (ctx.backend, action) {
+        (Backend::MlxPython, RuntimeAction::Status) => {
             let s = ctx.runtime.status();
             println!("{}", serde_json::to_string_pretty(&s)?);
         }
-        RuntimeAction::Install => {
+        (Backend::MlxPython, RuntimeAction::Install { variant }) => {
+            if variant.is_some() {
+                return Err(anyhow!("--variant is for the llama-cpp backend (--backend llama-cpp)"));
+            }
+            if !Backend::MlxPython.supported_here() {
+                return Err(anyhow!("the mlx-python backend needs Apple Silicon; use --backend llama-cpp"));
+            }
             ctx.runtime.preflight(estia_engine::runtime::RUNTIME_APPROX_BYTES)?;
-            let summary = ctx
-                .runtime
-                .install(|p| {
-                    eprint!("\r{:<32} {}                    ", p.phase, safe(&p.message.chars().take(60).collect::<String>()));
-                })
-                .await?;
+            let summary = ctx.runtime.install(|p| print_setup_progress(&p)).await?;
             eprintln!();
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        RuntimeAction::Remove => {
+        (Backend::MlxPython, RuntimeAction::Remove) => {
             println!("{}", if ctx.runtime.remove().await? { "removed" } else { "nothing to remove" });
+        }
+        (Backend::LlamaCpp, RuntimeAction::Status) => {
+            let mut v = serde_json::to_value(ctx.llama_runtime.status())?;
+            let probe = LlamaRuntime::probe();
+            v["probe"] = serde_json::json!({
+                "variant": probe.variant, "asset": probe.asset, "download_bytes": probe.download_bytes, "reason": probe.reason,
+            });
+            if let LlamaServer::Path(p) = LlamaServer::from_env() {
+                v["env_server"] = serde_json::json!(p);
+            }
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        }
+        (Backend::LlamaCpp, RuntimeAction::Install { variant }) => {
+            let summary = ctx.llama_runtime.install(variant.as_deref(), |p| print_setup_progress(&p)).await?;
+            eprintln!();
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        (Backend::LlamaCpp, RuntimeAction::Remove) => {
+            println!("{}", if ctx.llama_runtime.remove().await? { "removed" } else { "nothing to remove" });
         }
     }
     Ok(())
@@ -2102,6 +2500,10 @@ const SERVE_LOG_DEFAULT: &str = "warn,estia=info";
 /// Every other command prints its own output; it logs Estia's warnings and
 /// the runner's stderr (Python tracebacks among them), and no library output.
 const CLI_LOG_DEFAULT: &str = "estia=warn,estia_engine::runner=info";
+/// The same on llama.cpp, without the runner's stderr: llama-server logs
+/// several lines per request. Its failures come back as protocol errors, and
+/// `ESTIA_LOG=estia_engine::runner=info` shows the log.
+const CLI_LOG_DEFAULT_LLAMA: &str = "estia=warn,estia_engine::runner=warn";
 
 /// The filter: `defaults`, then `RUST_LOG`, then `ESTIA_LOG` / `--log-level`,
 /// each a comma-separated list of `tracing` filter directives; a later
@@ -2161,7 +2563,7 @@ fn init_logging(filter: EnvFilter, format: LogFormat) {
 
 /// Logging for this invocation: `serve` takes `--log-level` / `--log-format`
 /// (or `ESTIA_LOG` / `ESTIA_LOG_FORMAT`); other commands read the variables.
-fn setup_logging(cmd: &Cmd) -> Result<()> {
+fn setup_logging(cmd: &Cmd, backend: Backend) -> Result<()> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let (defaults, level, format) = match cmd {
         Cmd::Serve { log_level, log_format, .. } => (SERVE_LOG_DEFAULT, log_level.clone(), *log_format),
@@ -2170,7 +2572,8 @@ fn setup_logging(cmd: &Cmd) -> Result<()> {
                 Some("json") => LogFormat::Json,
                 _ => LogFormat::Text,
             };
-            (CLI_LOG_DEFAULT, env("ESTIA_LOG"), format)
+            let defaults = if backend == Backend::LlamaCpp { CLI_LOG_DEFAULT_LLAMA } else { CLI_LOG_DEFAULT };
+            (defaults, env("ESTIA_LOG"), format)
         }
     };
     let (filter, skipped) =
@@ -2182,8 +2585,67 @@ fn setup_logging(cmd: &Cmd) -> Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
+    // `estia runner llama …` is the llama.cpp adapter the engine starts. It
+    // runs before clap, logging and the async runtime: it owns stdin and
+    // stdout, and it must run on the main thread (on Linux, llama-server's
+    // parent-death signal is tied to the thread that started it).
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    if let Some(rest) = llama_runner_args(&argv) {
+        return std::process::ExitCode::from(llama_runner(rest.to_vec()));
+    }
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Error: could not start the async runtime: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    rt.block_on(cli_main())
+}
+
+/// The adapter's arguments when this process was started as
+/// `estia runner llama …`.
+fn llama_runner_args(argv: &[OsString]) -> Option<&[OsString]> {
+    match argv {
+        [_, runner, llama, rest @ ..] if runner == "runner" && llama == "llama" => Some(rest),
+        _ => None,
+    }
+}
+
+/// Run the llama.cpp adapter on stdin/stdout, as the standalone `estia-llama`
+/// binary does. Exit codes: 0 when stdin closes, 1 when llama-server died, 2
+/// on bad arguments (a signal exits with 128 + its number from inside).
+fn llama_runner(args: Vec<OsString>) -> u8 {
+    let usage = estia_llama::USAGE.replacen("usage: estia-llama", "usage: estia runner llama", 1);
+    // Only our own flags: everything after `--` belongs to llama-server.
+    for a in args.iter().take_while(|a| *a != "--") {
+        if a == "-h" || a == "--help" {
+            println!("{usage}");
+            return 0;
+        }
+        if a == "-V" || a == "--version" {
+            println!("{} {} (estia runner llama)", estia_llama::RUNNER, env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+    }
+    let opts = match estia_llama::parse_args(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("estia runner llama: {e:#}\n\n{usage}");
+            return 2;
+        }
+    };
+    match estia_llama::run_stdio(opts) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("estia runner llama: {e:#}");
+            1
+        }
+    }
+}
+
+async fn cli_main() -> std::process::ExitCode {
     match run_cli().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -2208,11 +2670,32 @@ async fn main() -> std::process::ExitCode {
 
 async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
-    setup_logging(&cli.cmd)?;
+    // Reached only with global flags before `runner` (`estia --data-dir x
+    // runner llama …`); this is still the main thread (`block_on`).
+    if let Cmd::Runner { kind, args } = &cli.cmd {
+        if kind != "llama" {
+            return Err(anyhow!("unknown runner `{}` (llama)", safe(kind)));
+        }
+        std::process::exit(llama_runner(args.clone()) as i32);
+    }
+    // The backend decides how much runner output the terminal gets, so it is
+    // read before logging starts; Ctx reads config.json properly below.
+    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
+    let configured = std::fs::read_to_string(data_dir.join("config.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<FileConfig>(&t).ok())
+        .and_then(|c| c.backend);
+    setup_logging(&cli.cmd, choose_backend(cli.backend, configured).0)?;
     let mut ctx = Ctx::new(&cli)?;
     match cli.cmd {
         Cmd::Models => models(&ctx),
         Cmd::Pull { id } => pull(&ctx, &id).await,
+        Cmd::Import { file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace } => {
+            tokio::task::block_in_place(|| {
+                import(&ctx, &file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace)
+            })
+        }
+        Cmd::Runner { .. } => unreachable!("handled above"),
         Cmd::Rm { id } => {
             let removed = ctx.store.remove(&id).await?;
             println!("{}", if removed { "removed" } else { "nothing to remove" });
@@ -2234,7 +2717,7 @@ async fn run_cli() -> Result<()> {
             chat(&ctx, &model, system.as_deref(), cache_key.as_deref(), tools, max_tokens, temperature, two_turns)
         }),
         Cmd::Tokens { model } => tokio::task::block_in_place(|| tokens(&ctx, &model)),
-        Cmd::Setup { roles, no_models } => setup(&ctx, &roles, no_models).await,
+        Cmd::Setup { roles, no_models, variant } => setup(&ctx, &roles, no_models, variant.as_deref()).await,
         Cmd::Service { action } => service(&ctx, action),
         Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
         Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host, log_level: _, log_format: _ } => {
@@ -2396,13 +2879,13 @@ mod tests {
     /// break out of a plist string or a systemd word is refused up front.
     #[test]
     fn service_args_carry_allowed_hosts() {
-        assert_eq!(service_args(27200, true, &[], None, None).unwrap(), ["serve", "--port", "27200"]);
+        assert_eq!(service_args(27200, true, &[], None, None, None).unwrap(), ["serve", "--port", "27200"]);
         assert_eq!(
-            service_args(1, false, &["studio.lan".into(), " *.home.arpa ".into(), "".into()], None, None).unwrap(),
+            service_args(1, false, &["studio.lan".into(), " *.home.arpa ".into(), "".into()], None, None, None).unwrap(),
             ["serve", "--port", "1", "--lan", "--allow-host", "studio.lan", "--allow-host", "*.home.arpa"]
         );
         for bad in ["a b", "a\nExecStartPre=/bin/sh", "x\"y", "100%", "$HOME"] {
-            assert!(service_args(1, false, &[bad.into()], None, None).is_err(), "{bad:?} accepted");
+            assert!(service_args(1, false, &[bad.into()], None, None, None).is_err(), "{bad:?} accepted");
         }
     }
 
@@ -2411,12 +2894,12 @@ mod tests {
     #[test]
     fn service_args_carry_log_settings() {
         assert_eq!(
-            service_args(1, true, &[], Some(" estia_server=debug,mdns_sd=info "), Some(LogFormat::Json)).unwrap(),
+            service_args(1, true, &[], Some(" estia_server=debug,mdns_sd=info "), Some(LogFormat::Json), None).unwrap(),
             ["serve", "--port", "1", "--log-level", "estia_server=debug,mdns_sd=info", "--log-format", "json"]
         );
-        assert_eq!(service_args(1, true, &[], Some(""), None).unwrap(), ["serve", "--port", "1"]);
+        assert_eq!(service_args(1, true, &[], Some(""), None, None).unwrap(), ["serve", "--port", "1"]);
         for bad in ["estia=loud", "debug\nExecStartPre=/bin/sh", "a b", "$HOME", "100%"] {
-            assert!(service_args(1, true, &[], Some(bad), None).is_err(), "{bad:?} accepted");
+            assert!(service_args(1, true, &[], Some(bad), None, None).is_err(), "{bad:?} accepted");
         }
     }
 
@@ -2474,6 +2957,8 @@ mod tests {
         assert!(!on(&v, "estia_server::access", "ERROR"));
         assert!(on(&v, "estia_server", "INFO"));
 
+        let v = passes(log_filter(CLI_LOG_DEFAULT_LLAMA, None, None).unwrap().0);
+        assert!(!on(&v, "estia_engine::runner", "INFO") && on(&v, "estia_engine::runner", "WARN"), "llama-server's chatter stays out");
         let v = passes(log_filter(CLI_LOG_DEFAULT, None, None).unwrap().0);
         assert!(on(&v, "estia_engine::runner", "INFO"), "other commands still show runner stderr");
         assert!(!on(&v, "estia_server::access", "INFO") && on(&v, "estia_server::access", "WARN"));
@@ -2527,6 +3012,152 @@ mod tests {
         assert_eq!(found, data.join("engine/runners/mlx-python/estia-runner.py"));
         assert_eq!(std::fs::read_to_string(&found).unwrap(), EMBEDDED_RUNNER);
         assert_eq!(find_runner(Some(PathBuf::from("/x/r.py")), &data), Some(PathBuf::from("/x/r.py")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backend_comes_from_the_flag_then_config_then_the_machine() {
+        let cli = Cli::try_parse_from(["estia", "--backend", "llama", "models"]).unwrap();
+        assert_eq!(cli.backend, Some(Backend::LlamaCpp));
+        // Global: accepted after the subcommand too.
+        let cli = Cli::try_parse_from(["estia", "runtime", "install", "--backend", "llama-cpp", "--variant", "cpu"]).unwrap();
+        assert_eq!(cli.backend, Some(Backend::LlamaCpp));
+        assert!(matches!(cli.cmd, Cmd::Runtime { action: RuntimeAction::Install { variant: Some(ref v) } } if v == "cpu"));
+        assert!(Cli::try_parse_from(["estia", "--backend", "onnx", "models"]).is_err());
+        assert_eq!(choose_backend(Some(Backend::LlamaCpp), Some(Backend::MlxPython)).0, Backend::LlamaCpp);
+        assert_eq!(choose_backend(None, Some(Backend::LlamaCpp)), (Backend::LlamaCpp, "config.json"));
+        assert_eq!(choose_backend(None, None).0, Backend::platform_default());
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(choose_backend(None, None).0, Backend::MlxPython, "Apple Silicon keeps MLX");
+        }
+    }
+
+    #[test]
+    fn setup_and_service_carry_the_backend() {
+        let cli = Cli::try_parse_from(["estia", "--backend", "llama", "setup", "--roles", "fast,embed", "--variant", "cpu"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Setup { ref roles, variant: Some(ref v), .. } if roles == &["fast", "embed"] && v == "cpu"));
+        let cli = Cli::try_parse_from(["estia", "service", "install", "--local", "--backend", "llama-cpp"]).unwrap();
+        assert_eq!(cli.backend, Some(Backend::LlamaCpp));
+        assert_eq!(
+            service_args(1, true, &[], None, None, Some(Backend::LlamaCpp)).unwrap(),
+            ["serve", "--port", "1", "--backend", "llama-cpp"]
+        );
+        let cli = Cli::try_parse_from(["estia", "serve", "--backend", "mlx", "--port", "27351"]).unwrap();
+        assert_eq!(cli.backend, Some(Backend::MlxPython));
+    }
+
+    #[test]
+    fn import_takes_its_options() {
+        let cli = Cli::try_parse_from([
+            "estia",
+            "import",
+            "/m/tiny.gguf",
+            "--id",
+            "tiny",
+            "--kind",
+            "embedding",
+            "--family",
+            "tinies",
+            "--ctx",
+            "4096",
+            "--dims",
+            "384",
+            "--link",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Import { file, id, kind, family, context_length, dims, link, replace, .. } => {
+                assert_eq!(file, PathBuf::from("/m/tiny.gguf"));
+                assert_eq!((id.as_deref(), kind.as_deref(), family.as_deref()), (Some("tiny"), Some("embedding"), Some("tinies")));
+                assert_eq!((context_length, dims, link, replace), (Some(4096), Some(384), true, false));
+            }
+            _ => panic!("not an import"),
+        }
+        assert!(Cli::try_parse_from(["estia", "import", "x.gguf", "--kind", "chat"]).is_err());
+    }
+
+    /// The engine starts `<estia> runner llama --server … --run-dir … [-- …]`;
+    /// the adapter's arguments are everything after `runner llama`, `--`
+    /// included, whichever way they reach it.
+    #[test]
+    fn runner_llama_arguments_reach_the_adapter_whole() {
+        let argv: Vec<OsString> =
+            ["estia", "runner", "llama", "--server", "/s", "--run-dir", "/r", "--", "-ngl", "0"].map(OsString::from).to_vec();
+        let rest = llama_runner_args(&argv).unwrap();
+        let opts = estia_llama::parse_args(rest.to_vec()).unwrap();
+        assert_eq!((opts.server_bin.as_path(), opts.run_dir.as_path()), (Path::new("/s"), Path::new("/r")));
+        assert_eq!(opts.extra_args, ["-ngl", "0"]);
+        assert!(llama_runner_args(&["estia", "runner"].map(OsString::from)).is_none());
+        assert!(llama_runner_args(&["estia", "models", "llama"].map(OsString::from)).is_none());
+        // With global flags first, clap routes it to the hidden subcommand.
+        let cli =
+            Cli::try_parse_from(["estia", "--data-dir", "/d", "runner", "llama", "--server", "/s", "--run-dir", "/r", "--", "-ngl", "0"])
+                .unwrap();
+        match cli.cmd {
+            Cmd::Runner { kind, args } => {
+                assert_eq!(kind, "llama");
+                let opts = estia_llama::parse_args(args).unwrap();
+                assert_eq!(opts.extra_args, ["-ngl", "0"], "`--` must survive clap");
+            }
+            _ => panic!("not the runner"),
+        }
+        assert_eq!(llama_runner(vec!["--bogus".into()]), 2, "bad arguments exit 2");
+    }
+
+    /// `config.json` keeps keys it does not know; `backend` is written by
+    /// setup and read back as the default.
+    #[test]
+    fn config_writes_keep_other_keys_and_record_the_backend() {
+        let dir = scratch("config");
+        std::fs::write(dir.join("config.json"), r#"{"host_app": {"x": 1}, "roles": {"text": {"family": "gemma4-e4b"}}}"#).unwrap();
+        let ctx = ctx_for(&dir);
+        ctx.save_config(Some(Backend::LlamaCpp)).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved["host_app"]["x"], 1, "{saved}");
+        assert_eq!(saved["backend"], "llama-cpp");
+        assert_eq!(saved["roles"]["text"]["family"], "gemma4-e4b");
+        ctx.save_roles().unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        assert_eq!(saved["backend"], "llama-cpp", "saving roles keeps the backend");
+        if std::env::var_os("ESTIA_BACKEND").is_none() {
+            let ctx = ctx_for(&dir);
+            assert_eq!((ctx.backend, ctx.backend_source), (Backend::LlamaCpp, "config.json"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On llama.cpp the engine runs this binary as the adapter, names the
+    /// llama-server (the installed build, or ESTIA_LLAMA_SERVER) and the run
+    /// directory, and resolves roles to GGUF artifacts.
+    #[test]
+    fn llama_engine_runs_this_binary_as_the_adapter() {
+        let dir = scratch("llama-engine");
+        let installed = dir.join(format!("runtime/llama/{}-cpu", estia_engine::runtime::llama_pins::LLAMA_BUILD));
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join(estia_engine::runtime::llama::server_file_name()), b"").unwrap();
+        let cli = Cli::try_parse_from(["estia", "--data-dir", dir.to_str().unwrap(), "--backend", "llama", "status"]).unwrap();
+        let ctx = Ctx::new(&cli).unwrap();
+        let engine = ctx.engine().unwrap();
+        assert_eq!(engine.backend(), Backend::LlamaCpp);
+        let launch = engine.launch_for("gemma4-e2b-it-qat-q4_0-gguf").unwrap();
+        assert_eq!(launch.program(), std::env::current_exe().unwrap());
+        let args: Vec<String> = launch.args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[..3], ["runner", "llama", "--server"]);
+        let server = match LlamaServer::from_env() {
+            LlamaServer::Path(p) => p,
+            LlamaServer::Installed => installed.join(estia_engine::runtime::llama::server_file_name()),
+        };
+        assert_eq!(args[3], server.display().to_string());
+        assert_eq!(&args[4..6], ["--run-dir", &dir.join("run").display().to_string()]);
+        assert!(args.windows(2).any(|w| w == ["--ctx", "32768"]), "{args:?}");
+        assert_eq!(ctx.resolve_generation(&engine, "fast").unwrap().id, "gemma4-e2b-it-qat-q4_0-gguf");
+        assert_eq!(engine.resolve_embedding(None).unwrap().1.id, "embeddinggemma-300m-q8_0-gguf");
+        // Pulls follow the backend too.
+        assert_eq!(estia_server::catalog::pull_spec(&ctx.resolver(), "embed").unwrap().id, "embeddinggemma-300m-q8_0-gguf");
+        assert_eq!(
+            estia_server::catalog::pull_spec(&ctx.resolver(), "embeddinggemma-300m-4bit").unwrap().id,
+            "embeddinggemma-300m-q8_0-gguf"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -131,7 +131,7 @@ button { touch-action: manipulation; }
     <h2>Runtime</h2>
     <div class="row"><span id="rtState" class="mute">unknown</span><button class="b" id="btnRuntime">Install runtime</button></div>
     <div id="rtProgress"></div>
-    <p class="note">Python + MLX packages the backends run in (~700 MB). Needs the <code>admin</code> scope.</p>
+    <p class="note" id="rtNote">Installs the runtime of the engine's backend. Needs the <code>admin</code> scope.</p>
   </div>
   <div class="card">
     <h2>Models</h2>
@@ -311,7 +311,8 @@ async function checkHealth() {
       ["bind", esc(health.bind)],
       ["auth", health.auth_required ? "token required" : `<span class="warn">open (loopback, --no-auth)</span>`],
       ["uptime", fmtDur(num(health.uptime_s))],
-      ["runtime", rt?.runtime_installed ? `<span class="ok">installed</span> (${esc(rt.id)})` : `<span class="warn">not installed</span> — Setup tab`],
+      ["backend", esc(health.backend || rt?.id || "?") + (rt?.build ? ` <span class="mute">(llama.cpp ${esc(rt.build)}${rt.variant ? ", " + esc(rt.variant) : ""})</span>` : "")],
+      ["runtime", rt?.runtime_installed || rt?.server === "custom" ? `<span class="ok">${rt?.server === "custom" ? "custom llama-server" : "installed"}</span> (${esc(rt.id)})` : `<span class="warn">not installed</span> — Setup tab`],
       ["loaded", (health.loaded || []).length ? esc(health.loaded.join(", ")) : `<span class="mute">nothing resident</span>`],
     ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
     renderRuntime();
@@ -375,8 +376,12 @@ $("btnPair").onclick = async () => {
 
 // ── Setup: runtime ──────────────────────────────────────────────────────────
 function renderRuntime() {
-  const inst = health?.backends?.[0]?.runtime_installed;
-  $("rtState").innerHTML = health == null ? "unknown" : inst ? `<span class="ok">installed</span>` : `<span class="warn">not installed</span>`;
+  const rt = health?.backends?.[0];
+  const inst = rt?.runtime_installed;
+  $("rtState").innerHTML = health == null ? "unknown" : inst ? `<span class="ok">installed</span> <span class="mute">(${esc(rt.id)})</span>` : `<span class="warn">not installed</span>`;
+  $("rtNote").innerHTML = rt?.id === "llama-cpp"
+    ? `The pinned llama.cpp build ${esc(rt.build || "")} for this machine (about 11 to 31 MB; more with CUDA or ROCm). Needs the <code>admin</code> scope.`
+    : `Python + MLX packages the MLX backend runs in (~700 MB). Needs the <code>admin</code> scope.`;
   $("btnRuntime").textContent = inst ? "Reinstall / update" : "Install runtime";
 }
 $("btnRuntime").onclick = async () => {
@@ -413,7 +418,8 @@ async function loadModels() {
       const size = m.installed ? fmtBytes(m.bytes_on_disk) : "~" + fmtBytes(m.required_disk_bytes);
       const state = m.installed ? `<span class="ok">installed</span>` : m.pulling ? `<span class="warn">pulling</span>` : m.partial_bytes ? `<span class="warn">partial ${fmtBytes(m.partial_bytes)}</span>` : `<span class="mute">not installed</span>`;
       const act = m.installed ? `<button class="b s" data-del="${esc(m.id)}">Delete</button>` : `<button class="b s" data-pull="${esc(m.id)}">${m.pulling ? "Watch" : m.partial_bytes ? "Resume" : "Pull"}</button>`;
-      const kind = m.kind === "embedding" ? `embedding · ${num(m.dims)}d` : `${esc(m.family)} · ${esc((m.capabilities || []).join(", "))}`;
+      const fmt = m.format ? ` · ${esc(m.format)}` + (m.runnable === false ? ` <span class="mute">(other backend)</span>` : "") : "";
+      const kind = (m.kind === "embedding" ? `embedding · ${num(m.dims)}d` : `${esc(m.family)} · ${esc((m.capabilities || []).join(", "))}`) + fmt;
       return `<tr><td><div class="mono">${esc(m.id)}</div><div class="mute">${esc(m.label)}</div><div id="pp-${esc(m.id)}"></div></td><td>${kind}</td><td class="mono">${size}</td><td>${state}</td><td>${act}</td></tr>`;
     }).join("");
     for (const m of rows) if (m.pulling) watchPull(m.id);
@@ -480,8 +486,10 @@ loaders.setup = () => { loadModels(); loadRoles(); };
 async function refreshModelsSelects() {
   try {
     const r = await json("GET", "/v1/models");
-    const gen = r.data.filter((m) => m.x_estia?.kind !== "embedding" && m.id !== "embed");
-    const emb = r.data.filter((m) => m.x_estia?.kind === "embedding" || m.id === "embed");
+    // Models this engine's backend cannot load are left out of the pickers.
+    const runs = (m) => m.x_estia?.runnable !== false;
+    const gen = r.data.filter((m) => m.x_estia?.kind !== "embedding" && m.id !== "embed" && runs(m));
+    const emb = r.data.filter((m) => (m.x_estia?.kind === "embedding" || m.id === "embed") && runs(m));
     const opt = (m) => {
       const x = m.x_estia || {};
       const tag = x.role ? `role → ${x.family}` : x.installed === false ? "not installed" : "";

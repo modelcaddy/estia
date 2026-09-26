@@ -5,6 +5,10 @@
 //! `<|"|>` as the string quote, several calls allowed back to back. The manual
 //! template fallback asks instead for `{"tool_call": {"name": …, "arguments": {…}}}`.
 //! Both are recognised; anything else is plain content.
+//!
+//! A runner that parses calls itself (the llama.cpp adapter declares
+//! `parses_tool_calls`) returns them in `meta.tool_calls`; its text is then
+//! plain content and is not parsed again ([`from_output`]).
 
 use serde_json::{json, Value};
 
@@ -118,9 +122,77 @@ pub fn parse(text: &str) -> Vec<ToolCall> {
     calls
 }
 
+/// The tool calls of a finished generation, OpenAI-shaped. `runner_parses`
+/// is the runner's `parses_tool_calls` capability: its `meta.tool_calls` are
+/// used as they came (with an `id`, `type` and string `arguments` filled in
+/// where missing), and the text is not parsed. Otherwise the text is parsed.
+pub fn from_output(runner_parses: bool, text: &str, meta_calls: Option<&[Value]>) -> Vec<Value> {
+    if runner_parses {
+        return meta_calls.unwrap_or_default().iter().enumerate().filter_map(|(i, c)| normalize(c, i)).collect();
+    }
+    parse(text).iter().enumerate().map(|(i, c)| c.to_openai(i)).collect()
+}
+
+/// One runner-parsed call in OpenAI's shape; `None` when it has no name.
+fn normalize(c: &Value, i: usize) -> Option<Value> {
+    let f = c.get("function")?;
+    let name = f.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())?;
+    let arguments = match f.get("arguments") {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.clone(),
+        None | Some(Value::Null) | Some(Value::String(_)) => "{}".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let id = c.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("call_{i}"));
+    Some(json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}))
+}
+
+/// Calls as a streamed delta carries them: each with its `index`, which
+/// OpenAI's clients use to put the pieces of a call together.
+pub fn indexed(calls: &[Value]) -> Vec<Value> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut c = c.clone();
+            if let Some(obj) = c.as_object_mut() {
+                obj.insert("index".into(), json!(i));
+            }
+            c
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_parsed_calls_are_used_and_the_text_is_not_parsed() {
+        let meta = vec![
+            json!({"id": "c9", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Athens\"}"}}),
+            json!({"function": {"name": "now", "arguments": {"tz": "UTC"}}}),
+            json!({"function": {"name": "", "arguments": "{}"}}),
+            json!({"function": {"name": "ping"}}),
+        ];
+        let gemma = r#"<|tool_call>call:wrong{}<tool_call|>"#;
+        let calls = from_output(true, gemma, Some(&meta));
+        assert_eq!(calls.len(), 3, "the nameless call is dropped: {calls:?}");
+        assert_eq!(
+            calls[0],
+            json!({"id": "c9", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Athens\"}"}})
+        );
+        assert_eq!(calls[1]["id"], "call_1");
+        assert_eq!(calls[1]["function"]["arguments"], "{\"tz\":\"UTC\"}");
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert!(from_output(true, gemma, None).is_empty(), "a parsing runner's text is content");
+        // A runner that does not parse: the text is.
+        let calls = from_output(false, gemma, Some(&meta));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "wrong");
+        let streamed = indexed(&calls);
+        assert_eq!(streamed[0]["index"], 0);
+        assert_eq!(streamed[0]["function"]["name"], "wrong");
+    }
 
     #[test]
     fn gemma_native_syntax() {

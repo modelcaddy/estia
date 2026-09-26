@@ -13,19 +13,22 @@ Estia is developed by ModelCaddy and runs inside its apps.
 Estia is early software. Version 0.1.0 has not been released. Expect breaking
 changes before 1.0.
 
-- **Apple Silicon Macs only, for now.** The only working backend is MLX, run by
-  a Python runner that Estia installs for itself. Linux and Windows need a
-  llama.cpp backend. It is designed
-  ([docs/design/llama-backend.md](docs/design/llama-backend.md)) and not
-  written yet.
+- **Two backends, one of them new.** On Apple Silicon Macs the default is
+  MLX, run by a Python runner that Estia installs for itself. Everywhere else
+  the default is llama.cpp: upstream's `llama-server` behind a small Rust
+  adapter (see [Backends](#backends)). The llama.cpp backend is new. It has
+  run end to end only on an Apple Silicon Mac, with two small test models; it
+  has not yet run the Gemma 4 GGUF files, and has not run on Linux outside
+  the CI job written for it. Estia does not build for Windows yet.
 - **No TLS.** LAN traffic is plain HTTP, including bearer tokens, prompts and
   outputs. That is fine on a home network you control. Do not serve the LAN on
   shared or public Wi-Fi.
 - **One machine, tokens only.** One engine runs on one machine. Access is by
   bearer token with scopes. There are no user accounts.
-- **A fixed model list.** The registry knows three Gemma 4 generation models
-  and four embedding models. Adding a model means adding a registry entry in
-  code.
+- **A fixed model list, plus your own GGUF files.** The registry knows three
+  Gemma 4 generation families and four embedding models, with an MLX
+  artifact, a GGUF artifact or both. On the llama.cpp backend, `estia import`
+  adds a GGUF file of your own.
 - **Text only through the API.** Image parts in chat messages are replaced by
   a text marker before they reach the model.
 
@@ -38,8 +41,10 @@ You need:
 
 - Rust 1.89 or newer ([rustup](https://rustup.rs)) and, on macOS, the Xcode
   Command Line Tools.
-- An Apple Silicon Mac to run models. `estia setup` downloads Python and the
-  MLX packages; nothing else needs to be installed first.
+- To run models: an Apple Silicon Mac for the MLX backend, or a Mac or Linux
+  machine for the llama.cpp backend. `estia setup` downloads what the backend
+  needs (Python and the MLX packages, or a pinned `llama-server` build);
+  nothing else needs to be installed first.
 - About 10 GB of free disk for the runtime and the default models.
 - `python3` on `PATH`, only if you want to run the test suite.
 
@@ -51,8 +56,8 @@ cargo install --locked --path cli   # puts `estia` in ~/.cargo/bin
 cargo build --release               # binary at target/release/estia
 ```
 
-The CLI needs the runner script `runners/mlx-python/estia-runner.py`. It
-takes the first of:
+The MLX backend needs the runner script `runners/mlx-python/estia-runner.py`.
+The CLI takes the first of:
 
 1. `--runner` or `ESTIA_RUNNER`;
 2. `runners/mlx-python/estia-runner.py` beside the binary (a release tarball,
@@ -63,7 +68,8 @@ takes the first of:
 
 It never looks in the current directory, so running `estia` inside a folder
 you downloaded cannot make it execute a script from that folder. A binary
-installed with `cargo install` works from any directory through step 4.
+installed with `cargo install` works from any directory through step 4. The
+llama.cpp backend needs no script: its adapter is compiled into `estia`.
 
 `estia service install` copies the binary and the runner scripts into the data
 directory, so an installed service keeps working if the checkout moves. Run it
@@ -86,10 +92,13 @@ cargo deny check                                             # licence and advis
 estia setup
 ```
 
-`setup` installs the Python runtime (about 700 MB), downloads the models for
-the `text`, `fast` and `embed` roles (about 9 GB), writes the role table to
-`config.json` and mints the first admin token. The token is printed once. Keep
-it. Running `setup` again is safe: it skips what is already there.
+`setup` installs the backend's runtime, downloads the models for the `text`,
+`fast` and `embed` roles (about 9 GB on either backend), writes the role table
+and the backend to `config.json` and mints the first admin token. The runtime
+is Python with the MLX packages on an Apple Silicon Mac (about 700 MB), and a
+pinned `llama-server` build elsewhere (11 to 31 MB for CPU, Metal and Vulkan).
+The token is printed once. Keep it. Running `setup` again is safe: it skips
+what is already there.
 
 Start the server in the foreground:
 
@@ -155,6 +164,115 @@ estia token new editor --replace           # rotate: the old token stops working
 Token names are unique. `token new` refuses a name that already exists;
 `--replace` rotates it, keeping the old token's scopes unless you pass
 `--scopes`.
+
+## Backends
+
+A backend is what runs the models. An engine uses one backend at a time.
+
+| Backend | Id | Runs on | Default on | Runtime Estia installs |
+|---|---|---|---|---|
+| MLX | `mlx-python` | Apple Silicon Macs | Apple Silicon Macs | Python 3.12 with `mlx-vlm`, `mlx-lm` and `mlx-embeddings`, about 700 MB |
+| llama.cpp | `llama-cpp` | Macs and Linux (x64, arm64) | every other machine | upstream's `llama-server`, pinned build b11146: 11 to 31 MB for CPU, Metal and Vulkan; 235 MB for ROCm; 590 to 765 MB for CUDA with its runtime libraries |
+
+llama.cpp publishes Windows builds and Estia pins their hashes, but Estia
+itself does not build for Windows yet.
+
+**Choosing.** The first of: `--backend` or `ESTIA_BACKEND` (`mlx-python` or
+`llama-cpp`; `mlx` and `llama` work too), then `backend` in `config.json`,
+which `estia setup` writes, then the machine's default. To run llama.cpp on
+a Mac:
+
+```bash
+estia --backend llama setup      # installs llama.cpp and the GGUF models; writes "backend": "llama-cpp"
+estia serve                      # now serves llama.cpp; /engine/health says "backend": "llama-cpp"
+```
+
+Clients see the same API, roles and scopes on either backend. What differs:
+`x_estia.backend` and `/engine/health` name the backend; artifact ids differ
+(`gemma4-e2b-it-4bit-mlx` against `gemma4-e2b-it-qat-q4_0-gguf`), so clients
+should ask by role or family; and embeddings from the two backends are
+different vector spaces, with fingerprints ending in `@mlx-python` or
+`@llama-cpp`. With a JSON Schema, llama.cpp constrains decoding to it; on MLX
+the engine shows the schema to the model in the system prompt. Both validate
+the output.
+
+### Installing llama.cpp
+
+```bash
+estia runtime install --backend llama                  # probe this machine
+estia runtime install --backend llama --variant cpu    # or metal, vulkan, cuda-12, cuda-13, rocm
+estia --backend llama runtime status
+estia --backend llama runtime remove
+```
+
+The probe picks Metal on Apple Silicon and the CPU build on Intel Macs. On
+Linux it picks CUDA when it finds an NVIDIA driver (CUDA 13 for a driver that
+supports it, else CUDA 12), then Vulkan when it finds a Vulkan loader and a
+GPU, then the CPU build, which picks its instruction set at run time. ROCm is
+used only when asked for. `ESTIA_LLAMA_VARIANT` sets the variant too.
+
+The installer downloads the archive from llama.cpp's GitHub release, checks it
+against the SHA-256 compiled into Estia, unpacks it into
+`<data dir>/runtime/llama/b11146-<variant>/` and runs `llama-server --version`.
+Upstream's macOS builds are not signed or notarized, so macOS checks a new
+`llama-server` when it first starts: on the machine this was written on, the
+first four starts after an install took about 25 s each, and later ones
+0.1 s.
+
+To use a `llama-server` of your own (a distribution package, or a build for a
+GPU the prebuilt archives miss), set `ESTIA_LLAMA_SERVER=/path/to/llama-server`.
+`ESTIA_LLAMA_ARGS` adds arguments to every `llama-server` Estia starts, for
+example `ESTIA_LLAMA_ARGS="-ngl 0"` to keep everything on the CPU. Arguments
+that would open the server up are refused: `--host`, `--port`, API keys, the
+web UI, `/slots`, built-in tools, agent and MCP options, and model downloads
+(`-hf`).
+
+### Gemma 4 GGUF models
+
+Each family has a GGUF artifact beside its MLX one: Google's own
+quantization-aware-trained Q4_0 files, pinned to a commit and checked against
+their SHA-256.
+
+| Family or model | GGUF artifact | Size | MLX artifact |
+|---|---|---|---|
+| `gemma4-e2b` | `gemma4-e2b-it-qat-q4_0-gguf` | 3.35 GB | `gemma4-e2b-it-4bit-mlx` |
+| `gemma4-e4b` | `gemma4-e4b-it-qat-q4_0-gguf` | 5.15 GB | `gemma4-e4b-it-4bit-mlx` |
+| `gemma4-12b-qat` | `gemma4-12b-it-qat-q4_0-gguf` | 6.98 GB | `gemma4-12b-it-qat-4bit-mlx` |
+| EmbeddingGemma 300M (`embed`) | `embeddinggemma-300m-q8_0-gguf` | 0.33 GB | `embeddinggemma-300m-4bit` |
+| Nomic Embed Text v1.5 | `nomic-embed-text-v1.5-q8_0-gguf` | 0.15 GB | `nomic-embed-text-v1.5` |
+
+`estia pull gemma4-e2b` (a family, role or embedding model id) downloads the
+running backend's artifact; an artifact id downloads that artifact. Roles
+resolve the same way: `"model": "fast"` answers from
+`gemma4-e2b-it-4bit-mlx` on MLX and from `gemma4-e2b-it-qat-q4_0-gguf` on
+llama.cpp. The files for image input (`mmproj`) are not downloaded yet,
+because the API does not pass images.
+
+These GGUF artifacts have not been run through Estia yet: their names, sizes
+and hashes were checked against Hugging Face, but the files (3.35 GB and up)
+were not downloaded. Gemma 4's tool calls on llama.cpp are untested for the
+same reason.
+
+### Your own GGUF file
+
+```bash
+estia import ~/models/my-model-Q4_K_M.gguf --id my-model
+estia roles set fast my-model
+estia import ~/models/all-MiniLM-L6-v2-Q8_0.gguf --id minilm
+estia roles set embed minilm
+```
+
+`import` reads the file's metadata: whether it is a chat model or an
+embedding model, its context length (run with at most 32768 tokens unless
+`--ctx` says otherwise), and an embedding model's width and pooling. It copies
+the file to `models/<id>/model.gguf`, or links to it with `--link`. The model
+then works like a built-in one: by id, by its family (the id, unless
+`--family`), or through a role. Only the llama.cpp backend runs it. An
+imported embedding model's fingerprint is `<id>@llama-cpp`. Chat goes
+through the chat template in the file's metadata, so tool calls and tool
+results work only when that template supports them (llama-server refuses a
+`tool` message for a template that does not, such as Gemma 3's). Ids may not
+be role names.
 
 ## Building on Estia
 
@@ -336,49 +454,59 @@ model family, so clients do not hard-code model names.
 | `fast` | text | `gemma4-e2b` | falls back to `text` |
 | `vision` | vision | `gemma4-e4b` | falls back to `text` |
 | `code` | text | none | falls back to `text` |
-| `embed` | embedding | `embeddinggemma-300m-4bit` | cannot be rebound yet |
+| `embed` | embedding | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`) |
 
-Role names are open. Bind any name to a generation family:
+Role names are open. Bind any name to a generation family, and `embed` to an
+embedding model:
 
 ```bash
 estia roles                              # list bindings
 estia roles set writer gemma4-12b-qat
 estia roles set code gemma4-e2b
+estia roles set embed nomic-embed-text-v1.5
 estia roles rm code                      # back to the fallback
 ```
 
 A binding is checked against the family's capabilities: `vision` needs a
-vision-capable family and every other name needs text. Bindings are stored in
+vision-capable family, `embed` an embedding model (built-in or imported), and
+every other name needs text. Bindings are stored in
 `config.json`. A running server reads that file when it starts, so restart it
 after `estia roles set`, or change roles live with `PUT /engine/defaults`
 (admin scope) or the Setup tab of `/client`.
 
 `GET /v1/models` lists the roles in the role table first, each with
 `"x_estia": {"role": true, "family": ...}`. These are the generation roles that
-`estia roles` shows, such as `text`, `fast` and `vision`. `embed` is not listed
-as a role: it is fixed to `embeddinggemma-300m-4bit` instead of being kept in
-the table, but `"model": "embed"` works on the embedding routes. A request's
-`model` can also be a family (`gemma4-e2b`) or an artifact id
-(`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family, and a family
-over a role.
+`estia roles` shows, such as `text`, `fast` and `vision`, and `embed` once it
+is bound. Unbound, `"model": "embed"` means `embeddinggemma-300m-4bit` on the
+embedding routes. A request's `model` can also be a family (`gemma4-e2b`) or
+an artifact id (`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family,
+and a family over a role. The running backend picks the family's artifact in
+its own format; an artifact id of the other format is a 400.
 
 A binding can carry `temperature`, `max_tokens` and `pin`. They are stored but
 the server does not apply them yet.
 
 ### Built-in models
 
-| Id | Family or kind | Disk (approx.) | Licence |
-|---|---|---|---|
-| `gemma4-e4b-it-4bit-mlx` | `gemma4-e4b` | 5.2 GB | Apache-2.0 |
-| `gemma4-12b-it-qat-4bit-mlx` | `gemma4-12b-qat` | 6.8 GB | Apache-2.0 |
-| `gemma4-e2b-it-4bit-mlx` | `gemma4-e2b` | 3.6 GB | Apache-2.0 |
-| `embeddinggemma-300m-4bit` | embedding, 768 dims (default) | 0.25 GB | Gemma Terms of Use |
-| `multilingual-e5-small-mlx` | embedding, 384 dims | 0.3 GB | MIT |
-| `nomicai-modernbert-embed-base-6bit` | embedding, 768 dims, English | 0.13 GB | Apache-2.0 |
-| `nomic-embed-text-v1.5` | embedding, 768 dims, English | 0.6 GB | Apache-2.0 |
+| Id | Format | Family or kind | Disk (approx.) | Licence |
+|---|---|---|---|---|
+| `gemma4-e4b-it-4bit-mlx` | MLX | `gemma4-e4b` | 5.2 GB | Apache-2.0 |
+| `gemma4-12b-it-qat-4bit-mlx` | MLX | `gemma4-12b-qat` | 6.8 GB | Apache-2.0 |
+| `gemma4-e2b-it-4bit-mlx` | MLX | `gemma4-e2b` | 3.6 GB | Apache-2.0 |
+| `gemma4-e4b-it-qat-q4_0-gguf` | GGUF | `gemma4-e4b` | 5.15 GB | Apache-2.0 |
+| `gemma4-12b-it-qat-q4_0-gguf` | GGUF | `gemma4-12b-qat` | 6.98 GB | Apache-2.0 |
+| `gemma4-e2b-it-qat-q4_0-gguf` | GGUF | `gemma4-e2b` | 3.35 GB | Apache-2.0 |
+| `embeddinggemma-300m-4bit` | MLX | embedding, 768 dims (default) | 0.25 GB | Gemma Terms of Use |
+| `embeddinggemma-300m-q8_0-gguf` | GGUF | the same model, 768 dims | 0.33 GB | Gemma Terms of Use |
+| `multilingual-e5-small-mlx` | MLX | embedding, 384 dims | 0.3 GB | MIT |
+| `nomicai-modernbert-embed-base-6bit` | MLX | embedding, 768 dims, English | 0.13 GB | Apache-2.0 |
+| `nomic-embed-text-v1.5` | MLX | embedding, 768 dims, English | 0.6 GB | Apache-2.0 |
+| `nomic-embed-text-v1.5-q8_0-gguf` | GGUF | the same model, 768 dims | 0.15 GB | Apache-2.0 |
 
-All are MLX weights from Hugging Face. `estia models` shows what is installed;
-`estia pull <id>` and `estia rm <id>` add and remove them.
+All come from Hugging Face. `estia models` shows each one's format, whether
+the running backend can load it (`*`), and whether it is installed, along
+with imported models; `estia pull <id>` and `estia rm <id>` add and remove
+them.
 
 ## HTTP API
 
@@ -407,10 +535,12 @@ All are MLX weights from Hugging Face. `estia models` shows what is installed;
 
 `admin` includes every other scope.
 
-`/v1/chat/completions` supports streaming, `tools` (the model's native call
-syntax is parsed into `tool_calls`), and `response_format` with `json_object`
-or `json_schema` (validated after generation, repaired where possible, retried
-once). `user` is used as the prompt-cache key. Prompt caches are kept per
+`/v1/chat/completions` supports streaming, `tools` (the model's calls come back
+as `tool_calls`, and `{"role": "tool"}` results go back to the model through
+its chat template), and `response_format` with `json_object` or `json_schema`
+(llama.cpp constrains decoding to it, MLX is shown the schema in the system
+prompt; the output is validated, repaired where possible and retried once).
+`user` is used as the prompt-cache key. Prompt caches are kept per
 token: two tokens never share a cache entry, even with the same `user`.
 
 Limits per request: `max_tokens` above 8192 is lowered to 8192, `max_attempts`
@@ -428,17 +558,19 @@ Estia adds a few fields that standard clients can ignore:
   embeddings; `task` (`document`, `query`, `clustering` or `none`, which
   picks the model's own input prefix) and `expect_fingerprint` (refuse with 422
   unless the vectors would match) on embeddings.
-- Responses: an `x_estia` object. Chat completions carry `family`, `backend`,
-  `cached_tokens`, `template`, `repaired`, `repairs` and `ms`. Embeddings carry
+- Responses: an `x_estia` object. Chat completions carry `family`, `backend`
+  (`mlx-python` or `llama-cpp`), `cached_tokens`, `template`,
+  `generation_tps`, `repaired`, `repairs` and `ms`. Embeddings carry
   `fingerprint`, `dims` and `task`. `/v1/models` entries carry `role`,
-  `family`, `installed`, `dims` and similar facts.
+  `family`, `format`, `backend`, `runnable`, `imported`, `installed`, `dims`
+  and similar facts.
 
 Request and response shapes for every route are in [docs/api.md](docs/api.md).
 
 ## CLI
 
 `estia <command> --help` has the details. Every command accepts `--data-dir`,
-`--runner` and `--python`.
+`--backend`, `--runner` and `--python`.
 
 | Command | What it does |
 |---|---|
@@ -454,15 +586,17 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | `pair request --engine <url>` | Ask an engine for a token and wait for approval |
 | `discover` | Find engines on the LAN |
 | `remote-check --engine <url>` | Health, one generation and one embedding against a server |
-| `models`, `pull <id>`, `rm <id>` | List, download and remove models |
+| `models`, `pull <id>`, `rm <id>` | List, download and remove models; `pull` takes an artifact id, or a family, role or embedding model id for the running backend's artifact |
+| `import <file.gguf> [--id] [--kind] [--family] [--ctx] [--dims] [--link] [--replace]` | Register a GGUF file of your own (llama.cpp backend) |
 | `roles`, `roles set <role> <family>`, `roles rm <role>` | Show and change role bindings |
-| `runtime status`, `runtime install`, `runtime remove` | The Python MLX runtime |
+| `runtime status`, `runtime install [--variant]`, `runtime remove` | The backend's runtime: Python and MLX, or the pinned llama.cpp build |
 | `run` | Generate from the prompt on stdin (`--model`, `--schema`, `--json`) |
 | `chat` | Chat through the model's template; stdin is text or a JSON array of messages (`--system`, `--cache-key`, `--tools`, `--two-turns`) |
 | `embed` | Embed each line of stdin and print the vectors as JSON |
 | `tokens` | Count the tokens of stdin |
 | `bench` | Time a model load, two generations and a batch of 32 embeddings |
 | `runner-check` | Handshake with the runner and print its capabilities; loads no model |
+| `runner llama` | Hidden: the llama.cpp adapter, which the engine starts for each model; not for direct use |
 
 `run`, `chat`, `embed`, `tokens` and `bench` start their own runner process.
 They do not go through a running server.
@@ -482,9 +616,11 @@ directory answers.
 
 | Path | Contents |
 |---|---|
-| `models/<id>/` | Downloaded models. An interrupted download waits in `models/<id>.download/` and resumes. |
+| `models/<id>/` | Downloaded models. An interrupted download waits in `models/<id>.download/` and resumes. A GGUF model is `models/<id>/model.gguf`; an imported one also has `estia-model.json`. |
 | `runtime/python/` | Python and the MLX packages |
-| `config.json` | `{"roles": {...}}`, the role table |
+| `runtime/llama/<build>-<variant>/` | The llama.cpp build; `runtime/llama/active` names the variant in use |
+| `run/` | Mode 0700. One UNIX socket and one record per running `llama-server`, removed when it stops; the engine stops servers whose adapter died when it starts |
+| `config.json` | `{"roles": {...}, "backend": "..."}`, the role table and the backend `setup` chose |
 | `tokens.json` | Token names, SHA-256 hashes of the tokens, scopes, creation times |
 | `pairings.json` | Recent pairing requests |
 | `tokens.lock`, `pairings.lock` | Empty lock files that keep the server and the CLI from writing those two files at the same time |
@@ -499,6 +635,10 @@ directory answers.
 | `ESTIA_DATA_DIR` | Data directory (same as `--data-dir`) |
 | `ESTIA_RUNNER` | Path to `estia-runner.py` (same as `--runner`) |
 | `ESTIA_PYTHON` | Python interpreter for the runner (same as `--python`). Default: the installed runtime, else `python3` on `PATH`. |
+| `ESTIA_BACKEND` | `mlx-python` or `llama-cpp` (same as `--backend`) |
+| `ESTIA_LLAMA_SERVER` | A `llama-server` binary to use instead of the installed build |
+| `ESTIA_LLAMA_ARGS` | Extra `llama-server` arguments, split on spaces (`-ngl 0`) |
+| `ESTIA_LLAMA_VARIANT` | The llama.cpp build `runtime install` picks: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`, `rocm` |
 | `ESTIA_ALLOWED_HOSTS` | Extra `Host` names the server answers to, comma-separated (same syntax as `serve --allow-host`) |
 | `ESTIA_MDNS_REFRESH_SECS` | How often the built-in Bonjour advertiser re-registers, in seconds (default 300). A testing aid; not used when macOS `dns-sd` does the advertising. |
 | `ESTIA_LOG` | What to log (same as `--log-level`): a level such as `debug`, or filter directives such as `estia_server=debug,mdns_sd=info`. Default: `info` for Estia, `warn` for libraries. See [docs/logging.md](docs/logging.md). |
@@ -580,9 +720,18 @@ the crates in your own program.
   kept below the open-files limit, which the server raises at start. The
   server speaks HTTP/1.1 only.
 - **The browser client** keeps its token in the page's `localStorage`.
-- **Downloads.** The Python build is checked against a SHA-256 pinned in the
-  source. Model weights are checked against the SHA-256 Hugging Face publishes
-  for large files; small files get a size check. The MLX packages come from
+- **llama-server is private.** Each `llama-server` listens on a UNIX socket in
+  `<data dir>/run/` (mode 0700) and accepts only a random API key that its
+  adapter passes in a 0600 file and deletes once the server is up. It runs
+  with its web UI, `/slots`, built-in tools and downloads off, and without
+  `LLAMA_ARG_*`, `LLAMA_API_KEY` or `HF_TOKEN` from the environment. Prompt
+  caches do not leak across tokens: a slot is reused only for the cache key
+  that filled it.
+- **Downloads.** The Python build and every llama.cpp archive are checked
+  against SHA-256 hashes pinned in the source. MLX model weights are checked
+  against the SHA-256 Hugging Face publishes for large files; small files get
+  a size check. GGUF files are pinned to a commit and checked against their
+  SHA-256. The MLX packages come from
   PyPI and are not pinned: `mlx-vlm` is held to `>=0.6.13,<0.7`, `mlx-lm` has
   a floor and `mlx-embeddings` has no bound.
 
@@ -594,14 +743,17 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
   OpenAI SDKs, curl, /client, RemoteEngine
                   │  HTTP + bearer token
                   ▼
-  estia-server ── estia-engine ── Session ──► python3 estia-runner.py   (one process per loaded model)
-                                               JSON lines on stdin/stdout
+  estia-server ── estia-engine ── Session ──► python3 estia-runner.py                  (MLX; one process per loaded model)
+                                     │         JSON lines on stdin/stdout
+                                     └──────► estia runner llama ──HTTP──► llama-server  (llama.cpp; one pair per loaded model)
+                                               same protocol          private UNIX socket
 ```
 
 | Crate | Path | What it holds |
 |---|---|---|
 | `estia-proto` | `proto/` | Wire types for the runner protocol |
-| `estia-engine` | `engine/` | Runner sessions (priority gate, cancel, deadlines, one respawn), one-shot runs, the model registry, the Hugging Face downloader (resume, parallel chunks, SHA-256) and on-disk store, the Python runtime installer (feature `python-mlx`), roles, structured output, and `RemoteEngine` for talking to a server from Rust |
+| `estia-engine` | `engine/` | Runner sessions (priority gate, cancel, deadlines, one respawn), one-shot runs, backends, the model registry, the Hugging Face downloader (resume, parallel chunks, SHA-256) and on-disk store, GGUF metadata and imports, the Python runtime installer (feature `python-mlx`) and the llama.cpp installer (feature `llama-runtime`), roles, structured output, and `RemoteEngine` for talking to a server from Rust |
+| `estia-llama` | `llama/` | The llama.cpp adapter: speaks the runner protocol on stdin and stdout and runs one `llama-server` per model. A library and a small `estia-llama` binary; the `estia` CLI runs it as `estia runner llama` |
 | `estia-server` | `server/` | The axum server: `/v1/*`, `/engine/*`, tokens, pairing, Bonjour |
 | `estia` | `cli/` | The `estia` binary |
 
@@ -624,7 +776,8 @@ resident runner.
 
 | Runner | Kind | Notes |
 |---|---|---|
-| `runners/mlx-python/estia-runner.py` | resident | The working backend. `mlx-vlm` for generation, `mlx-embeddings` for embeddings. |
+| `runners/mlx-python/estia-runner.py` | resident | The MLX backend. `mlx-vlm` for generation, `mlx-embeddings` for embeddings. |
+| `estia runner llama` (crate `estia-llama`) | resident | The llama.cpp backend: an adapter in front of upstream `llama-server` |
 | `runners/mlx-python/oneshot-runner.py` | one-shot | The older Python runner |
 | `runners/apple/AppleRunner.swift` | one-shot | Apple Foundation Models; builds with plain `swiftc` |
 | `runners/mlx-swift/` | one-shot | Compiled MLX runner for hosts that must ship a signed binary and cannot download an interpreter |
@@ -636,10 +789,12 @@ The **Python runtime** is a pinned `python-build-standalone` build (Python
 installed from PyPI, all under `<data dir>/runtime/`. No system Python, Homebrew or pip is
 needed.
 
-**Structured output.** The MLX runner cannot constrain decoding, so the engine
-enforces JSON after the fact: parse, repair common defects (code fences,
-preambles, bad escapes, unescaped quotes), validate against the JSON Schema,
-and retry once with the validator's complaint.
+**Structured output.** The llama.cpp adapter constrains decoding to the JSON
+Schema with a grammar. The MLX runner cannot, so the engine puts the schema in
+the system prompt instead. On both, the engine then checks the output: parse,
+repair common defects (code fences, preambles, bad escapes, unescaped quotes),
+validate against the JSON Schema, and retry once with the validator's
+complaint.
 
 ## Benchmarks
 
@@ -652,9 +807,9 @@ number.
 
 ## Roadmap
 
-[ROADMAP.md](ROADMAP.md) lists what comes next and why. The next major item is
-a llama.cpp backend, which brings Linux, Windows, CPU-only machines and NVIDIA
-and AMD GPUs. Its design is in
+[ROADMAP.md](ROADMAP.md) lists what comes next and why. The llama.cpp backend,
+which brings Linux, CPU-only machines and NVIDIA and AMD GPUs, is in progress:
+its design and status are in
 [docs/design/llama-backend.md](docs/design/llama-backend.md).
 
 ## Licence
@@ -669,6 +824,7 @@ and Unicode-3.0 licences. Each release tarball includes
 by [cargo-about](https://github.com/EmbarkStudios/cargo-about) (configuration
 in `about.toml`).
 
-Models and the Python packages Estia downloads come under their own licences.
+Models, the Python packages and the llama.cpp builds (MIT) that Estia
+downloads come under their own licences.
 Gemma 4 is Apache-2.0 (per Google's model cards); EmbeddingGemma is under the
 Gemma Terms of Use. `GET /engine/models` lists each model's licence.

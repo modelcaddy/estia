@@ -277,6 +277,63 @@ fn dead_child_is_respawned_once_and_observer_sees_it() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A runner that answers every line with `{"ok": true}`. On SIGTERM it writes
+/// "stopped" to `marker` and exits, or, with `ignore_term`, carries on.
+#[cfg(unix)]
+fn write_term_runner(tag: &str, marker: &std::path::Path, ignore_term: bool) -> String {
+    let on_term = if ignore_term { "signal.SIG_IGN" } else { "on_term" };
+    let src = format!(
+        r#"import json, os, signal, sys
+def on_term(sig, frame):
+    with open({marker:?}, "w") as f:
+        f.write("stopped")
+    os._exit(0)
+signal.signal(signal.SIGTERM, {on_term})
+for line in sys.stdin:
+    sys.stdout.write(json.dumps({{"ok": True}}) + "\n")
+    sys.stdout.flush()
+"#,
+        marker = marker.to_string_lossy()
+    );
+    let path = std::env::temp_dir().join(format!("estia_fake_{tag}_{}.py", std::process::id()));
+    std::fs::write(&path, src).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// Dropping a session sends the runner SIGTERM first, so it can clean up
+/// after itself (the llama adapter stops its llama-server and removes its
+/// socket), and kills it only if it is still there after a grace period.
+#[cfg(unix)]
+#[test]
+fn drop_asks_the_runner_to_stop_then_kills_it() {
+    if !python3_available() {
+        return;
+    }
+    let marker = std::env::temp_dir().join(format!("estia_fake_term_{}.marker", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let path = write_term_runner("term", &marker, false);
+    let s = spawn(&path, None);
+    // The answer means the handler is installed.
+    s.call_unobserved(&Request::Ping).unwrap();
+    let t = Instant::now();
+    drop(s);
+    assert_eq!(std::fs::read_to_string(&marker).ok().as_deref(), Some("stopped"), "the runner saw SIGTERM");
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_file(&path);
+
+    // A runner that ignores SIGTERM is killed after the grace period.
+    let path = write_term_runner("noterm", &marker, true);
+    let s = spawn(&path, None);
+    s.call_unobserved(&Request::Ping).unwrap();
+    let t = Instant::now();
+    drop(s);
+    let took = t.elapsed();
+    assert!(took >= Duration::from_secs(3) && took < Duration::from_secs(15), "{took:?}");
+    assert!(!marker.exists());
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn spawn_failure_is_typed() {
     let err = Session::spawn(Launch::new("/definitely/not/a/program"), SessionConfig::default(), Arc::new(NoopObserver)).err().unwrap();

@@ -98,12 +98,10 @@ def run(client: OpenAI, question: str) -> str:
             fn = FUNCTIONS.get(name)
             result = fn(**args) if fn else {"error": f"no tool named {name!r}"}
             print(f"[tool] {name}({json.dumps(args)}) -> {json.dumps(result)}", file=sys.stderr)
-            # The result goes back as a user turn. The OpenAI convention is a
-            # {"role": "tool", "tool_call_id": ...} message, but with Gemma
-            # models Estia currently drops those before the model sees them,
-            # and the model answers with an empty reply. A user turn works on
-            # every model.
-            messages.append({"role": "user", "content": f"Result of {name}({json.dumps(args)}): {json.dumps(result)}"})
+            # The result goes back as a tool message that names the call it
+            # answers. The model's chat template renders it after the
+            # assistant turn above.
+            messages.append({"role": "tool", "tool_call_id": call.id, "name": name, "content": json.dumps(result)})
     return "(stopped: the model kept calling tools)"
 
 

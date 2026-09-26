@@ -65,8 +65,15 @@ tool with `cargo install cargo-about --locked --features cli`):
 ## Changes to the runner protocol
 
 `proto` defines the wire format between the engine and its runners. If you
-change it, change `runners/mlx-python/estia-runner.py` in the same pull
-request. Bump `PROTOCOL_VERSION` only for an incompatible change.
+change it, change both resident runners in the same pull request:
+`runners/mlx-python/estia-runner.py` and the llama.cpp adapter in `llama/`.
+Bump `PROTOCOL_VERSION` only for an incompatible change.
+
+The adapter's integration tests (`llama/tests/adapter.rs`) run against a real
+`llama-server` when `ESTIA_LLAMA_SERVER`, `ESTIA_LLAMA_TEST_MODEL` and
+`ESTIA_LLAMA_TEST_EMBED_MODEL` are set, and skip otherwise. The `llama` job in
+`.github/workflows/ci.yml` shows where to get the pinned build and the two
+small test models.
 
 ## Commits and pull requests
 
@@ -74,7 +81,7 @@ request. Bump `PROTOCOL_VERSION` only for an incompatible change.
 - Write commit subjects as `type(scope): summary`, for example
   `docs(server): describe the token scopes`. Types: `feat`, `fix`, `docs`,
   `refactor`, `test`, `chore`. Scopes: `engine`, `server`, `cli`, `proto`,
-  `runners`, `client`, `ci`.
+  `llama`, `runners`, `client`, `ci`.
 - Add or update a test when you change behaviour.
 
 For a large change, open an issue first so we can agree on the approach.

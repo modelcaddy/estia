@@ -9,7 +9,10 @@ repository with its history.
 
 - MLX on Apple Silicon macOS, through a resident Python runner
   (`runners/mlx-python/estia-runner.py`) using `mlx-vlm` for generation and
-  `mlx-embeddings` for embeddings. This is the only working backend.
+  `mlx-embeddings` for embeddings. The default on Apple Silicon.
+- llama.cpp, new and not yet run with the Gemma 4 GGUF files: upstream
+  `llama-server` behind the `estia-llama` adapter. The default everywhere
+  else. See [llama.cpp backend](#llamacpp-backend) below.
 - Runner protocol v2: newline-delimited JSON over stdin/stdout with a `hello`
   handshake and capabilities, `load` / `unload`, `chat` and `chat_stream`
   rendered by the model's own chat template, a per-conversation KV cache
@@ -60,6 +63,80 @@ repository with its history.
 - `pair`, `discover`, `remote-check`, `token`.
 - `models`, `pull`, `rm`, `roles`, `runtime`.
 - `run`, `chat`, `embed`, `tokens`, `bench`, `runner-check`.
+
+### llama.cpp backend
+
+From [docs/design/llama-backend.md](docs/design/llama-backend.md), which has
+the status of each slice and the live evidence.
+
+- **`estia-llama`**, a new crate: an adapter that speaks runner protocol v2 on
+  stdin and stdout and runs one upstream `llama-server` per model on a private
+  UNIX socket with a random API key. Streaming, cancel (the HTTP connection is
+  closed and `llama-server` stops the task), JSON and JSON Schema output
+  constrained by a grammar, tool calls parsed by `llama-server` and returned
+  in `meta.tool_calls`, `count_tokens`, embeddings, a prompt-cache slot reused
+  only by the cache key that filled it, explicit sampling, thinking off.
+  `llama-server` is stopped when the adapter exits, is signalled, loses its
+  parent, or (on macOS, through a guard process) is killed. The `estia` binary
+  runs it as `estia runner llama`; the crate also builds a small
+  `estia-llama` binary.
+- **Protocol:** `Message.tool_calls`, `meta.tool_calls`,
+  `meta.generation_tps`, and the capabilities `parses_tool_calls` and
+  `backend`. Old runners and engines ignore them.
+- **Backends in the engine:** `Backend` (`mlx-python`, `llama-cpp`),
+  `EngineConfig::with_backend` and `with_llama(LlamaLaunch)`, resolution of a
+  role or family to the backend's artifact, and a check that refuses an
+  artifact or fingerprint of the other backend. Stale `llama-server`
+  processes whose adapter died are stopped when an engine starts.
+- **Stopping a runner** (idle unload, shutdown, a missed deadline) now sends
+  SIGTERM and waits up to 4 s before SIGKILL, on both backends. The llama.cpp
+  adapter uses the time to stop its `llama-server` and remove its socket and
+  record from `run/`.
+- **Models:** GGUF artifacts for the three Gemma 4 families (Google's QAT
+  Q4_0 files), EmbeddingGemma 300M Q8_0 and Nomic Embed Text v1.5 Q8_0,
+  pinned to commits with explicit file lists and SHA-256 hashes. Embedding
+  models have one artifact per format; fingerprints are
+  `<artifact id>@<backend>`, so MLX fingerprints do not change.
+- **`estia import`** registers a GGUF file of your own, reading its kind,
+  context length, width and pooling from its metadata; copied or linked.
+- **Runtime:** `estia runtime install --backend llama [--variant …]` (engine
+  feature `llama-runtime`) downloads the pinned llama.cpp build b11146 for the
+  platform and accelerator, checks its SHA-256, unpacks it and runs
+  `--version`. `ESTIA_LLAMA_SERVER` uses your own `llama-server`;
+  `ESTIA_LLAMA_ARGS` adds arguments, minus the ones that would open it up.
+- **CLI and server:** a global `--backend` / `ESTIA_BACKEND`, saved to
+  `config.json` by `setup`. `/engine/health` gains `backend` and a `backends`
+  list with `active`, `supported`, and for llama.cpp `build`, `variant` and
+  `server`. `/engine/models` and `/v1/models` mark artifacts `runnable` on the
+  running backend and list imports. `POST /engine/runtime/install` takes
+  `{backend, variant}`. `x_estia` gains `generation_tps`, and streamed
+  `tool_calls` carry `index`.
+- **The `embed` role** can be bound to any embedding model, built-in or
+  imported.
+- **CI:** a `llama` job on Linux and macOS runs the adapter's integration
+  tests against the pinned `llama-server` with two small models, and fails if
+  a test skipped or a process was left behind.
+
+### Tool results and JSON Schemas reach the model
+
+- An assistant message's `tool_calls` now reach the runner as structured
+  data, so the model's chat template renders the `{"role": "tool"}` results
+  after them. Before, the calls reached the runner as text and Gemma's
+  template dropped the results.
+- The MLX runner (2.2.0) passes the calls and results to the template, and
+  when Gemma 4 ends its turn with no text right after a tool result, asks
+  once more in a new model turn. It also reports `generation_tps`.
+- `response_format` reaches the model on both backends: as `format` to a
+  runner that constrains decoding (llama.cpp), otherwise as an instruction
+  with the schema in the system prompt (MLX), or after a raw prompt on
+  `/engine/generate` and `estia run --schema`. The output is still validated.
+  `structured::with_prompt_hint`, `prompt_with_hint` and `prompt_hint` are
+  public for hosts that run the engine in process.
+- `examples/python/tools.py` sends results as `{"role": "tool"}`;
+  `structured.py`, `quickstart.sh` and `in_process.rs` no longer put the
+  schema in the prompt. The guide drops both workarounds.
+- The `/client` page names the backend, describes the right runtime, and
+  leaves models the backend cannot run out of its pickers.
 
 ### Logging and request ids
 
@@ -131,7 +208,7 @@ Behaviour changes that come with it:
   check that closes each item.
 - [docs/design/llama-backend.md](docs/design/llama-backend.md): the design for
   a llama.cpp backend (upstream `llama-server` as a child process behind a
-  protocol-v2 adapter). Not implemented.
+  protocol-v2 adapter), now with its implementation status.
 
 ### Hardening before release
 
@@ -208,16 +285,12 @@ ModelCaddy.
 
 [ROADMAP.md](ROADMAP.md) says which of these are planned to change.
 
-- No backend for Linux or Windows yet; a llama.cpp backend is designed and
-  not written.
+- The llama.cpp backend has run end to end only on an Apple Silicon Mac with
+  small test models. The Gemma 4 GGUF files, Linux (outside CI) and NVIDIA
+  GPUs are untested, and Estia does not build for Windows.
 - No TLS: LAN traffic, tokens included, is plain HTTP.
 - Image input is not passed through the API.
 - Role sampling settings (`temperature`, `max_tokens`, `pin`) are stored but
-  not applied. The `embed` role cannot be rebound.
-- A `{"role": "tool"}` message does not reach Gemma: the chat template drops
-  it, because assistant `tool_calls` reach the runner as text. Send tool
-  results as a user message.
-- The JSON Schema in `response_format` is used to validate the output but is
-  not shown to the model. Put it in the prompt.
+  not applied.
 - A non-streaming request is not cancelled when its client disconnects, and
   there is no time limit on reading a request body.

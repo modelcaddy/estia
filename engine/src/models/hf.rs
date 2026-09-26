@@ -10,6 +10,9 @@
 //!   reported as tampering.
 //! - An installed model gets small metadata topped up in place instead of a
 //!   multi-GB re-download.
+//! - An artifact that lists its files (every GGUF artifact) downloads exactly
+//!   those, at a pinned commit, checked against the SHA-256 compiled into the
+//!   registry, and stores each under its fixed local name (`model.gguf`).
 
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
@@ -630,19 +633,49 @@ pub fn resolve_url(repo_id: &str, revision: &str, filename: &str) -> String {
     format!("https://huggingface.co/{}/resolve/{}/{}?download=true", repo_id, revision, filename)
 }
 
+/// One file a download will fetch: where it is in the repository, the name it
+/// is stored under, and what it must hash to.
+#[derive(Debug, Clone)]
+struct PlannedFile {
+    remote: String,
+    local: String,
+    size: u64,
+    sha256: Option<String>,
+}
+
+impl From<HfFile> for PlannedFile {
+    fn from(f: HfFile) -> Self {
+        Self { local: f.path.clone(), remote: f.path, size: f.size, sha256: f.sha256 }
+    }
+}
+
+impl From<&super::registry::ArtifactFile> for PlannedFile {
+    fn from(f: &super::registry::ArtifactFile) -> Self {
+        Self { remote: f.remote.to_string(), local: f.local.to_string(), size: f.bytes, sha256: Some(f.sha256.to_ascii_lowercase()) }
+    }
+}
+
+/// The registry artifact whose explicit file list a spec should download, if
+/// it names one. The repository and revision must match too: a spec pointing
+/// somewhere else is not that artifact.
+fn explicit_artifact(spec: &DownloadSpec) -> Option<&'static super::registry::Artifact> {
+    super::registry::find_any_artifact(&spec.id)
+        .filter(|a| a.has_explicit_files() && a.repo_id == spec.repo_id && a.revision == spec.revision)
+}
+
 /// Size + integrity check for one downloaded file. LFS-backed files (the
 /// weights) publish a content SHA256; plain config/tokenizer files don't, so
 /// they're covered by the size check alone.
-fn verify_downloaded_file(file: &HfFile, written: u64, actual_sha: &str) -> Result<()> {
+fn verify_downloaded_file(file: &PlannedFile, written: u64, actual_sha: &str) -> Result<()> {
     if file.size > 0 && written != file.size {
-        return Err(anyhow!("downloaded size mismatch for {}: expected {}, got {}", file.path, file.size, written));
+        return Err(anyhow!("downloaded size mismatch for {}: expected {}, got {}", file.remote, file.size, written));
     }
     if let Some(expected_sha) = &file.sha256 {
         if actual_sha != expected_sha {
             return Err(anyhow!(
                 "SHA256 mismatch for {} (expected {}, got {}) — the download may be \
                  corrupted or tampered with; the model was not installed",
-                file.path,
+                file.remote,
                 expected_sha,
                 actual_sha
             ));
@@ -730,6 +763,16 @@ async fn top_up_installed_model_files(destination: &Path, repo_id: &str, revisio
     added
 }
 
+/// Where a download into `destination` stages: `<destination>.download`.
+/// Appended, not `with_extension`: an id with a dot (`nomic-embed-text-v1.5`,
+/// `nomic-embed-text-v1.5-q8_0-gguf`) would lose its tail, and two artifacts
+/// would share one staging directory.
+pub fn staging_path(destination: &Path) -> PathBuf {
+    let mut name = destination.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".download");
+    destination.with_file_name(name)
+}
+
 /// Download `spec` into `destination` (a directory named after the artifact),
 /// staging in `<destination>.download` and renaming atomically at the end.
 /// An already-installed destination only gets its small metadata topped up.
@@ -745,13 +788,26 @@ where
     let mut pump = ProgressPump::new(on_progress);
     // A stale pause request from a previous run must not kill this download.
     clear_download_cancel(model_id);
-    let temp_destination = destination.with_extension("download");
-    if destination.exists() {
+    let temp_destination = staging_path(&destination);
+    let explicit = explicit_artifact(spec);
+    let imported = destination.join(super::custom::MANIFEST_FILE).exists();
+    // An explicit list is installed only when every listed file is there; a
+    // directory missing one (a hand-made directory, a file removed by hand)
+    // is downloaded again and replaced at the end.
+    let complete = match explicit {
+        Some(a) => a.files.iter().all(|f| destination.join(f.local).is_file()),
+        None => true,
+    };
+    if destination.exists() && complete {
         // Already installed — but it may predate a widening of
         // `should_download_hf_file`, so fill in any small metadata it's missing
         // before reporting complete. Re-running setup is the reachable trigger
-        // for this; it stays cheap because weights are excluded by size.
-        top_up_installed_model_files(&destination, repo_id, revision, user_agent).await;
+        // for this; it stays cheap because weights are excluded by size. An
+        // artifact with an explicit file list, or an imported model, has
+        // nothing else to fetch.
+        if explicit.is_none() && !imported && !repo_id.is_empty() {
+            top_up_installed_model_files(&destination, repo_id, revision, user_agent).await;
+        }
 
         let bytes = dir_size(&destination).unwrap_or(0);
         pump.send(
@@ -773,6 +829,10 @@ where
             bytes_downloaded: bytes,
             path: destination.display().to_string(),
         });
+    }
+
+    if repo_id.is_empty() {
+        return Err(anyhow!("`{model_id}` has no repository to download from (an imported model is added with an import, not a pull)"));
     }
 
     pump.send(
@@ -803,7 +863,12 @@ where
     tokio::fs::remove_file(&legacy_marker).await.ok();
 
     let client = download_client(user_agent)?;
-    let files = hf_repo_files(&client, repo_id, revision).await?;
+    // An explicit list needs no tree listing: the registry pins the commit,
+    // the names, the sizes and the hashes.
+    let files: Vec<PlannedFile> = match explicit {
+        Some(a) => a.files.iter().map(PlannedFile::from).collect(),
+        None => hf_repo_files(&client, repo_id, revision).await?.into_iter().map(PlannedFile::from).collect(),
+    };
     if files.is_empty() {
         return Err(anyhow!("Hugging Face repo returned no downloadable model files"));
     }
@@ -820,7 +885,7 @@ where
     if already_on_disk > 0 {
         tracing::info!(model = %model_id, bytes_on_disk = already_on_disk, "resuming a partial download");
     }
-    tracing::debug!(model = %model_id, repo = %repo_id, revision = %revision, files = file_count, bytes = planned_bytes, "download plan");
+    tracing::debug!(model = %model_id, repo = %repo_id, revision = %revision, files = file_count, bytes = planned_bytes, explicit = explicit.is_some(), "download plan");
 
     // Fail before transferring gigabytes we can't store. `df` is best-effort,
     // so an unreadable probe just skips the check.
@@ -847,11 +912,11 @@ where
         if download_cancel_requested(model_id) {
             return Err(anyhow!("{DOWNLOAD_PAUSED_MARKER}"));
         }
-        let target = temp_destination.join(&file.path);
+        let target = temp_destination.join(&file.local);
         if let Some(parent) = target.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let url = resolve_url(repo_id, revision, &file.path);
+        let url = resolve_url(repo_id, revision, &file.remote);
 
         let mut attempt = 0_usize;
         let written = loop {
@@ -865,7 +930,7 @@ where
                     &target,
                     file.size,
                     bytes_downloaded,
-                    &file.path,
+                    &file.remote,
                     idx + 1,
                     file_count,
                     total_bytes,
@@ -880,7 +945,7 @@ where
                     &target,
                     file.size,
                     bytes_downloaded,
-                    &file.path,
+                    &file.remote,
                     idx + 1,
                     file_count,
                     total_bytes,
@@ -902,7 +967,7 @@ where
                         // from-scratch download that fails still hard-errors —
                         // that check is the point of verifying at all.
                         Err(err) if reused && !last_attempt => {
-                            tracing::warn!(model = %model_id, file = %file.path, error = %err, "a resumed file failed verification; downloading it again");
+                            tracing::warn!(model = %model_id, file = %file.remote, error = %err, "a resumed file failed verification; downloading it again");
                             tokio::fs::remove_file(&target).await.ok();
                             tokio::fs::remove_file(chunk_sidecar_path(&target)).await.ok();
                         }
@@ -917,12 +982,12 @@ where
                     }
                 }
                 Err(err) if !last_attempt => {
-                    tracing::warn!(model = %model_id, file = %file.path, attempt, error = %err, "download attempt failed; retrying");
+                    tracing::warn!(model = %model_id, file = %file.remote, attempt, error = %err, "download attempt failed; retrying");
                     // Leave the partial in place on purpose: the next attempt
                     // resumes from it instead of re-fetching what already landed.
                     tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
                 }
-                Err(err) => return Err(err.context(format!("downloading {} failed after {} attempts", file.path, attempt))),
+                Err(err) => return Err(err.context(format!("downloading {} failed after {} attempts", file.remote, attempt))),
             }
         };
 
@@ -975,5 +1040,115 @@ mod tests {
         // Still no repo furniture.
         assert!(!should_download_hf_file(".gitattributes"));
         assert!(!should_download_hf_file("README.md"));
+    }
+
+    #[test]
+    fn staging_paths_keep_the_whole_id() {
+        let models = Path::new("/m");
+        assert_eq!(staging_path(&models.join("gemma4-e2b-it-4bit-mlx")), models.join("gemma4-e2b-it-4bit-mlx.download"));
+        let mlx = staging_path(&models.join("nomic-embed-text-v1.5"));
+        let gguf = staging_path(&models.join("nomic-embed-text-v1.5-q8_0-gguf"));
+        assert_eq!(mlx, models.join("nomic-embed-text-v1.5.download"));
+        assert_eq!(gguf, models.join("nomic-embed-text-v1.5-q8_0-gguf.download"));
+        assert_ne!(mlx, gguf);
+    }
+
+    #[test]
+    fn gguf_artifacts_plan_their_listed_files() {
+        let a = super::super::registry::find_artifact("gemma4-e2b-it-qat-q4_0-gguf").unwrap();
+        let spec = DownloadSpec::from(a);
+        assert!(std::ptr::eq(explicit_artifact(&spec).unwrap(), a));
+        let planned: Vec<PlannedFile> = a.files.iter().map(PlannedFile::from).collect();
+        assert_eq!(planned.len(), 1);
+        assert_eq!((planned[0].remote.as_str(), planned[0].local.as_str()), ("gemma-4-E2B_q4_0-it.gguf", "model.gguf"));
+        assert_eq!(planned[0].sha256.as_deref(), Some(a.files[0].sha256));
+        assert_eq!(planned[0].size, 3_349_516_256);
+        // Another revision or repository is not that artifact.
+        assert!(explicit_artifact(&DownloadSpec { revision: "main".into(), ..spec.clone() }).is_none());
+        assert!(explicit_artifact(&DownloadSpec { repo_id: "someone/else".into(), ..spec }).is_none());
+        // MLX artifacts and embedding GGUF artifacts.
+        assert!(explicit_artifact(&DownloadSpec::from(super::super::registry::find_artifact("gemma4-e2b-it-4bit-mlx").unwrap())).is_none());
+        let e = super::super::registry::find_any_artifact("embeddinggemma-300m-q8_0-gguf").unwrap();
+        assert!(explicit_artifact(&DownloadSpec::from(e)).is_some());
+        // A verification failure names the repository path.
+        let err = verify_downloaded_file(&planned[0], 3_349_516_256, "00").unwrap_err();
+        assert!(err.to_string().contains("gemma-4-E2B_q4_0-it.gguf"), "{err}");
+    }
+
+    const TINY_REPO: &str = "hf-internal-testing/tiny-random-gpt2";
+    const TINY_COMMIT: &str = "71034c5d8bde858ff824298bdedc65515b97d2b9";
+    static TINY_FILES: [super::super::registry::ArtifactFile; 1] = [super::super::registry::ArtifactFile {
+        remote: "model.safetensors",
+        local: "model.gguf",
+        bytes: 453_864,
+        sha256: "8111d5afb0715dbf5a31396d31432cb56370ba23f6650a035ea0fc8a20b4e500",
+    }];
+    static TINY_BAD: [super::super::registry::ArtifactFile; 1] = [super::super::registry::ArtifactFile {
+        remote: "model.safetensors",
+        local: "model.gguf",
+        bytes: 453_864,
+        sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+    }];
+
+    fn tiny_artifact(
+        id: &'static str,
+        files: &'static [super::super::registry::ArtifactFile],
+    ) -> &'static super::super::registry::Artifact {
+        use super::super::registry::*;
+        register_custom_generation(Artifact {
+            id,
+            family: id,
+            label: id,
+            kind: ModelKind::Generation,
+            format: Format::Gguf,
+            repo_id: TINY_REPO,
+            revision: TINY_COMMIT,
+            required_disk_bytes: 453_864,
+            capabilities: &[Capability::Text],
+            context_length: None,
+            license: "test",
+            files,
+        })
+    }
+
+    /// An explicit list downloads exactly its files, under their local
+    /// names, checked against the pinned hash; a wrong pin installs nothing.
+    #[tokio::test]
+    #[ignore = "hits huggingface.co"]
+    async fn explicit_files_download_verify_and_rename() {
+        let dir = std::env::temp_dir().join(format!("estia-dl-explicit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = super::super::ModelStore::new(dir.join("models"));
+
+        let a = tiny_artifact("hf-explicit-test-gguf", &TINY_FILES);
+        let summary = store.download(&DownloadSpec::from(a), |_| {}).await.unwrap();
+        assert_eq!(summary.files_downloaded, 1);
+        let names: Vec<String> =
+            std::fs::read_dir(store.path(a.id)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["model.gguf".to_string()], "only the listed file, under its local name");
+        assert!(store.is_installed(a.id));
+        assert_eq!(store.bytes_on_disk(a.id), Some(453_864));
+        assert_eq!(store.load_path(a.id), store.path(a.id).join("model.gguf"));
+        // Installed: nothing else to fetch, no top-up.
+        let again = store.download(&DownloadSpec::from(a), |_| {}).await.unwrap();
+        assert_eq!(again.files_downloaded, 0);
+        // A directory missing a listed file is not installed: fetched again.
+        std::fs::remove_file(store.path(a.id).join("model.gguf")).unwrap();
+        assert!(!store.is_installed(a.id));
+        let refetched = store.download(&DownloadSpec::from(a), |_| {}).await.unwrap();
+        assert_eq!(refetched.files_downloaded, 1);
+        assert!(store.is_installed(a.id));
+
+        let bad = tiny_artifact("hf-explicit-bad-gguf", &TINY_BAD);
+        let err = store.download(&DownloadSpec::from(bad), |_| {}).await.unwrap_err();
+        assert!(format!("{err:#}").contains("SHA256 mismatch"), "{err:#}");
+        assert!(!store.is_installed(bad.id));
+        assert!(!store.partial_path(bad.id).join("model.gguf").exists(), "bytes that failed verification are not kept");
+
+        assert!(store.remove(a.id).await.unwrap());
+        assert!(!store.is_installed(a.id));
+        super::super::registry::unregister_custom_generation(a.id);
+        super::super::registry::unregister_custom_generation(bad.id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

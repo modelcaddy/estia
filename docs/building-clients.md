@@ -56,12 +56,22 @@ operator swaps a model.
 | `fast` | `gemma4-e2b` | falls back to `text` |
 | `vision` | `gemma4-e4b` | falls back to `text` |
 | `code` | none | falls back to `text` |
-| `embed` | `embeddinggemma-300m-4bit` (fixed) | cannot be rebound yet |
+| `embed` | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`) |
 
 `model` also accepts a family (`gemma4-e2b`) or an artifact id
 (`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family, and a family
-over a role. Prefer roles: an artifact id ties your app to one download, and
-fails with 404 on an engine that does not have it.
+over a role. Prefer roles: an artifact id ties your app to one download and
+one backend. The same family has an MLX artifact and a GGUF artifact
+(`gemma4-e2b-it-qat-q4_0-gguf`); a role or family answers from the one the
+engine's backend runs, while the other backend's artifact id is a 400.
+
+**Backends.** An engine runs its models on MLX (`mlx-python`, the default on
+Apple Silicon Macs) or llama.cpp (`llama-cpp`, the default elsewhere).
+`/engine/health` says which, in `backend`, and every chat completion repeats
+it in `x_estia.backend`. The API is the same on both. The differences an app
+may notice: artifact ids (above), embedding fingerprints (see
+[Embeddings](#embeddings)), and how closely the model follows a JSON Schema
+(see [Structured output](#structured-output)).
 
 The response tells you what answered: `model` is the artifact id and
 `x_estia.family` the family. `GET /v1/models` lists the role table first, each
@@ -227,8 +237,9 @@ In JavaScript, call `stream.controller.abort()`. With openai-node 6 the
 `for await` loop then ends without throwing, so check
 `stream.controller.signal.aborted` afterwards. In Rust, flip a `CancelToken`.
 
-With `tools` declared, the engine holds the first characters back to tell a
-tool call from prose; a tool call arrives whole in the final chunk. JSON output
+With `tools` declared on MLX, the engine holds the first characters back to
+tell a tool call from prose; on llama.cpp prose streams at once. Either way
+the tool calls arrive whole in the final chunk. JSON output
 (`response_format`) is also sent in the final chunk. If a stream fails after
 it started, it ends with a `data: {"error": {"message", "type", "request_id"}}`
 event and `data: [DONE]`; the Python SDK raises that as `openai.APIError`.
@@ -251,24 +262,23 @@ Ask for JSON that matches a schema with `response_format`:
 ```python
 r = client.chat.completions.create(
     model="fast",
-    messages=[{"role": "system", "content": "Answer with one JSON object matching this JSON Schema: " + json.dumps(schema)},
+    messages=[{"role": "system", "content": "Extract the event described in the user's text."},
               {"role": "user", "content": text}],
     response_format={"type": "json_schema", "json_schema": {"name": "event", "schema": schema}},
 )
 event = json.loads(r.choices[0].message.content)
 ```
 
-The MLX backend cannot constrain decoding, so the engine enforces the schema
-after generation: it parses the output, repairs common defects (code fences,
-preambles, bad escapes, unescaped quotes), validates, and retries once with the
-validator's complaint. `x_estia.repaired` and `x_estia.repairs` say what it
-fixed.
-
-**Put the schema in your prompt.** The engine validates against the schema but
-does not show it to the model. Without the schema in the prompt the model
-guesses field names. In our runs with `gemma4-e2b`, the event extraction in
-`structured.py` failed validation twice out of two without the schema in the
-prompt, and passed twice out of two with it.
+The model sees the schema; you do not need to repeat it in the prompt. On
+llama.cpp, decoding is constrained to the schema, so the output parses and has
+the schema's structure, unless `max_tokens` cuts it short: give long string
+fields a `maxLength`, or leave room in `max_tokens`. On MLX, which cannot constrain decoding, the engine
+adds the schema to the system prompt. Either way the engine then checks the
+output: it parses it, repairs common defects (code fences, preambles, bad
+escapes, unescaped quotes), validates, and retries once with the validator's
+complaint. `x_estia.repaired` and `x_estia.repairs` say what it fixed. With
+`gemma4-e2b` on MLX, the event extraction in `structured.py`, with no schema
+in its prompt, returned valid JSON in 10 runs out of 10, none repaired.
 
 When the output still does not validate, the answer is a 422 with type
 `invalid_request_error` and a message that starts with
@@ -300,16 +310,23 @@ if msg.tool_calls:
                      "tool_calls": [c.model_dump() for c in msg.tool_calls]})
     for call in msg.tool_calls:
         result = FUNCTIONS[call.function.name](**json.loads(call.function.arguments))
-        messages.append({"role": "user", "content": f"Result of {call.function.name}: {json.dumps(result)}"})
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
     # ...and ask again with the longer history
 ```
 
-Send the result as a **user** message. With the Gemma models, a
-`{"role": "tool"}` message is dropped before the model sees it: the engine
-passes an assistant's `tool_calls` to the model as text, and Gemma's chat
-template renders a tool message only after a structured `tool_calls`. The
-model then answers with an empty reply. This is a current limitation, not the
-intended behaviour.
+Send each result as a `{"role": "tool"}` message with the `tool_call_id` of
+the call it answers, after the assistant message that made the calls. The
+engine passes the assistant's `tool_calls` to the model's chat template as
+structured calls, so the template renders the results where the model
+expects them. With `gemma4-e2b` on MLX, `tools.py` answered from the tool's
+result for five questions out of five.
+
+On llama.cpp the calls are parsed by `llama-server` rather than by Estia, and
+the model's chat template must support tools: with a template that does not,
+`llama-server` refuses a `tool` message and the request fails with a 500.
+Gemma 4's tool calls on llama.cpp have not been tested yet; with a small test
+model and a tool-capable template, the calls and results were checked to
+reach the template.
 
 `tool_choice` is accepted and ignored. Bound the loop (the example stops after
 4 steps), and decide in your code which calls to run: only tools you declare
@@ -335,9 +352,11 @@ store and what you search with. Send `task: "document"` when indexing and
 document. `clustering` exists too, and `none` sends your text unchanged, for
 clients that add prefixes themselves (`RemoteEngine` does).
 
-**Fingerprints.** Every response carries a fingerprint, `<model id>@<backend>`,
-for example `embeddinggemma-300m-4bit@mlx-python`. Vectors with different
-fingerprints cannot be compared, even for the same model on two backends.
+**Fingerprints.** Every response carries a fingerprint, `<artifact id>@<backend>`,
+for example `embeddinggemma-300m-4bit@mlx-python` on MLX and
+`embeddinggemma-300m-q8_0-gguf@llama-cpp` for the same model on llama.cpp.
+Vectors with different fingerprints cannot be compared, even for the same
+model on two backends.
 Store the fingerprint with your index and send it back as
 `expect_fingerprint`. If the engine would produce different vectors, it
 answers 422 before doing any work:
@@ -349,13 +368,15 @@ fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, yo
 **Re-embedding.** Any change of embedding model or backend on the host changes
 the fingerprint. On that 422, rebuild the index from your source texts with
 the new fingerprint, then switch to it. Keep the source texts, not only the
-vectors. `GET /engine/models` lists each embedding model's `fingerprint`, so
-an app can check before it searches.
+vectors. Moving an engine from MLX to llama.cpp, or binding `embed` to
+another model, is such a change. `GET /engine/models` lists each embedding
+model's `fingerprint`, so an app can check before it searches.
 
 Other facts: at most 256 inputs per request (more is a 400, so batch);
 vectors are float arrays whatever `encoding_format` says (pass `"float"` so
-SDKs do not try to decode base64); `usage` is reported as zero; `embed`
-currently means `embeddinggemma-300m-4bit` (768 dimensions). The native
+SDKs do not try to decode base64); `usage` is reported as zero; `embed` means
+EmbeddingGemma 300M (768 dimensions) unless the operator binds it to another
+model. The native
 `POST /engine/embed` takes `inputs` and returns `vectors`, `fingerprint` and
 `dims` at the top level.
 
@@ -546,8 +567,11 @@ let out = gen.chat_with(&messages, None, Some("conv-1"), None, Some(200), None, 
 ```
 
 The in-process engine does not read the CLI's `config.json`; pass your own
-role table with `EngineConfig::with_roles`. Structured output is yours to
-enforce with `structured::enforce` and `Structured::retry_hint`.
+role table with `EngineConfig::with_roles`, and a `LlamaLaunch` with
+`EngineConfig::with_llama` to run llama.cpp. Structured output is yours to
+enforce: `structured::with_prompt_hint` shows the model the schema (for a
+runner that cannot constrain decoding), then `structured::enforce` and
+`Structured::retry_hint`.
 
 `estia-engine` reports what its runners do (start, handshake, model load,
 cancel, restart, idle release) as `tracing` events, and turns each runner's
@@ -562,15 +586,11 @@ Examples: [`remote_client.rs`](../engine/examples/remote_client.rs),
 [ROADMAP.md](../ROADMAP.md) says which of these are planned to change, and in
 what order.
 
-- Apple Silicon Macs only. The one backend is MLX through a Python runner. A
-  llama.cpp backend for Linux and Windows is designed
-  ([design/llama-backend.md](design/llama-backend.md)) and not written. Ask
-  by role, not artifact id, and store embedding fingerprints, and your app
-  will work on it unchanged.
-- Tool results sent as `{"role": "tool"}` are dropped with the Gemma models.
-  Send them as user messages (see [Tools](#tools)).
-- The JSON Schema in `response_format` is not shown to the model. Put it in
-  the prompt.
+- The llama.cpp backend is new. It has run end to end only on an Apple
+  Silicon Mac with small test models; the Gemma 4 GGUF files, Linux and
+  Windows are untested ([design/llama-backend.md](design/llama-backend.md)
+  has the status). Ask by role, not artifact id, and store embedding
+  fingerprints, and your app works on either backend unchanged.
 - Image parts in messages are replaced by a text marker.
 - A non-streaming request is not cancelled when its client disconnects.
 - `tool_choice`, `n`, `top_p` and `stop` are accepted and ignored. Role

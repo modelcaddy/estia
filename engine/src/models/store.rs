@@ -1,6 +1,13 @@
 //! Where models live on disk.
+//!
+//! Each artifact is a directory, `<models_dir>/<artifact id>/`. An MLX
+//! artifact holds the repository's files under their own names; a GGUF
+//! artifact holds its listed files under fixed names (`model.gguf`), and an
+//! imported one also holds its manifest (see [`super::custom`]).
 
+use super::custom::{self, ImportManifest, ImportOptions};
 use super::hf::{self, DownloadProgress, DownloadSpec, DownloadSummary};
+use super::registry::{self, Format};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,11 +55,61 @@ impl ModelStore {
 
     /// Where a download stages before its atomic rename into place.
     pub fn partial_path(&self, id: &str) -> PathBuf {
-        self.path(id).with_extension("download")
+        hf::staging_path(&self.path(id))
     }
 
+    /// Whether the artifact is on disk. A GGUF artifact counts only when its
+    /// `model.gguf` is there (a symlinked import whose source moved does not).
     pub fn is_installed(&self, id: &str) -> bool {
-        self.path(id).exists()
+        let p = self.path(id);
+        if !p.exists() {
+            return false;
+        }
+        match self.gguf_file_name(id) {
+            Some(file) if p.is_dir() => p.join(file).exists(),
+            _ => true,
+        }
+    }
+
+    /// What a runner is told to load (`model_path` in the runner protocol):
+    /// the artifact's directory for MLX, the `.gguf` file itself for GGUF. An
+    /// override that points at a file is used as it is.
+    pub fn load_path(&self, id: &str) -> PathBuf {
+        let p = self.path(id);
+        match self.gguf_file_name(id) {
+            Some(file) if !p.is_file() => p.join(file),
+            _ => p,
+        }
+    }
+
+    /// `model.gguf` for a known GGUF artifact (built-in or imported), or for
+    /// an unknown id whose directory holds one.
+    fn gguf_file_name(&self, id: &str) -> Option<&'static str> {
+        match registry::find_any_artifact(id) {
+            Some(a) => a.model_file(),
+            None => self.path(id).join(registry::GGUF_MODEL_FILE).exists().then_some(registry::GGUF_MODEL_FILE),
+        }
+    }
+
+    /// The format of what is stored under `id`, when the registry or the
+    /// directory tells.
+    pub fn format_of(&self, id: &str) -> Option<Format> {
+        match registry::find_any_artifact(id) {
+            Some(a) => Some(a.format),
+            None => self.gguf_file_name(id).map(|_| Format::Gguf),
+        }
+    }
+
+    /// Import a local GGUF file as a model (see [`custom::import_gguf`]).
+    pub fn import_gguf(&self, source: &Path, opts: ImportOptions) -> Result<ImportManifest> {
+        custom::import_gguf(self, source, opts)
+    }
+
+    /// Register every imported model in this store. `Engine::new` does this;
+    /// a host that lists or resolves models without an engine calls it once
+    /// at startup.
+    pub fn load_imported(&self) -> Vec<ImportManifest> {
+        custom::load_imported(self)
     }
 
     pub fn bytes_on_disk(&self, id: &str) -> Option<u64> {
@@ -99,10 +156,21 @@ impl ModelStore {
         }
         let destination = self.path(id);
         let partial = self.partial_path(id);
+        let imported = custom::is_imported(self, id);
         let mut removed = false;
-        if destination.exists() {
-            tokio::fs::remove_dir_all(&destination).await?;
+        // `exists()` follows links; `symlink_metadata` also sees a dangling one.
+        if destination.symlink_metadata().is_ok() {
+            if destination.is_dir() {
+                // Does not follow symlinks: a symlinked import loses its link,
+                // never the file it points at.
+                tokio::fs::remove_dir_all(&destination).await?;
+            } else {
+                tokio::fs::remove_file(&destination).await?;
+            }
             removed = true;
+        }
+        if imported {
+            custom::unregister(id);
         }
         if partial.exists() {
             tokio::fs::remove_dir_all(&partial).await?;

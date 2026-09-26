@@ -24,6 +24,7 @@
 //! emits `tracing` events; the binary installs the subscriber.
 
 pub mod access;
+pub mod catalog;
 pub mod engine_api;
 pub mod jobs;
 pub mod openai;
@@ -40,9 +41,9 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use estia_engine::models::embed::{find_embed_model, EmbedModel, BACKEND_MLX_PYTHON};
-use estia_engine::models::{find_artifact, find_family_default, Artifact, Format};
-use estia_engine::{EmbedSession, Engine, GenSession};
+use estia_engine::models::embed::EmbedModel;
+use estia_engine::models::{Artifact, ResolveError};
+use estia_engine::{Backend, EmbedSession, Engine, EngineError, GenSession};
 use jobs::JobTable;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -114,33 +115,37 @@ impl AppState {
         self.hosts.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The backend identity vectors from this server carry.
+    /// The backend this server's engine runs.
+    pub fn backend(&self) -> Backend {
+        self.engine.backend()
+    }
+
+    /// The backend id outputs and vectors from this server carry
+    /// (`x_estia.backend`, the suffix of every embedding fingerprint).
     pub fn embed_backend(&self) -> &'static str {
-        BACKEND_MLX_PYTHON
+        self.engine.backend().id()
     }
 
-    /// Role name, family or artifact id → the artifact this host loads.
+    /// Role name, family or artifact id → the artifact this host's backend
+    /// loads (`fast` is the MLX artifact on an MLX engine and the GGUF one on
+    /// a llama.cpp engine). Imported models resolve by id and family too.
     pub fn resolve_generation(&self, name: &str) -> Result<&'static Artifact, ApiError> {
-        if let Some(a) = find_artifact(name) {
-            return Ok(a);
-        }
-        if let Some(a) = find_family_default(name, Format::Mlx) {
-            return Ok(a);
-        }
-        let roles = self.engine.roles();
-        match roles.resolve_artifact(name, Format::Mlx) {
-            Ok((_, a)) => Ok(a),
-            Err(e) => Err(ApiError::not_found(format!("unknown model `{name}`: {e}"))),
-        }
+        self.engine.resolve_generation(name).map_err(resolve_error)
     }
 
+    /// Model id, artifact id, fingerprint or the `embed` role (`None` too) →
+    /// the embedding model. Refused when this backend has no artifact for it.
     pub fn resolve_embedding(&self, name: Option<&str>) -> Result<&'static EmbedModel, ApiError> {
-        let roles = self.engine.roles();
-        let id = match name {
-            None | Some("embed") => roles.get("embed").map(|b| b.family.clone()).unwrap_or_else(|| "embeddinggemma-300m-4bit".to_string()),
-            Some(other) => other.to_string(),
-        };
-        find_embed_model(&id).ok_or_else(|| ApiError::not_found(format!("unknown embedding model `{id}`")))
+        self.engine.resolve_embedding(name).map(|(m, _)| m).map_err(resolve_error)
+    }
+
+    /// The fingerprint vectors of `model` carry on this host:
+    /// `<artifact id>@<backend>`.
+    pub fn embed_fingerprint(&self, model: &EmbedModel) -> Result<String, ApiError> {
+        let backend = self.backend();
+        self.engine
+            .embed_fingerprint(model)
+            .ok_or_else(|| resolve_error(ResolveError::NoArtifactForBackend { family: model.id.to_string(), backend }))
     }
 
     /// Get or spawn the resident generation session for an artifact. Blocking
@@ -171,19 +176,24 @@ impl AppState {
         self.embed_session_timed(model).map(|(s, _)| s)
     }
 
-    /// [`AppState::embed_session`], plus how long starting it took.
+    /// [`AppState::embed_session`], plus how long starting it took. Sessions
+    /// are keyed by the artifact this backend loads, so `loaded` names the
+    /// weights actually resident.
     pub(crate) fn embed_session_timed(&self, model: &EmbedModel) -> Result<(Arc<EmbedSession>, Option<u64>), ApiError> {
-        if let Some(s) = self.embed.lock().unwrap().get(model.id) {
+        let backend = self.backend();
+        let artifact = model
+            .artifact_for(backend)
+            .ok_or_else(|| resolve_error(ResolveError::NoArtifactForBackend { family: model.id.to_string(), backend }))?;
+        if let Some(s) = self.embed.lock().unwrap().get(artifact.id) {
             return Ok((Arc::clone(s), None));
         }
         let t0 = Instant::now();
-        let fingerprint = model.fingerprint_for(self.embed_backend());
-        let s = self.engine.spawn_embed_session(model.id, &fingerprint)?;
+        let s = self.engine.spawn_embed_model(model)?;
         s.load()?;
         let ms = t0.elapsed().as_millis() as u64;
-        tracing::info!(model = %model.id, dims = model.dims, ready_ms = ms, "embedding model ready");
+        tracing::info!(model = %model.id, artifact = %artifact.id, dims = model.dims, ready_ms = ms, "embedding model ready");
         let s = Arc::new(s);
-        self.embed.lock().unwrap().insert(model.id.to_string(), Arc::clone(&s));
+        self.embed.lock().unwrap().insert(artifact.id.to_string(), Arc::clone(&s));
         Ok((s, Some(ms)))
     }
 
@@ -277,12 +287,25 @@ impl From<estia_engine::SessionError> for ApiError {
         ApiError::internal(format!("runner: {e}"))
     }
 }
-impl From<estia_engine::EngineError> for ApiError {
-    fn from(e: estia_engine::EngineError) -> Self {
+impl From<EngineError> for ApiError {
+    fn from(e: EngineError) -> Self {
         match e {
-            estia_engine::EngineError::ModelMissing { .. } => ApiError::not_found(e.to_string()),
+            EngineError::ModelMissing { .. } => ApiError::not_found(e.to_string()),
+            EngineError::Resolve(r) => resolve_error(r),
+            EngineError::FingerprintMismatch { .. } => ApiError::unprocessable(e.to_string()),
             other => ApiError::internal(other.to_string()),
         }
+    }
+}
+
+/// A name that does not resolve on this backend: unknown is 404, an artifact
+/// of the other format is 400 (ask by family or role), a family without an
+/// artifact for this backend is 404.
+pub fn resolve_error(e: ResolveError) -> ApiError {
+    match e {
+        ResolveError::Unknown(name) => ApiError::not_found(format!("unknown model `{name}`")),
+        e @ ResolveError::WrongFormat { .. } => ApiError::bad_request(e.to_string()),
+        e @ ResolveError::NoArtifactForBackend { .. } => ApiError::not_found(e.to_string()),
     }
 }
 impl From<anyhow::Error> for ApiError {
@@ -1143,7 +1166,8 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         idle_unload_s = opts.idle_unload.map(|d| d.as_secs()),
         allowed_hosts = %if opts.allowed_hosts.is_empty() { "-".to_string() } else { opts.allowed_hosts.join(",") },
         data_dir = %data_dir.display(),
-        runner = %state.engine.resident_runner().display(),
+        backend = %state.engine.backend(),
+        runner = %runner_description(&state.engine),
         pid = std::process::id(),
         "estia serving"
     );
@@ -1209,6 +1233,21 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     }
     result?;
     Ok(())
+}
+
+/// What starts this engine's runners, for the startup log line: the MLX
+/// script, or the llama adapter and the `llama-server` it drives.
+fn runner_description(engine: &Engine) -> String {
+    match engine.backend() {
+        Backend::MlxPython => engine.resident_runner().display().to_string(),
+        Backend::LlamaCpp => {
+            let adapter = engine.config().llama.as_ref().map(|l| l.program.display().to_string()).unwrap_or_else(|| "(none)".into());
+            match engine.llama_server_path() {
+                Ok(server) => format!("{adapter} → {}", server.display()),
+                Err(e) => format!("{adapter} ({e})"),
+            }
+        }
+    }
 }
 
 /// Connection limits for [`serve_router`].

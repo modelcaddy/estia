@@ -14,12 +14,18 @@ Requests:
   {"type":"chat","model_path":"...","messages":[{"role":"user","content":"..."},...],
    "tools":[...OpenAI tool schemas...], "cache_key":"conv-1", "format":{...},
    "max_tokens":256,"temperature":0.2}
-      -> {"text":"...","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N}}
+      -> {"text":"...","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,
+                                "generation_tps":X}}
       messages are rendered through the model's own chat template (system, user,
       assistant, tool roles; tools declared natively where the template supports
-      it). cache_key keeps the KV cache across turns of one conversation so only
-      the new suffix is prefilled. format is accepted and ignored: this runner
-      cannot constrain decoding (capabilities.structured is empty).
+      it). An assistant turn's tool_calls (OpenAI shape, arguments as a JSON
+      string) and the tool results that answer them (role "tool" with
+      tool_call_id) go through the template too, so the model sees its own calls
+      and their results. cache_key keeps the KV cache across turns of one
+      conversation so only the new suffix is prefilled. format is accepted and
+      ignored: this runner cannot constrain decoding (capabilities.structured is
+      empty). Tool calls stay in the text for the client to parse
+      (capabilities.parses_tool_calls is false).
   {"type":"chat_stream", ...same...}
       -> token lines, then {"type":"meta",...}, then {"done": true}
   {"type":"count_tokens","model_path":"...","text":"..."} -> {"tokens":N}
@@ -69,7 +75,7 @@ _GEN_CACHE = {}
 # Protocol v2 identity. Bump RUNNER_VERSION on any behaviour change a client
 # could care about; PROTOCOL is the dialect number from the engine's proto crate.
 RUNNER_NAME = "mlx-python"
-RUNNER_VERSION = "2.1.0"
+RUNNER_VERSION = "2.2.0"
 PROTOCOL = 2
 CAPABILITIES = {
     "generate": True,
@@ -83,6 +89,10 @@ CAPABILITIES = {
     "count_tokens": True,
     # No constrained decoding yet: the engine validates and repairs instead.
     "structured": [],
+    # Tool calls are left in the text; the client parses them.
+    "parses_tool_calls": False,
+    # Part of every embedding fingerprint this runner's vectors carry.
+    "backend": "mlx-python",
 }
 
 # Prompt (KV) caches by (model_path, cache_key). mlx-vlm's PromptCacheState
@@ -317,6 +327,57 @@ def _tokenizer_of(processor):
     return getattr(processor, "tokenizer", processor)
 
 
+def _call_arguments(raw):
+    """A tool call's arguments as a dict when they are a JSON object.
+
+    OpenAI sends them as a JSON string; chat templates (Gemma 4's among them)
+    render a mapping in the model's own call syntax but print a string
+    verbatim, which would show the model a call it never makes. Anything that
+    is not a JSON object is kept as it came."""
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            return raw
+        return parsed if isinstance(parsed, dict) else raw
+    return {} if raw is None else raw
+
+
+def _template_messages(messages):
+    """Messages as chat templates expect them: content always a string,
+    assistant tool_calls OpenAI-shaped with their arguments as a mapping, and
+    tool results kept with the tool_call_id the template uses to name the
+    function they answer."""
+    out = []
+    for i, m in enumerate(messages):
+        msg = {"role": m.get("role", "user"), "content": m.get("content") or ""}
+        for key in ("name", "tool_call_id"):
+            if m.get(key):
+                msg[key] = m[key]
+        calls = []
+        for j, c in enumerate(m.get("tool_calls") or []):
+            f = c.get("function") or {}
+            calls.append({
+                "id": c.get("id") or f"call_{i}_{j}",
+                "type": "function",
+                "function": {"name": f.get("name", ""), "arguments": _call_arguments(f.get("arguments"))},
+            })
+        if calls:
+            msg["tool_calls"] = calls
+        out.append(msg)
+    return out
+
+
+def _call_names(messages):
+    """tool_call_id -> function name, from the assistant turns' tool_calls."""
+    names = {}
+    for m in messages:
+        for c in m.get("tool_calls") or []:
+            if c.get("id"):
+                names[c["id"]] = (c.get("function") or {}).get("name", "")
+    return names
+
+
 def _render_messages(processor, messages, tools):
     """Render an OpenAI-style message list with the model's own chat template.
 
@@ -325,6 +386,7 @@ def _render_messages(processor, messages, tools):
     Gemma-turn fallback used when a bundle has no usable template.
     """
     tok = _tokenizer_of(processor)
+    messages = _template_messages(messages)
     kwargs = {"tokenize": False, "add_generation_prompt": True}
     if tools:
         kwargs["tools"] = tools
@@ -339,6 +401,7 @@ def _render_messages(processor, messages, tools):
     if tools:
         system = "You can call these tools by answering with a JSON object " \
                  "{\"tool_call\": {\"name\": ..., \"arguments\": {...}}}:\n" + json.dumps(tools)
+    names = _call_names(messages)
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "") or ""
@@ -347,9 +410,16 @@ def _render_messages(processor, messages, tools):
             continue
         if role == "assistant":
             role = "model"
+            # The call in the same JSON shape the fallback asks the model for.
+            for c in m.get("tool_calls") or []:
+                call = {"tool_call": {"name": c["function"]["name"], "arguments": c["function"]["arguments"]}}
+                content = (content + "\n" if content else "") + json.dumps(call)
         elif role == "tool":
             role = "user"
-            content = "[tool result" + (f" for {m.get('tool_call_id')}" if m.get("tool_call_id") else "") + f"]\n{content}"
+            call_id = m.get("tool_call_id")
+            name = m.get("name") or names.get(call_id)
+            label = " ".join(x for x in (name, f"({call_id})" if call_id else None) if x)
+            content = "[tool result" + (f" for {label}" if label else "") + f"]\n{content}"
         if system and role == "user":
             content = f"{system}\n\n{content}"
             system = None
@@ -431,7 +501,32 @@ def _stream_core(model, processor, prompt, raw_prompt, max_tokens, temperature, 
             "cached_tokens": getattr(last, "cached_tokens", None),
             "generation_tokens": getattr(last, "generation_tokens", None),
         }
+        # mlx-vlm's GenerationResult carries the decode rate it measured.
+        tps = getattr(last, "generation_tps", None)
+        if isinstance(tps, (int, float)) and not isinstance(tps, bool) and math.isfinite(tps) and tps > 0:
+            meta["generation_tps"] = float(tps)
     return any_emitted, cancelled, meta, None
+
+
+# Gemma 4's template leaves the model's turn open after a tool result
+# (`...<tool_response|>`), for the answer to follow in the same turn. The
+# 4-bit E2B model often ends the turn right there without a word (three of
+# five time-zone questions on 2026-09-26, at every temperature tried). Closing
+# the turn and opening a new model turn got an answer from the result in all
+# three.
+_OPEN_TOOL_TURN = "<tool_response|>"
+_REOPEN_MODEL_TURN = "<turn|>\n<|turn>model\n"
+
+
+def _chat_core(model, processor, prompt, native, max_tokens, temperature, state):
+    """_stream_core, asked once more in a new model turn when the answer after
+    a tool result came back empty."""
+    result = _stream_core(model, processor, prompt, "", max_tokens, temperature, state)
+    any_emitted, cancelled, _meta, error = result
+    if native and not (any_emitted or cancelled or error) and prompt.rstrip().endswith(_OPEN_TOOL_TURN):
+        print("estia-runner: empty answer after a tool result; asking again in a new model turn", file=sys.stderr, flush=True)
+        result = _stream_core(model, processor, prompt + _REOPEN_MODEL_TURN, "", max_tokens, temperature, state)
+    return result
 
 
 def chat_stream_lines(req):
@@ -440,7 +535,7 @@ def chat_stream_lines(req):
     max_tokens = int(req.get("max_tokens") or 256)
     temperature = float(req.get("temperature") or 0.0)
     state = _cache_state(req["model_path"], req.get("cache_key"))
-    any_emitted, cancelled, meta, error = _stream_core(model, processor, prompt, "", max_tokens, temperature, state)
+    any_emitted, cancelled, meta, error = _chat_core(model, processor, prompt, native, max_tokens, temperature, state)
     if cancelled:
         emit({"done": True, "cancelled": True})
         return
@@ -474,8 +569,8 @@ def chat_text(req):
         model, processor = load_gen(req["model_path"])
         prompt, native = _render_messages(processor, req.get("messages") or [], req.get("tools"))
         state = _cache_state(req["model_path"], req.get("cache_key"))
-        any_emitted, cancelled, meta, error = _stream_core(
-            model, processor, prompt, "", int(req.get("max_tokens") or 256),
+        any_emitted, cancelled, meta, error = _chat_core(
+            model, processor, prompt, native, int(req.get("max_tokens") or 256),
             float(req.get("temperature") or 0.0), state)
     finally:
         globals()["emit"] = real_emit

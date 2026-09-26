@@ -8,6 +8,7 @@
 //!
 //! Roles carry sampling defaults and a pin flag. They never carry a prompt.
 
+use crate::models::embed;
 use crate::models::registry::{self, Capability, Format};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -100,13 +101,20 @@ impl Roles {
 
     /// Bind a role, refusing a family that lacks what the role needs or that
     /// the registry does not know. Any role name is accepted; the built-in
-    /// names carry capability requirements, others need `text`.
+    /// names carry capability requirements, others need `text`. `embed`
+    /// binds to an embedding model id (built-in or imported), whose artifact
+    /// for the running backend the engine picks.
     pub fn bind(&mut self, role: &str, binding: RoleBinding) -> Result<(), RoleError> {
         let needed = required_capability(role);
-        if registry::family_has(&binding.family, needed) {
+        let embedding_model = embed::find_embed_model(&binding.family).is_some() && !binding.family.contains('@');
+        let capable = match needed {
+            Capability::Embed => embedding_model,
+            _ => registry::family_has(&binding.family, needed),
+        };
+        if capable {
             self.bindings.insert(role.to_string(), binding);
             Ok(())
-        } else if registry::family_known(&binding.family) {
+        } else if registry::family_known(&binding.family) || embedding_model {
             Err(RoleError::Incapable { role: role.to_string(), family: binding.family, needed })
         } else {
             Err(RoleError::UnknownFamily(binding.family))
@@ -165,9 +173,17 @@ mod tests {
         r.bind("writer", RoleBinding::family("gemma4-12b-qat")).unwrap();
         assert_eq!(r.resolve("writer").unwrap().binding.family, "gemma4-12b-qat");
         assert_eq!(r.bind(CODE, RoleBinding::family("nope")), Err(RoleError::UnknownFamily("nope".into())));
-        // No text-capable embed family exists in the registry today, and the
-        // embed role needs `Embed`, which no generation family has.
+        // The embed role needs an embedding model; generation families are
+        // refused for it, and embedding models for every other role.
         assert!(matches!(r.bind(EMBED, RoleBinding::family("gemma4-e4b")), Err(RoleError::Incapable { .. })));
+        r.bind(EMBED, RoleBinding::family("nomic-embed-text-v1.5")).unwrap();
+        assert_eq!(r.get(EMBED).unwrap().family, "nomic-embed-text-v1.5");
+        assert!(matches!(r.bind(TEXT, RoleBinding::family("nomic-embed-text-v1.5")), Err(RoleError::Incapable { .. })));
+        assert_eq!(
+            r.bind(EMBED, RoleBinding::family("nomic-embed-text-v1.5@mlx-python")),
+            Err(RoleError::UnknownFamily("nomic-embed-text-v1.5@mlx-python".into())),
+            "a fingerprint is not a model id"
+        );
         assert!(r.unbind("writer").is_some());
         assert!(r.unbind("writer").is_none());
     }

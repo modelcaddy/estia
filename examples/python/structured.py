@@ -2,10 +2,10 @@
 """Pull structured data out of free text with a JSON Schema.
 
 What it shows:
-  - `response_format` with `json_schema`: the engine checks the model's output
-    against the schema, repairs common defects and retries once
-  - putting the schema in the prompt: the engine validates after generation
-    and does not show the schema to the model
+  - `response_format` with `json_schema`: the model is held to the schema
+    (llama.cpp constrains decoding to it; on MLX the engine shows it to the
+    model in the system prompt), and the engine checks the output against
+    it, repairs common defects and retries once
   - `x_estia.repaired` and `x_estia.repairs`: what the engine had to fix
   - the typed error: output that still fails the schema is a 422 with type
     `invalid_request_error`, raised by the SDK as UnprocessableEntityError
@@ -75,14 +75,9 @@ def explain(e: Exception) -> str:
 
 
 def extract(client: OpenAI, text: str, schema: dict) -> dict:
-    # Estia validates the answer against the schema but does not show the
-    # schema to the model (the MLX backend cannot constrain decoding). Put the
-    # shape in the prompt yourself, or the model has to guess field names.
-    system = (
-        "Extract the event described in the user's text. "
-        "Answer with one JSON object that matches this JSON Schema, and nothing else:\n"
-        + json.dumps(schema)
-    )
+    # Say what to do; the schema itself travels in response_format and the
+    # engine makes sure the model sees it.
+    system = "Extract the event described in the user's text."
     r = client.chat.completions.create(
         model=MODEL,
         messages=[
