@@ -1,0 +1,67 @@
+# cargo-about configuration for THIRD_PARTY_LICENSES, which ships in the
+# release tarball: the licence text of every crate linked into the `estia`
+# binary, with the crates that use it. .github/scripts/third-party-licenses.sh
+# generates it (CI runs it on every pull request, the release workflow when it
+# packages) and fails when a licence text is missing or unverified.
+#
+# `accepted` mirrors the `allow` list in deny.toml; keep the two in step.
+# When a crate offers a choice (`MIT OR Apache-2.0`), the first licence in this
+# list that it offers is the one reproduced, so MIT comes first.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "Unlicense",
+]
+
+# The only release target. Build and dev dependencies are not in the binary.
+targets = ["aarch64-apple-darwin"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# These crates are MIT but ship no licence file in their .crate, so without a
+# clarification cargo-about falls back to the bare SPDX text and loses their
+# copyright line. Each entry fetches LICENSE from the upstream repository at
+# the commit the crate was published from (its .cargo_vcs_info.json) and checks
+# it against this SHA-256. When a version bump changes the file, the script
+# fails until the checksum here is updated.
+[jsonschema.clarify]
+license = "MIT"
+[[jsonschema.clarify.git]]
+path = "LICENSE"
+checksum = "0f614c290631feb320f6c0d54c72fc0f85b17ca6d6dc0b5a3383ea7de3e9dc69"
+
+[referencing.clarify]
+license = "MIT"
+[[referencing.clarify.git]]
+path = "LICENSE"
+checksum = "0f614c290631feb320f6c0d54c72fc0f85b17ca6d6dc0b5a3383ea7de3e9dc69"
+
+[uuid-simd.clarify]
+license = "MIT"
+[[uuid-simd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+[vsimd.clarify]
+license = "MIT"
+[[vsimd.clarify.git]]
+path = "LICENSE"
+checksum = "71674605ec4c087fe9eb534e3e4f9e26eb2e4aabcd76a29fd156c6a844d44b3d"
+
+# num-cmp puts a public-domain dedication, CC0, MIT and Apache-2.0 in one file
+# that cargo-about cannot identify, so it would print the bare MIT template.
+# Reproduce the crate's own file instead.
+[num-cmp.clarify]
+license = "MIT"
+[[num-cmp.clarify.files]]
+path = "LICENSE.txt"
+checksum = "3bb1e548250b3acc43febde65a5cdba9f2e0a3288018aa41f009a3c59ffab51a"

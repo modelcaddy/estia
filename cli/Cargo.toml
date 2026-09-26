@@ -3,8 +3,12 @@ name = "estia"
 description = "Estia command-line tool: setup, service, serve, pairing, models, run, chat, embed, bench."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "inference", "mlx", "openai", "estia"]
+categories = ["artificial-intelligence", "command-line-utilities"]
 
 [[bin]]
 name = "estia"
@@ -20,3 +24,4 @@ serde_json.workspace = true
 tokio.workspace = true
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 log = "0.4"
+libc = "0.2"

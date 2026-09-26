@@ -179,4 +179,5 @@ These live in `engine/src/session.rs`:
 A minimal resident runner answers `ping`, `hello` (declare only what you
 implement), and the requests its capabilities promise. The server's tests use
 a stdlib-only Python fake that does exactly this; see `FAKE` in
-`server/tests/api.rs` and `engine/tests/fake_runner.rs`.
+`server/tests/api.rs`, and the `V2` and `V2_CHAT` runners in
+`engine/tests/fake_runner.rs`.

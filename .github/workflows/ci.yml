@@ -29,14 +29,16 @@ jobs:
       - run: cargo fmt --all --check
 
   test:
-    # macos-14 is Apple Silicon, where the MLX backend runs. Linux has no
+    # macos-15 is Apple Silicon (arm64), where the MLX backend runs. It is
+    # pinned rather than macos-latest so the image cannot move under us; move
+    # it to the next version before GitHub retires this one. Linux has no
     # backend yet, but the workspace must still build and pass its tests there.
     # The tests drive a fake runner written in Python; both images ship python3.
     name: test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-latest]
+        os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -51,6 +53,54 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test
         run: cargo test --workspace --locked
+
+  msrv:
+    # The oldest Rust the workspace claims to build with: `rust-version` in
+    # the root Cargo.toml.
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the minimum supported Rust
+        run: |
+          msrv="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$msrv"
+          rustup toolchain install "$msrv" --profile minimal
+          rustup default "$msrv"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  package:
+    # Every crate must carry LICENSE and NOTICE (Apache-2.0 section 4), which
+    # reach each crate as symlinks to the root files, and must build from its
+    # own .crate. The release tarball's THIRD_PARTY_LICENSES must build too, so
+    # a new dependency without a usable licence file fails here rather than at
+    # release time.
+    name: licences and packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - name: THIRD_PARTY_LICENSES
+        run: bash .github/scripts/third-party-licenses.sh "$RUNNER_TEMP/THIRD_PARTY_LICENSES"
+      - name: LICENSE and NOTICE in every crate
+        run: |
+          set -euo pipefail
+          for crate in estia-proto estia-engine estia-server estia; do
+            files="$(cargo package --list --locked -p "$crate")"
+            for f in LICENSE NOTICE README.md; do
+              grep -qxF "$f" <<<"$files" || { echo "$crate does not package $f" >&2; exit 1; }
+            done
+          done
+      - name: Package and build every crate
+        run: cargo package --workspace --locked
 
   deny:
     # Licences, bans, sources and RustSec advisories. Policy: deny.toml.

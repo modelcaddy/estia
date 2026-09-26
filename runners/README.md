@@ -80,18 +80,24 @@ The `estia` CLI looks for the script in this order (`find_runner` in
 
 1. `--runner <path>`, or the `ESTIA_RUNNER` environment variable.
 2. `runners/mlx-python/estia-runner.py` next to the `estia` binary.
-3. The same path two directories above the binary. This finds the script
-   when the binary is `target/debug/estia` or `target/release/estia` in this
+3. The same path two directories above the binary, only when the binary is
+   in a cargo `target/<profile>/` directory. This finds the script when the
+   binary is `target/debug/estia` or `target/release/estia` in this
    repository.
-4. The same path relative to the current directory.
-5. Otherwise, the copy compiled into the binary, written to
+4. Otherwise, the copy compiled into the binary, written to
    `<data_dir>/engine/runners/mlx-python/estia-runner.py` (and rewritten when
    the binary's copy changes). This is what a `cargo install`ed binary uses.
+
+The current directory is never searched: running `estia` inside a folder you
+downloaded must not execute a script that folder contains. The compiled-in
+copy comes from `cli/estia-runner.py`, a symbolic link to
+`mlx-python/estia-runner.py` that keeps the script inside the `estia` crate's
+package.
 
 The interpreter is `--python` or `ESTIA_PYTHON` if set, else the installed
 runtime's `<data_dir>/runtime/python/bin/python3`, else `python3` on `PATH`.
 `estia runtime install` (and `estia setup`) installs that runtime: a
-standalone Python 3.12 with `mlx-vlm` and `mlx-embeddings`.
+standalone Python 3.12 with `mlx-vlm`, `mlx-lm` and `mlx-embeddings`.
 
 `estia status` shows the runner and interpreter it found. `estia runner-check`
 does the `hello` handshake without loading a model.

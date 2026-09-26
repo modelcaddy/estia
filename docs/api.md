@@ -28,7 +28,46 @@ by `estia setup` or the first `estia serve`, or through pairing.
 
 A missing or unknown token gets `401`; a token without the needed scope gets
 `403`. `estia serve --no-auth` turns authentication off, and is refused unless
-the server is bound to loopback.
+the server is bound to loopback. A revoked token (`estia token revoke`, or a
+denied pairing) gets `401` from the next request on; the server re-reads
+`tokens.json` and needs no restart.
+
+## Host and Origin checks
+
+Before authentication, on every route including health, pairing, `/client`
+and unknown paths, the server checks where a request is addressed:
+
+- **`Host`** must be an IP literal (v4 or v6, any port), `localhost` or
+  `*.localhost`, a `*.local` name, this machine's hostname (short or fully
+  qualified), or a name allowed with `estia serve --allow-host <name>` or
+  `ESTIA_ALLOWED_HOSTS=<name>,<name>`. In both, a port is ignored,
+  `*.example.com` allows the subdomains of `example.com` but not the name
+  itself, and `*` disables the check. A request with no `Host` at all (not a
+  browser) is let through.
+- **`Origin`**, when present on a request other than GET, HEAD or OPTIONS,
+  must have the same scheme, host and port as the request's `Host` (default
+  ports filled in). `Origin: null` never matches.
+
+Either failure is a `403` with type `permission_error`; the message for an
+unknown host says how to allow it. This blocks DNS rebinding (a site pointing
+its own name at the engine) and cross-site form posts. Clients that reach the
+engine by IP address or `.local` name and send no `Origin`, which covers the
+SDKs, curl and `RemoteEngine`, are unaffected. A reverse proxy must forward the
+original `Host`, or its own name must be allowed.
+
+## Limits
+
+| Limit | Value | Over it |
+|---|---|---|
+| `max_tokens` / `max_completion_tokens` | 8192 | Lowered to 8192 |
+| `max_attempts` on `/engine/generate` | 3 | Held to 1–3 |
+| Inputs per `/v1/embeddings` or `/engine/embed` request | 256 | 400 |
+| Pending pairing requests | 24 overall, 4 per client address | 429, type `rate_limit_error` |
+| Time to send a request's headers | 10 s | Connection closed; also closes a keep-alive connection idle that long |
+| Open connections per client address | 32 (IPv6 counted per /64; loopback exempt) | New connections are closed at once |
+| Open connections in total | Below the open-files limit, which the server raises at start (at most 4096) | New connections wait in the listen backlog |
+
+The server speaks HTTP/1.1 only.
 
 ## Routes
 
@@ -36,7 +75,7 @@ the server is bound to loopback.
 |---|---|---|---|
 | POST | `/v1/chat/completions` | `generate` | Chat completion, streaming or not |
 | POST | `/v1/embeddings` | `embed` | Embeddings |
-| GET | `/v1/models` | `models:read` | Bound roles, then generation and embedding models |
+| GET | `/v1/models` | `models:read` | Roles from the role table, then generation and embedding models |
 | GET | `/engine/health` | none | Version, bind address, auth, backends, loaded models |
 | GET | `/engine/defaults` | `models:read` | The role table |
 | PUT | `/engine/defaults` | `admin` | Replace the role table (applied now, saved to `config.json`) |
@@ -55,9 +94,13 @@ the server is bound to loopback.
 | GET | `/engine/pair/{id}` | none | Poll a pairing request; returns the token once |
 | GET | `/engine/pairings` | `admin` | Pending and recent pairing requests |
 | POST | `/engine/pairings/{id}/approve` | `admin` | Approve: mint a token with the requested scopes |
-| POST | `/engine/pairings/{id}/deny` | `admin` | Deny |
+| POST | `/engine/pairings/{id}/deny` | `admin` | Deny a pending request, or take back an approved one and revoke its token |
 | GET | `/client` | none | The browser test client (a static page) |
+| GET | `/client/` | none | Redirects (308) to `/client` |
 | GET | `/` | none | Redirects to `/client` |
+
+Any other path gets a `404` in the error shape below, with or without a
+token.
 
 Model ids, families and roles are explained in the README under
 [Roles](../README.md#roles). Wherever a generation request takes `model`, it
@@ -74,12 +117,13 @@ Errors raised by the handlers use OpenAI's shape:
 
 | Status | When |
 |---|---|
-| 400 | Empty `messages` or `input`, neither `prompt` nor `messages`, unknown `response_format` type or embedding `task`, unknown scope, empty pairing name, a pairing that cannot be approved or denied |
-| 401 | Missing or unknown token |
-| 403 | Token lacks the scope |
-| 404 | Unknown model, model not downloaded, unknown job, unknown pairing id on poll |
+| 400 | Empty `messages` or `input`, more than 256 embedding inputs, neither `prompt` nor `messages`, unknown `response_format` type or embedding `task`, unknown scope, a pairing name that breaks the [name rules](#pairing), an unknown pairing id on approve or deny, a pairing that cannot be approved or denied |
+| 401 | Missing, unknown or revoked token |
+| 403 | Token lacks the scope; `Host` not allowed or cross-origin write (type `permission_error`, see [Host and Origin checks](#host-and-origin-checks)) |
+| 404 | Unknown path, unknown model, model not downloaded, unknown job, unknown pairing id on poll |
 | 422 | Structured output still invalid after the retry; embedding fingerprint mismatch |
-| 500 | Runner failure |
+| 429 | `POST /engine/pair` while 24 requests are pending, or 4 from the same address (type `rate_limit_error`) |
+| 500 | Runner failure; the pairing store could not be read or written (details in the server's log) |
 
 A body that is not JSON, lacks `Content-Type: application/json`, or does not
 fit the route's fields is rejected before the handler runs, with a plain-text
@@ -95,7 +139,7 @@ Supported request fields:
 | `messages` | `system`, `user`, `assistant`, `tool`. `content` may be a string or an array of parts. Text parts are joined. Other parts, such as images, are replaced by a marker like `[image_url omitted]`: image input is not passed to the model yet. An assistant message's `tool_calls` are passed back to the model as JSON text. |
 | `tools` | OpenAI tool schemas. The model answers in its own call syntax and the server converts it to `tool_calls`. Gemma 4's native syntax and a `{"tool_call": {"name", "arguments"}}` object are recognised. |
 | `response_format` | `text`, `json_object`, or `json_schema` with `json_schema.schema`. See [Structured output](#structured-output). |
-| `max_completion_tokens`, `max_tokens` | Default 1024 |
+| `max_completion_tokens`, `max_tokens` | Default 1024, at most 8192 (larger values are lowered) |
 | `temperature` | Default 0.2 |
 | `stream` | Server-sent events, ending with `data: [DONE]` |
 | `user` | Used as the prompt-cache key |
@@ -109,6 +153,12 @@ so a conversation that grows by appending only prefills its new turns. The key
 is `user` when given. Otherwise the server derives one from the model, the
 leading system messages and the first user message, which stays the same for
 every turn of a conversation.
+
+Cache entries belong to the token that made them: the server combines the key
+with a hash of the caller's token before it reaches the runner. Two tokens that
+send the same `user`, or the same opening messages, never share an entry, so
+`cached_tokens` cannot tell one client anything about another's conversation.
+With `--no-auth` every request shares one namespace.
 
 **Response.** Standard fields, plus:
 
@@ -131,7 +181,7 @@ generation is cancelled in the runner.
 | Field | Notes |
 |---|---|
 | `model` | `embed` (currently `embeddinggemma-300m-4bit`) or an embedding model id |
-| `input` | A string or an array of strings |
+| `input` | A string or an array of at most 256 strings |
 | `task` | Estia extension: `document` (default), `query`, `clustering`, or `none`. The model's own prefix for that task is prepended. `none` sends the inputs unchanged. |
 | `expect_fingerprint` | Estia extension: refuse with 422 unless the server would produce vectors with this fingerprint |
 | `priority` | Estia extension: `interactive` (default) or `background` |
@@ -147,18 +197,22 @@ send it back as `expect_fingerprint`.
 
 ## GET /v1/models
 
-Bound roles come first, each with `x_estia: {"role": true, "family": …}`. Then
-every generation model (`x_estia`: `family`, `format`, `installed`,
-`context_length`) and every embedding model (`x_estia`: `kind`, `dims`,
-`installed`). Models that are not downloaded are listed too; check
-`installed`.
+The roles in the role table come first, each with
+`x_estia: {"role": true, "family": …}`. These are the generation roles
+(`text`, `fast`, `vision` and any others bound with `estia roles set` or
+`PUT /engine/defaults`). `embed` is not listed as a role: it is fixed to
+`embeddinggemma-300m-4bit` and is not in the table, but `"model": "embed"`
+works on the embedding routes. Then come every generation model (`x_estia`:
+`family`, `format`, `installed`, `context_length`) and every embedding model
+(`x_estia`: `kind`, `dims`, `installed`). Models that are not downloaded are
+listed too; check `installed`.
 
 ## GET /engine/health
 
 Open, so clients can check an engine before they have a token.
 
 ```json
-{"ok": true, "engine": "estia", "version": "0.0.1", "api_version": 1, "protocol_version": 2,
+{"ok": true, "engine": "estia", "version": "0.1.0", "api_version": 1, "protocol_version": 2,
  "bind": "127.0.0.1:27200", "auth_required": true, "uptime_s": 3,
  "backends": [{"id": "mlx-python", "runtime_installed": false}], "loaded": []}
 ```
@@ -221,10 +275,10 @@ OpenAI's envelope.
 | `model` | Default `text` |
 | `prompt` or `messages` | One is required. The runner treats `prompt` as a single user turn. `messages` go through the model's chat template and get tools, the prompt cache and token counts. |
 | `tools` | As in chat completions (with `messages`) |
-| `cache_key` | Prompt-cache key; derived from `messages` when absent |
+| `cache_key` | Prompt-cache key; derived from `messages` when absent. Scoped to the caller's token, as in chat completions. |
 | `format` | Same shape as OpenAI's `response_format` |
-| `max_attempts` | For structured output. Default 2, which is one retry. |
-| `max_tokens`, `temperature`, `priority`, `stream` | As above. Streaming is ignored when `format` asks for JSON. |
+| `max_attempts` | For structured output. Default 2, which is one retry; held between 1 and 3. |
+| `max_tokens`, `temperature`, `priority`, `stream` | As above (`max_tokens` at most 8192). Streaming is ignored when `format` asks for JSON. |
 
 Response:
 
@@ -244,7 +298,7 @@ Response:
 | Field | Notes |
 |---|---|
 | `model` | Default `embed` |
-| `inputs` | A string or an array of strings |
+| `inputs` | A string or an array of at most 256 strings |
 | `task`, `expect_fingerprint`, `priority` | As in `/v1/embeddings` |
 
 Response: `{"vectors": [[…]], "fingerprint": …, "model": …, "dims": …, "task": …,
@@ -279,10 +333,35 @@ GET /engine/pair/{id}             ──►    {"status": "approved", "token": n
 ```
 
 `scopes` defaults to `generate`, `embed`, `models:read`. Unknown scopes are
-refused. At most 24 requests may be pending at once. The token is returned on
-the first poll after approval and never again. The operator decides with the
-CLI on the engine's machine (it edits the data directory directly and needs no
-token) or through the `admin` routes above.
+refused with 400; a scope listed twice counts once.
+
+`name` is trimmed and must then be 1 to 64 characters of: letters and digits
+in any script, single spaces, and `. _ - ' ’ ( )`. Control characters, escape
+sequences, invisible and bidi formatting characters, emoji, colons and runs of
+spaces are refused with 400 rather than stripped. The operator reads names in
+a terminal, and the token an approval mints is named `pair:<name>:<id>`.
+
+At most 24 requests may be pending at once, and at most 4 from one client
+address. Past either cap a new request gets 429 (`rate_limit_error`) until one
+is approved, denied or expires. Expired requests do not count.
+
+The token is returned on the first poll after approval and never again. A
+poll can return 500 if the engine cannot read or write `pairings.json`;
+retry it, since the token is only handed out once its collection is saved.
+
+The operator decides with the CLI on the engine's machine (it edits the data
+directory directly and needs no token) or through the `admin` routes above.
+`estia pair approve` refuses a request for `admin` unless given
+`--allow-admin`; the approve route itself grants exactly the requested scopes.
+
+`POST /engine/pairings/{id}/deny` on a pending request denies it. On an
+approved request it also revokes the minted token, whether or not the device
+has collected it, and answers
+`{"id", "name", "status": "denied", "revoked": true, "token_name": "pair:<name>:<id>"}`.
+Denying twice changes nothing. `GET /engine/pairings` rows carry `revoked`
+too. A pairing is dropped from the store 5 minutes after it was requested (10
+if an approved token is still uncollected); denying it after that is a 400
+that points to `estia token revoke`.
 
 ## Clients
 
@@ -291,5 +370,5 @@ token) or through the `admin` routes above.
 - Rust: `estia_engine::RemoteEngine`, with `RemoteGen` and `RemoteEmbed`,
   talks to a daemon through the `/engine/*` routes with the same method shapes
   as local sessions.
-- Browser: `/client`, source in `clients/web/index.html`, uses only the routes
-  above.
+- Browser: `/client`, source in `server/client/index.html`, uses only the
+  routes above.

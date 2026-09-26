@@ -156,9 +156,10 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = 27200)]
         port: u16,
-        /// Address to bind. Anything but loopback needs --lan.
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: String,
+        /// Address to bind (default 127.0.0.1, or 0.0.0.0 with --lan). Anything
+        /// but loopback needs --lan.
+        #[arg(long)]
+        bind: Option<String>,
         /// Serve the LAN: binds 0.0.0.0 unless --bind says otherwise, requires
         /// auth (clients pair for a token), advertises over Bonjour.
         #[arg(long)]
@@ -175,6 +176,12 @@ enum Cmd {
         /// Release a resident model after this many idle minutes (0 = never).
         #[arg(long, default_value_t = 15)]
         idle_unload_minutes: u64,
+        /// Also accept requests whose Host header names this host (repeatable,
+        /// or comma-separated): a reverse proxy's name, or a LAN name such as
+        /// `mac.lan`. IP literals, `localhost` and `<name>.local` are always
+        /// accepted.
+        #[arg(long = "allow-host", value_name = "NAME", value_delimiter = ',')]
+        allow_host: Vec<String>,
     },
     /// Pairing: approve LAN clients (operator side) or request a token (client side).
     Pair {
@@ -212,6 +219,10 @@ enum ServiceAction {
         /// Loopback only (no LAN, no pairing needed for local clients with a token).
         #[arg(long)]
         local: bool,
+        /// Passed to `serve --allow-host`: extra Host names the service
+        /// answers to (repeatable, or comma-separated).
+        #[arg(long = "allow-host", value_name = "NAME", value_delimiter = ',')]
+        allow_host: Vec<String>,
     },
     Uninstall,
     Start,
@@ -241,6 +252,10 @@ enum PairAction {
         engine: Option<String>,
         #[arg(long)]
         token: Option<String>,
+        /// Approve a request that asks for the `admin` scope (full control of
+        /// the engine). Without it such a request is refused.
+        #[arg(long)]
+        allow_admin: bool,
     },
     Deny {
         id: String,
@@ -265,12 +280,16 @@ enum PairAction {
 
 #[derive(Subcommand)]
 enum TokenAction {
-    /// Mint a token; the plaintext is printed once.
+    /// Mint a token; the plaintext is printed once. Names are unique.
     New {
         name: String,
-        /// Scopes: generate, embed, models:read, models:write, admin. Default admin.
+        /// Scopes: generate, embed, models:read, models:write, admin. Default admin
+        /// (with --replace: the replaced token's scopes).
         #[arg(long, value_delimiter = ',')]
         scopes: Option<Vec<String>>,
+        /// Rotate an existing token of this name: the previous one stops working now.
+        #[arg(long)]
+        replace: bool,
     },
     List,
     Revoke {
@@ -323,8 +342,21 @@ fn default_data_dir() -> PathBuf {
 
 /// The resident runner, compiled in so an installed binary (`cargo install`,
 /// a release tarball without its `runners/` folder) still has one.
-const EMBEDDED_RUNNER: &str = include_str!("../../runners/mlx-python/estia-runner.py");
+/// `cli/estia-runner.py` is a symlink to `runners/mlx-python/estia-runner.py`,
+/// so the script is inside this crate and ships in its package.
+const EMBEDDED_RUNNER: &str = include_str!("../estia-runner.py");
 
+/// The runner script, by the first rule that finds one:
+///
+/// 1. `--runner` / `ESTIA_RUNNER`.
+/// 2. `runners/mlx-python/estia-runner.py` beside the binary: a release
+///    tarball, or what `service install` stages.
+/// 3. The same path two levels up, only when the binary sits in a cargo
+///    `target/<profile>/` directory: `target/debug/estia` in a checkout.
+/// 4. The compiled-in copy, written to `<data_dir>/engine/runners/`.
+///
+/// Never the current directory: running `estia` inside a downloaded or cloned
+/// folder must not execute a script that folder happens to contain.
 fn find_runner(explicit: Option<PathBuf>, data_dir: &Path) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p);
@@ -333,14 +365,12 @@ fn find_runner(explicit: Option<PathBuf>, data_dir: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // Installed layout: runners beside the binary (a release tarball,
-            // or what `service install` stages). Dev layout: target/debug/ is
-            // two levels below the repo root.
             candidates.push(dir.join(REL));
-            candidates.push(dir.join("../..").join(REL));
+            if dir.parent().and_then(Path::file_name).is_some_and(|n| n == "target") {
+                candidates.push(dir.join("../..").join(REL));
+            }
         }
     }
-    candidates.push(PathBuf::from(REL));
     if let Some(found) = candidates.into_iter().find(|p| p.exists()).and_then(|p| p.canonicalize().ok()) {
         return Some(found);
     }
@@ -421,6 +451,71 @@ impl Ctx {
     }
 }
 
+// ── Printing text this process did not write ──────────────────────────────────
+
+/// True for characters that can steer a terminal or hide what it shows: C0
+/// and C1 controls (ESC opens every escape sequence, CR rewrites the line),
+/// bidi embeddings, overrides and isolates, zero-width and other invisible
+/// format characters, the Unicode line and paragraph separators, and tag
+/// characters.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
+}
+
+/// `s` with each unsafe character (see [`is_unsafe_char`]) written as a
+/// visible escape — `\u{1b}`, `\r`, `\u{202e}` — and everything else as is,
+/// apostrophes and non-Latin letters included.
+///
+/// Every string that reached this process from outside goes through this
+/// before it is printed: pairing and token names (chosen by whoever sent the
+/// pairing request), anything a remote engine or an mDNS answer said, error
+/// text built from those. A pairing name ending in `ESC[8m` once hid the
+/// `admin` scope printed after it.
+fn safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if is_unsafe_char(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// [`safe`], line by line: line breaks are kept (errors quote runner output
+/// and tracebacks), every other unsafe character is escaped.
+fn safe_lines(s: &str) -> String {
+    s.split('\n').map(safe).collect::<Vec<_>>().join("\n")
+}
+
+/// A JSON value from an engine as printable text: a string escaped by
+/// [`safe`], `?` for a missing value, anything else in its JSON form.
+fn jtext(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => safe(s),
+        serde_json::Value::Null => "?".into(),
+        other => safe(&other.to_string()),
+    }
+}
+
+/// A JSON array of strings from an engine, each escaped.
+fn jlist(v: &serde_json::Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().filter_map(|x| x.as_str()).map(safe).collect()
+}
+
 fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
 }
@@ -430,7 +525,7 @@ fn print_progress(p: estia_engine::models::DownloadProgress) {
         Some(t) if t > 0 => format!("{:>3}%", p.bytes_downloaded * 100 / t),
         _ => "    ".to_string(),
     };
-    eprint!("\r{:<12} {pct} {} {}                    ", p.phase, gb(p.bytes_downloaded), p.file_name.as_deref().unwrap_or(""));
+    eprint!("\r{:<12} {pct} {} {}                    ", p.phase, gb(p.bytes_downloaded), safe(p.file_name.as_deref().unwrap_or("")));
     if p.phase == "complete" {
         eprintln!();
     }
@@ -513,7 +608,7 @@ fn status(ctx: &Ctx) -> Result<()> {
         Some(rec) => {
             let health = reqwest_blocking()
                 .ok()
-                .and_then(|c| c.get(format!("http://127.0.0.1:{}/engine/health", rec.port)).send().ok())
+                .and_then(|c| c.get(format!("{}/engine/health", local_url(&rec.bind, rec.port))).send().ok())
                 .and_then(|r| r.json::<serde_json::Value>().ok());
             let up = health
                 .as_ref()
@@ -523,16 +618,17 @@ fn status(ctx: &Ctx) -> Result<()> {
             let loaded = health
                 .as_ref()
                 .and_then(|h| h["loaded"].as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .map(|a| a.iter().filter_map(|x| x.as_str()).map(safe).collect::<Vec<_>>().join(", "))
                 .unwrap_or_default();
-            println!("daemon   : running · pid {} · {}:{} · up {up} · loaded [{loaded}]", rec.pid, rec.bind, rec.port);
-            if rec.bind == "0.0.0.0" {
+            println!("daemon   : running · pid {} · {} · up {up} · loaded [{loaded}]", rec.pid, host_port(&rec.bind, rec.port));
+            if rec.bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
                 for ip in lan_ips() {
-                    println!("  reach it: http://{ip}:{}   (clients: estia pair request --engine http://{ip}:{})", rec.port, rec.port);
+                    let url = http_url(&ip, rec.port);
+                    println!("  reach it: {url}   (clients: estia pair request --engine {url})");
                 }
             }
         }
-        None => println!("daemon   : not running  (estia serve --lan, or estia service install)"),
+        None => println!("daemon   : not running  (estia serve: this machine only · estia serve --lan: let other devices pair)"),
     }
     let pending: Vec<_> = estia_server::pairing::PairingStore::new(&ctx.data_dir)
         .list()
@@ -581,7 +677,7 @@ fn roles(ctx: &mut Ctx, action: Option<RolesAction>) -> Result<()> {
                 ctx.save_roles()?;
                 println!("{role} unbound");
             }
-            None => println!("{role} was not bound"),
+            None => return Err(anyhow!("role `{role}` was not bound; nothing removed")),
         },
     }
     Ok(())
@@ -902,22 +998,24 @@ fn tokens(ctx: &Ctx, model: &str) -> Result<()> {
 async fn serve(
     ctx: &Ctx,
     port: u16,
-    bind: &str,
+    bind: Option<&str>,
     lan: bool,
     no_advertise: bool,
     name: Option<String>,
     no_auth: bool,
     idle_unload_minutes: u64,
+    allow_host: Vec<String>,
 ) -> Result<()> {
     use estia_server::{tokens::TokenStore, AppState, ServeOptions};
+    // An explicit --bind always wins; only the default follows --lan.
+    let bind = bind.unwrap_or(if lan { "0.0.0.0" } else { "127.0.0.1" });
+    let addr = parse_bind(bind, port)?;
     let engine = std::sync::Arc::new(ctx.engine()?);
     let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
     if !no_auth && tokens.is_empty() {
         let t = tokens.mint("local", &[estia_server::tokens::SCOPE_ADMIN])?;
         eprintln!("minted the first token (name `local`, scope admin). Shown once — keep it:\n\n  {t}\n\n  Authorization: Bearer {t}\n");
     }
-    let bind = if lan && bind == "127.0.0.1" { "0.0.0.0" } else { bind };
-    let addr: std::net::SocketAddr = format!("{bind}:{port}").parse().context("bad --bind/--port")?;
     let state = std::sync::Arc::new(AppState::new(engine, tokens, !no_auth, addr));
     if no_auth {
         eprintln!("warning: --no-auth — every loopback process can use this engine");
@@ -928,7 +1026,54 @@ async fn serve(
         );
     }
     let idle_unload = if idle_unload_minutes == 0 { None } else { Some(std::time::Duration::from_secs(idle_unload_minutes * 60)) };
-    estia_server::serve(state, ctx.data_dir.clone(), ServeOptions { lan, advertise: lan && !no_advertise, name, idle_unload }).await
+    estia_server::serve(
+        state,
+        ctx.data_dir.clone(),
+        ServeOptions { lan, advertise: lan && !no_advertise, name, idle_unload, allowed_hosts: allow_host },
+    )
+    .await
+}
+
+/// `--bind` as an address: an IP literal (IPv6 with or without brackets),
+/// `localhost`, or a host name that resolves (IPv4 preferred).
+fn parse_bind(bind: &str, port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+    let bare = bind.strip_prefix('[').and_then(|b| b.strip_suffix(']')).unwrap_or(bind);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    if bind.eq_ignore_ascii_case("localhost") {
+        return Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    }
+    let addrs: Vec<SocketAddr> = (bind, port)
+        .to_socket_addrs()
+        .with_context(|| format!("--bind `{bind}` is neither an IP address nor a host name that resolves"))?
+        .collect();
+    addrs.iter().find(|a| a.is_ipv4()).or(addrs.first()).copied().ok_or_else(|| anyhow!("--bind `{bind}` resolves to no address"))
+}
+
+/// `host:port`, with an IPv6 literal in brackets.
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        // A zone (`fe80::1%en0`) is written `%25` inside a URL.
+        format!("[{}]:{port}", host.replace('%', "%25"))
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn http_url(host: &str, port: u16) -> String {
+    format!("http://{}", host_port(host, port))
+}
+
+/// The URL that reaches, from this machine, a daemon bound to `bind`:
+/// the wildcard addresses are reached through loopback.
+fn local_url(bind: &str, port: u16) -> String {
+    match bind.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) if ip.is_unspecified() => http_url("127.0.0.1", port),
+        Ok(std::net::IpAddr::V6(ip)) if ip.is_unspecified() => http_url("::1", port),
+        _ => http_url(bind, port),
+    }
 }
 
 async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
@@ -948,7 +1093,7 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
         println!("… runtime  : installing Python + MLX (~700 MB, several minutes)");
         ctx.runtime.preflight(estia_engine::runtime::RUNTIME_APPROX_BYTES)?;
         let summary =
-            ctx.runtime.install(|p| eprint!("\r  {:<32} {:<60}", p.phase, p.message.chars().take(60).collect::<String>())).await?;
+            ctx.runtime.install(|p| eprint!("\r  {:<32} {:<60}", p.phase, safe(&p.message.chars().take(60).collect::<String>()))).await?;
         eprintln!();
         println!("✓ runtime  : python {} / mlx-lm {}", summary.python_version, summary.mlx_lm_version);
     }
@@ -1001,7 +1146,16 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool) -> Result<()> {
     if ctx.runner().is_none() {
         println!("! runner   : estia-runner.py not found — pass --runner or set ESTIA_RUNNER");
     }
-    println!("\nnext:\n  estia service install          run at login, on the LAN, with pairing\n  estia serve --lan              or run it by hand\n  estia status · estia dashboard\n  from another device: estia discover · estia pair request --engine http://<this-mac>:27200");
+    println!(
+        "\nnext:
+  estia serve                    run it now, for this machine only (loopback)
+  estia service install --local  or run it at login, loopback only
+  estia status · estia dashboard
+
+  to let other devices on your network use it (plain HTTP; each device pairs for a token):
+  estia serve --lan              or: estia service install
+  from the other device: estia discover · estia pair request --engine http://<this-mac>:27200"
+    );
     Ok(())
 }
 
@@ -1101,21 +1255,21 @@ fn stage_install(data_dir: &Path, runner: &Path) -> Result<(PathBuf, PathBuf)> {
 fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
     let logs = ctx.data_dir.join("logs");
     match action {
-        ServiceAction::Install { port, local } => {
+        ServiceAction::Install { port, local, allow_host } => {
+            // Checked before anything is staged: every path below lives under it.
+            service_path(&ctx.data_dir)?;
             std::fs::create_dir_all(&logs)?;
             let runner = ctx
                 .runner()
                 .ok_or_else(|| anyhow!("no runner script found — pass --runner or set ESTIA_RUNNER before installing the service"))?;
             let (exe, runner) = stage_install(&ctx.data_dir, &runner)?;
+            let (exe_s, runner_s, data_s) = (service_path(&exe)?, service_path(&runner)?, service_path(&ctx.data_dir)?);
             println!("staged {} and {}", exe.display(), runner.display());
-            let mut args = vec!["serve".to_string(), "--port".into(), port.to_string()];
-            if !local {
-                args.push("--lan".into());
-            }
+            let args = service_args(port, local, &allow_host)?;
             if cfg!(target_os = "macos") {
                 let plist = launchd_plist_path();
                 std::fs::create_dir_all(plist.parent().unwrap())?;
-                let arg_xml: String = std::iter::once(exe.display().to_string())
+                let arg_xml: String = std::iter::once(exe_s.to_string())
                     .chain(args.iter().cloned())
                     .map(|a| format!("      <string>{}</string>\n", xml_escape(&a)))
                     .collect();
@@ -1143,10 +1297,10 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
 </dict>
 </plist>
 "#,
-                    data = xml_escape(&ctx.data_dir.display().to_string()),
-                    runner = xml_escape(&runner.display().to_string()),
-                    out = xml_escape(&logs.join("estia.out.log").display().to_string()),
-                    err = xml_escape(&logs.join("estia.err.log").display().to_string())
+                    data = xml_escape(data_s),
+                    runner = xml_escape(runner_s),
+                    out = xml_escape(service_path(&logs.join("estia.out.log"))?),
+                    err = xml_escape(service_path(&logs.join("estia.err.log"))?)
                 );
                 std::fs::write(&plist, body)?;
                 let target = format!("gui/{}", uid());
@@ -1175,8 +1329,7 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
             } else {
                 let unit = systemd_unit_path();
                 std::fs::create_dir_all(unit.parent().unwrap())?;
-                let body = format!("[Unit]\nDescription=estia\nAfter=network.target\n\n[Service]\nExecStart={} {}\nEnvironment=ESTIA_DATA_DIR={}\nEnvironment=ESTIA_RUNNER={}\nRestart=always\nRestartSec=3\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n", exe.display(), args.join(" "), ctx.data_dir.display(), runner.display(), ctx.data_dir.display());
-                std::fs::write(&unit, body)?;
+                std::fs::write(&unit, systemd_unit(exe_s, &args, data_s, runner_s)?)?;
                 sh("systemctl", &["--user", "daemon-reload"])?;
                 sh("systemctl", &["--user", "enable", "--now", "estia"])?;
                 println!("installed estia.service and started it");
@@ -1251,7 +1404,74 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// A path as it goes into a service definition: UTF-8 (a lossy rendering
+/// would name a different file) and free of control characters (a newline
+/// starts a new directive in a unit file; XML 1.0 cannot carry most of them).
+/// The `estia` arguments a service runs with. Host names go into a plist or a
+/// systemd command line, so they are checked here rather than left for
+/// `serve` to skip.
+fn service_args(port: u16, local: bool, allow_host: &[String]) -> Result<Vec<String>> {
+    let mut args = vec!["serve".to_string(), "--port".into(), port.to_string()];
+    if !local {
+        args.push("--lan".into());
+    }
+    for name in allow_host.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        if name.chars().any(|c| c.is_control() || c.is_whitespace() || c == '"' || c == '\\' || c == '%' || c == '$') {
+            return Err(anyhow!("`{}` is not a host name", safe(name)));
+        }
+        args.push("--allow-host".into());
+        args.push(name.to_string());
+    }
+    Ok(args)
+}
+
+fn service_path(p: &Path) -> Result<&str> {
+    let s = p.to_str().ok_or_else(|| anyhow!("{} is not valid UTF-8; a service definition cannot name it", p.display()))?;
+    if s.chars().any(char::is_control) {
+        return Err(anyhow!("{} contains a control character; a service definition cannot name it", safe(s)));
+    }
+    Ok(s)
+}
+
+/// One double-quoted word for a systemd unit (systemd.syntax(7), "Quoting"):
+/// `\` and `"` are backslash-escaped and `%`, which starts a specifier, is
+/// doubled. On a command line (`exec`), `$` starts a variable and is doubled
+/// too; in `Environment=` it has no special meaning.
+fn systemd_quote(s: &str, exec: bool) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' if exec => out.push_str("$$"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `systemd --user` unit. Callers pass paths through [`service_path`].
+fn systemd_unit(exe: &str, args: &[String], data_dir: &str, runner: &str) -> Result<String> {
+    // WorkingDirectory= is not unquoted: the rest of the line, trimmed, is the
+    // path, with only specifiers expanded. A trailing backslash would continue
+    // the line; surrounding whitespace would be trimmed away.
+    if data_dir.ends_with('\\') || data_dir.trim() != data_dir {
+        return Err(anyhow!("data dir `{}` ends in a backslash or whitespace; a systemd unit cannot name it", safe(data_dir)));
+    }
+    let exec: Vec<String> = std::iter::once(exe).chain(args.iter().map(String::as_str)).map(|w| systemd_quote(w, true)).collect();
+    Ok(format!(
+        "[Unit]\nDescription=estia\nAfter=network.target\n\n[Service]\nExecStart={}\nEnvironment={}\nEnvironment={}\nRestart=always\nRestartSec=3\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+        exec.join(" "),
+        systemd_quote(&format!("ESTIA_DATA_DIR={data_dir}"), false),
+        systemd_quote(&format!("ESTIA_RUNNER={runner}"), false),
+        data_dir.replace('%', "%%")
+    ))
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
@@ -1260,12 +1480,9 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
     let base = match engine {
         Some(e) => e.trim_end_matches('/').to_string(),
         None => match estia_server::another_engine_running(&ctx.data_dir) {
-            Some(rec) => format!("http://127.0.0.1:{}", rec.port),
+            Some(rec) => local_url(&rec.bind, rec.port),
             None => {
-                return Err(anyhow!(
-                    "no running engine for {} — start one with `estia serve --lan` or pass --engine",
-                    ctx.data_dir.display()
-                ))
+                return Err(anyhow!("no running engine for {} — start one with `estia serve` or pass --engine", ctx.data_dir.display()))
             }
         },
     };
@@ -1287,14 +1504,14 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
         if !once {
             print!("\x1b[2J\x1b[H");
         }
-        println!("estia dashboard · {base} · {}", chrono_now());
+        println!("estia dashboard · {} · {}", safe(&base), clock_now());
         match &health {
             Some(h) => println!(
                 "engine   : v{} api v{} · up {}s · bind {} · auth {}",
-                h["version"].as_str().unwrap_or("?"),
-                h["api_version"],
-                h["uptime_s"],
-                h["bind"].as_str().unwrap_or("?"),
+                jtext(&h["version"]),
+                jtext(&h["api_version"]),
+                jtext(&h["uptime_s"]),
+                jtext(&h["bind"]),
                 if h["auth_required"].as_bool().unwrap_or(true) { "required" } else { "OFF" }
             ),
             None => println!("engine   : unreachable"),
@@ -1302,10 +1519,10 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
         match &stats {
             Some(s) => println!(
                 "loaded   : {} · queue interactive {} / background {} · jobs {}",
-                s["loaded"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
-                s["queue"]["interactive"],
-                s["queue"]["background"],
-                s["jobs"]
+                jlist(&s["loaded"]).join(", "),
+                jtext(&s["queue"]["interactive"]),
+                jtext(&s["queue"]["background"]),
+                jtext(&s["jobs"])
             ),
             None => println!("loaded   : (stats need a token: --token)"),
         }
@@ -1319,12 +1536,7 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
                 } else {
                     "missing"
                 };
-                println!(
-                    "  {:<36} {:<10} {}",
-                    a["id"].as_str().unwrap_or("?"),
-                    state,
-                    a["bytes_on_disk"].as_u64().map(gb).unwrap_or_default()
-                );
+                println!("  {:<36} {:<10} {}", jtext(&a["id"]), state, a["bytes_on_disk"].as_u64().map(gb).unwrap_or_default());
             }
         }
         match &pairings {
@@ -1337,16 +1549,11 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
                     if pending.is_empty() { "".to_string() } else { "  — approve with: estia pair approve <id>".to_string() }
                 );
                 for x in pending {
-                    println!(
-                        "  {:<18} {:<20} {:<28} from {}",
-                        x["id"].as_str().unwrap_or("?"),
-                        x["name"].as_str().unwrap_or("?"),
-                        x["scopes"]
-                            .as_array()
-                            .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(","))
-                            .unwrap_or_default(),
-                        x["from"].as_str().unwrap_or("?")
-                    );
+                    let scopes = jlist(&x["scopes"]);
+                    println!("  {:<18} {:<28} from {:<16} {}", jtext(&x["id"]), scopes.join(","), jtext(&x["from"]), jtext(&x["name"]));
+                    if let Some(w) = scope_warning(&scopes) {
+                        println!("  {:<18} ! {w}", "");
+                    }
                 }
             }
             None => println!("pairings : (admin token needed)"),
@@ -1360,13 +1567,138 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
     Ok(())
 }
 
-fn chrono_now() -> String {
+/// Wall-clock time for the dashboard header: `HH:MM:SS` in local time with
+/// the zone's abbreviation, or `HH:MM:SS UTC` where local time is unavailable.
+fn clock_now() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("{}h{:02}m{:02}s UTC", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let t = secs as libc::time_t;
+        // SAFETY: `localtime_r` writes only into `tm`, which outlives the
+        // call; `tm_zone`, when set, points at static zone data.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            let zone = if tm.tm_zone.is_null() {
+                String::new()
+            } else {
+                format!(" {}", unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_string_lossy())
+            };
+            return format!("{:02}:{:02}:{:02}{zone}", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+    }
+    utc_clock(secs)
+}
+
+fn utc_clock(unix_secs: u64) -> String {
+    let s = unix_secs % 86_400;
+    format!("{:02}:{:02}:{:02} UTC", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// One pairing as `pair list` prints it, every field already escaped.
+struct PairRow {
+    id: String,
+    status: String,
+    pending: bool,
+    scopes: Vec<String>,
+    from: String,
+    name: String,
+}
+
+impl PairRow {
+    fn local(p: &estia_server::pairing::Pairing) -> Self {
+        PairRow {
+            id: safe(&p.id),
+            status: format!(
+                "{:?}{}",
+                p.status,
+                if p.revoked {
+                    " (token revoked)"
+                } else if p.claimed {
+                    " (collected)"
+                } else {
+                    ""
+                }
+            ),
+            pending: p.status == estia_server::pairing::PairingStatus::Pending,
+            scopes: p.scopes.iter().map(|s| safe(s)).collect(),
+            from: safe(p.from.as_deref().unwrap_or("?")),
+            name: safe(&p.name),
+        }
+    }
+
+    fn remote(p: &serde_json::Value) -> Self {
+        PairRow {
+            id: jtext(&p["id"]),
+            status: format!(
+                "{}{}",
+                jtext(&p["status"]),
+                if p["revoked"].as_bool() == Some(true) {
+                    " (token revoked)"
+                } else if p["claimed"].as_bool() == Some(true) {
+                    " (collected)"
+                } else {
+                    ""
+                }
+            ),
+            pending: p["status"] == "pending",
+            scopes: jlist(&p["scopes"]),
+            from: jtext(&p["from"]),
+            name: jtext(&p["name"]),
+        }
+    }
+}
+
+/// `pair list` output: the trusted columns first and the name — chosen by
+/// whoever sent the request — last, so nothing the engine vouches for is
+/// printed after it. Pending requests for more than inference get a warning.
+fn pairing_lines(rows: &[PairRow]) -> Vec<String> {
+    if rows.is_empty() {
+        return vec!["no pairing requests".into()];
+    }
+    let mut out = vec![format!("{:<18} {:<22} {:<28} {:<16} NAME", "ID", "STATUS", "SCOPES", "FROM")];
+    for r in rows {
+        out.push(format!("{:<18} {:<22} {:<28} {:<16} {}", r.id, r.status, r.scopes.join(","), r.from, r.name));
+        if r.pending {
+            if let Some(w) = scope_warning(&r.scopes) {
+                out.push(format!("{:<18} ! {w}", ""));
+            }
+        }
+    }
+    out
+}
+
+/// What a pending request's scopes allow beyond inference, if anything.
+fn scope_warning(scopes: &[String]) -> Option<&'static str> {
+    use estia_server::tokens::{SCOPE_ADMIN, SCOPE_MODELS_WRITE};
+    if scopes.iter().any(|s| s == SCOPE_ADMIN) {
+        Some("asks for admin: full control of this engine (models, roles, runtime, tokens, pairings); approving needs --allow-admin")
+    } else if scopes.iter().any(|s| s == SCOPE_MODELS_WRITE) {
+        Some("asks for models:write: can pull and delete models")
+    } else {
+        None
+    }
+}
+
+/// Refuse to approve an `admin` request unless the operator said so; warn on
+/// `models:write`. Arguments are already escaped.
+fn check_approval(id: &str, scopes: &[String], from: &str, name: &str, allow_admin: bool) -> Result<()> {
+    use estia_server::tokens::{SCOPE_ADMIN, SCOPE_MODELS_WRITE};
+    if scopes.iter().any(|s| s == SCOPE_ADMIN) && !allow_admin {
+        return Err(anyhow!(
+            "not approved: pairing {id} asks for scopes [{}] from {from}, under the name `{name}`.\n\
+             admin is full control of this engine: models, roles, runtime, tokens and further pairings.\n\
+             If you started this request yourself, run the same command again with --allow-admin.",
+            scopes.join(",")
+        ));
+    }
+    if scopes.iter().any(|s| s == SCOPE_MODELS_WRITE) {
+        eprintln!("warning: pairing {id} gets models:write: it can pull and delete models on this engine");
+    }
+    Ok(())
 }
 
 fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
-    use estia_server::pairing::{PairingStatus, PairingStore};
+    use estia_server::pairing::PairingStore;
     use estia_server::tokens::TokenStore;
     let store = PairingStore::new(&ctx.data_dir);
     let remote = |engine: &Option<String>, token: &Option<String>| -> Result<Option<estia_engine::RemoteEngine>> {
@@ -1377,62 +1709,75 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
     };
     match action {
         PairAction::List { engine, token } => {
-            if let Some(r) = remote(&engine, &token)? {
-                let v = r.pairings()?;
-                for p in v["pairings"].as_array().cloned().unwrap_or_default() {
-                    println!(
-                        "{:<18} {:<20} {:<28} {:<9} from {}",
-                        p["id"].as_str().unwrap_or("?"),
-                        p["name"].as_str().unwrap_or("?"),
-                        p["scopes"]
-                            .as_array()
-                            .map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(","))
-                            .unwrap_or_default(),
-                        p["status"].as_str().unwrap_or("?"),
-                        p["from"].as_str().unwrap_or("?")
-                    );
-                }
-                return Ok(());
-            }
-            let list = store.list();
-            if list.is_empty() {
-                println!("no pairing requests");
-            }
-            for p in list {
-                println!(
-                    "{:<18} {:<20} {:<28} {:?}{}  from {}",
-                    p.id,
-                    p.name,
-                    p.scopes.join(","),
-                    p.status,
-                    if p.claimed { " (collected)" } else { "" },
-                    p.from.as_deref().unwrap_or("?")
-                );
+            let rows: Vec<PairRow> = match remote(&engine, &token)? {
+                Some(r) => r.pairings()?["pairings"].as_array().into_iter().flatten().map(PairRow::remote).collect(),
+                None => store.list().iter().map(PairRow::local).collect(),
+            };
+            for line in pairing_lines(&rows) {
+                println!("{line}");
             }
         }
-        PairAction::Approve { id, engine, token } => {
+        PairAction::Approve { id, engine, token, allow_admin } => {
             if let Some(r) = remote(&engine, &token)? {
+                // Read the request first: the approve route takes no scopes, so
+                // this is the only place to see what is being granted.
+                let list = r.pairings()?;
+                let p = list["pairings"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["id"].as_str() == Some(id.as_str()))
+                    .ok_or_else(|| anyhow!("no pairing `{}` on {} (expired?)", safe(&id), safe(r.base_url())))?;
+                let row = PairRow::remote(p);
+                // Only a pending request can be approved; the engine says why otherwise.
+                if row.pending {
+                    check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
+                }
                 let v = r.decide_pairing(&id, true)?;
                 println!(
-                    "approved `{}` ({}) on {}",
-                    v["name"].as_str().unwrap_or("?"),
-                    v["scopes"].as_array().map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default(),
-                    r.base_url()
+                    "approved {} with scopes [{}] from {}, name `{}`, on {} — the client collects its token on its next poll",
+                    jtext(&v["id"]),
+                    jlist(&v["scopes"]).join(","),
+                    row.from,
+                    jtext(&v["name"]),
+                    safe(r.base_url())
                 );
                 return Ok(());
             }
+            let pending = store.list().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("no pairing `{}` (expired?)", safe(&id)))?;
+            let row = PairRow::local(&pending);
+            if row.pending {
+                check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
+            }
             let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
-            let p = store.approve(&id, &tokens)?;
-            println!("approved `{}` ({}) — the client collects its token on its next poll", p.name, p.scopes.join(","));
+            let p = PairRow::local(&store.approve(&id, &tokens)?);
+            println!(
+                "approved {} with scopes [{}] from {}, name `{}` — the client collects its token on its next poll",
+                p.id,
+                p.scopes.join(","),
+                p.from,
+                p.name
+            );
         }
         PairAction::Deny { id, engine, token } => {
             if let Some(r) = remote(&engine, &token)? {
                 let v = r.decide_pairing(&id, false)?;
-                println!("denied `{}` on {}", v["name"].as_str().unwrap_or("?"), r.base_url());
+                let revoked = if v["revoked"].as_bool() == Some(true) {
+                    format!("; its token {} was revoked", jtext(&v["token_name"]))
+                } else {
+                    String::new()
+                };
+                println!("denied {} (name `{}`) on {}{revoked}", jtext(&v["id"]), jtext(&v["name"]), safe(r.base_url()));
                 return Ok(());
             }
             let p = store.deny(&id)?;
-            println!("denied `{}`", p.name);
+            let revoked = match (&p.revoked, &p.token_name) {
+                (true, Some(t)) => format!("; its token {} was revoked", safe(t)),
+                (true, None) => "; its token was revoked".to_string(),
+                _ => String::new(),
+            };
+            let row = PairRow::local(&p);
+            println!("denied {} (name `{}`){revoked}", row.id, row.name);
         }
         PairAction::Request { engine, name, scopes, wait_seconds } => {
             let client = reqwest_blocking()?;
@@ -1446,17 +1791,38 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                 .context("pairing request refused")?
                 .json()?;
             let id = r["id"].as_str().ok_or_else(|| anyhow!("no pairing id in response"))?.to_string();
+            // The id goes into a URL path below and in front of the operator.
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(anyhow!("the engine returned a malformed pairing id `{}`", safe(&id)));
+            }
             eprintln!(
-                "pairing request `{id}` sent as `{name}` — waiting up to {wait_seconds}s for the operator to run: estia pair approve {id}"
+                "pairing request `{id}` sent as `{}` — waiting up to {wait_seconds}s for the operator to run: estia pair approve {id}",
+                safe(&name)
             );
             let deadline = Instant::now() + std::time::Duration::from_secs(wait_seconds);
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(2));
-                let v: serde_json::Value = client.get(format!("{base}/engine/pair/{id}")).send()?.error_for_status()?.json()?;
+                // A 5xx (the engine could not read or write pairings.json) or a
+                // dropped connection is worth another poll: the token is only
+                // handed out once its claim is saved, so nothing is lost. A 4xx
+                // (unknown or expired id) is final.
+                let v: Option<serde_json::Value> = match client.get(format!("{base}/engine/pair/{id}")).send() {
+                    Ok(r) if r.status().is_server_error() => {
+                        eprintln!("the engine answered {} while polling; retrying", r.status());
+                        None
+                    }
+                    Ok(r) => Some(r.error_for_status()?.json()?),
+                    Err(e) if e.is_connect() || e.is_timeout() => {
+                        eprintln!("could not reach the engine while polling ({}); retrying", safe(&e.to_string()));
+                        None
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let v = v.unwrap_or(serde_json::Value::Null);
                 match v["status"].as_str() {
                     Some("approved") => {
                         let token = v["token"].as_str().ok_or_else(|| anyhow!("approved but the token was already collected"))?;
-                        println!("{token}");
+                        println!("{}", safe(token));
                         return Ok(());
                     }
                     Some("denied") => return Err(anyhow!("pairing denied by the operator")),
@@ -1465,7 +1831,6 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                 if Instant::now() >= deadline {
                     return Err(anyhow!("timed out waiting for approval"));
                 }
-                let _ = PairingStatus::Pending;
             }
         }
     }
@@ -1487,17 +1852,15 @@ fn discover(seconds: u64) -> Result<()> {
         // The list is ordered by what a client can dial, so the head is the
         // address to hand to another device; the rest are loopback and IPv6
         // spellings of the same engine and only add noise here.
-        let url = match d.addresses.first() {
-            Some(a) => format!("http://{a}:{}", d.port),
-            None => format!("http://{}:{}", d.host, d.port),
-        };
+        // Everything here came off the network from whoever answered.
+        let url = safe(&http_url(d.addresses.first().unwrap_or(&d.host), d.port));
         println!(
             "{:<20} {:<28} {:<30} v{:<7} {}",
-            d.name,
-            d.host,
+            safe(&d.name),
+            safe(&d.host),
             url,
-            d.api_version.unwrap_or_else(|| "?".into()),
-            d.engine_version.unwrap_or_else(|| "?".into())
+            safe(d.api_version.as_deref().unwrap_or("?")),
+            safe(d.engine_version.as_deref().unwrap_or("?"))
         );
     }
     Ok(())
@@ -1507,42 +1870,93 @@ fn remote_check(engine: &str, token: Option<String>, model: &str) -> Result<()> 
     use estia_engine::{Priority, RemoteEmbed, RemoteEngine, RemoteGen};
     let remote = std::sync::Arc::new(RemoteEngine::new(engine, token)?);
     let health = remote.health()?;
-    println!("health   : api v{} engine {} bind {}", health["api_version"], health["version"], health["bind"]);
+    println!("health   : api v{} engine {} bind {}", jtext(&health["api_version"]), jtext(&health["version"]), jtext(&health["bind"]));
     let gen = RemoteGen::new(std::sync::Arc::clone(&remote), model);
     let t0 = Instant::now();
     let mut pieces = 0;
     let text = gen.generate_stream_with("Name one sea in two words.", Some(16), Some(0.0), Priority::Interactive, None, |_| pieces += 1)?;
-    println!("generate : {:?} in {} ms ({pieces} pieces, streamed)", text.trim(), t0.elapsed().as_millis());
+    println!("generate : \"{}\" in {} ms ({pieces} pieces, streamed)", safe(text.trim()), t0.elapsed().as_millis());
     let spec = estia_engine::models::embed::EMBEDDING_GEMMA_300M_4BIT;
     let emb = RemoteEmbed::new(remote, spec.id, spec.fingerprint_for("mlx-python"));
     let t0 = Instant::now();
     let v = emb.embed_batch_with(&["the sea at dawn".into()], Priority::Interactive)?;
-    println!("embed    : {} × {} dims in {} ms, fingerprint {}", v.len(), v[0].len(), t0.elapsed().as_millis(), emb.fingerprint());
+    println!("embed    : {} × {} dims in {} ms, fingerprint {}", v.len(), v[0].len(), t0.elapsed().as_millis(), safe(emb.fingerprint()));
     Ok(())
 }
 
 fn token(ctx: &Ctx, action: TokenAction) -> Result<()> {
-    use estia_server::tokens::{TokenStore, ALL_SCOPES, SCOPE_ADMIN};
+    use estia_server::tokens::{TokenExists, TokenStore, ALL_SCOPES, SCOPE_ADMIN};
     let store = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
     match action {
-        TokenAction::New { name, scopes } => {
-            let scopes: Vec<String> = scopes.unwrap_or_else(|| vec![SCOPE_ADMIN.to_string()]);
+        TokenAction::New { name, scopes, replace } => {
+            if name.trim().is_empty() || name.chars().any(is_unsafe_char) {
+                return Err(anyhow!("token name `{}` is empty or holds control or invisible characters", safe(&name)));
+            }
+            // Rotating keeps the replaced token's scopes unless told otherwise.
+            let scopes: Vec<String> = match scopes {
+                Some(s) => s,
+                None if replace => store.get(&name).map(|old| old.scopes).unwrap_or_else(|| vec![SCOPE_ADMIN.to_string()]),
+                None => vec![SCOPE_ADMIN.to_string()],
+            };
             for s in &scopes {
                 if !ALL_SCOPES.contains(&s.as_str()) {
-                    return Err(anyhow!("unknown scope `{s}` (one of {})", ALL_SCOPES.join(", ")));
+                    return Err(anyhow!("unknown scope `{}` (one of {})", safe(s), ALL_SCOPES.join(", ")));
                 }
             }
             let refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-            let t = store.mint(&name, &refs)?;
+            // Names are how tokens are listed and revoked, so they are unique:
+            // minting over one would cut off whoever holds the old token.
+            let t = if replace {
+                let (t, old) = store.replace(&name, &refs)?;
+                if old.is_some() {
+                    eprintln!("replaced `{}` (now {}): the previous token stops working now", safe(&name), scopes.join(","));
+                }
+                t
+            } else {
+                store.mint(&name, &refs).map_err(|e| match e.downcast_ref::<TokenExists>() {
+                    Some(x) => anyhow!(
+                        "token `{}` already exists (scopes {}, created {}); pass --replace to rotate it (the old token stops working), or `estia token revoke` it first",
+                        safe(&x.name),
+                        x.existing.scopes.join(","),
+                        x.existing.created_unix
+                    ),
+                    None => e,
+                })?
+            };
             println!("{t}");
         }
         TokenAction::List => {
-            for r in store.list() {
-                println!("{:<12} {:<40} created {}", r.name, r.scopes.join(","), r.created_unix);
+            let list = store.list();
+            if list.is_empty() {
+                println!("no tokens");
+                return Ok(());
+            }
+            // The name last: a paired device's token is named after the
+            // device, which chose its own name.
+            println!("{:<40} {:<12} NAME", "SCOPES", "CREATED");
+            for r in list {
+                println!("{:<40} {:<12} {}", safe(&r.scopes.join(",")), r.created_unix, safe(&r.name));
             }
         }
         TokenAction::Revoke { name } => {
-            println!("{}", if store.revoke(&name)? { "revoked" } else { "no such token" });
+            // A name as `token list` printed it also works: a device that
+            // named itself with control characters is listed escaped, and
+            // the escaped form is what the operator can type.
+            let target = match store.list().into_iter().find(|r| r.name == name) {
+                Some(r) => r.name,
+                None => {
+                    let shown: Vec<String> = store.list().into_iter().map(|r| r.name).filter(|n| safe(n) == name).collect();
+                    match shown.as_slice() {
+                        [one] => one.clone(),
+                        [] => return Err(anyhow!("no token named `{}` (see `estia token list`); nothing revoked", safe(&name))),
+                        _ => return Err(anyhow!("`{}` matches {} tokens as printed; nothing revoked", safe(&name), shown.len())),
+                    }
+                }
+            };
+            if !store.revoke(&target)? {
+                return Err(anyhow!("no token named `{}`; nothing revoked", safe(&name)));
+            }
+            println!("revoked `{}`", safe(&target));
         }
     }
     Ok(())
@@ -1559,7 +1973,7 @@ async fn runtime(ctx: &Ctx, action: RuntimeAction) -> Result<()> {
             let summary = ctx
                 .runtime
                 .install(|p| {
-                    eprint!("\r{:<32} {}                    ", p.phase, p.message.chars().take(60).collect::<String>());
+                    eprint!("\r{:<32} {}                    ", p.phase, safe(&p.message.chars().take(60).collect::<String>()));
                 })
                 .await?;
             eprintln!();
@@ -1624,7 +2038,30 @@ fn init_logging() {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run_cli().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // As `Result` from `main` would print it, but escaped: errors
+            // carry text from remote engines and pairing requests.
+            eprintln!("Error: {}", safe_lines(&e.to_string()));
+            let causes: Vec<String> = e.chain().skip(1).map(|c| safe_lines(&c.to_string())).collect();
+            match causes.as_slice() {
+                [] => {}
+                [one] => eprintln!("\nCaused by:\n    {one}"),
+                many => {
+                    eprintln!("\nCaused by:");
+                    for (i, c) in many.iter().enumerate() {
+                        eprintln!("    {i}: {c}");
+                    }
+                }
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_cli() -> Result<()> {
     init_logging();
     let cli = Cli::parse();
     let mut ctx = Ctx::new(&cli)?;
@@ -1655,12 +2092,228 @@ async fn main() -> Result<()> {
         Cmd::Setup { roles, no_models } => setup(&ctx, &roles, no_models).await,
         Cmd::Service { action } => service(&ctx, action),
         Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
-        Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes } => {
-            serve(&ctx, port, &bind, lan, no_advertise, name, no_auth, idle_unload_minutes).await
+        Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host } => {
+            serve(&ctx, port, bind.as_deref(), lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host).await
         }
         Cmd::Token { action } => token(&ctx, action),
         Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),
         Cmd::RemoteCheck { engine, token, model } => tokio::task::block_in_place(|| remote_check(&engine, token, &model)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("estia-cli-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn ctx_for(dir: &Path) -> Ctx {
+        let cli = Cli::try_parse_from(["estia", "--data-dir", dir.to_str().unwrap(), "status"]).unwrap();
+        Ctx::new(&cli).unwrap()
+    }
+
+    #[test]
+    fn safe_escapes_terminal_controls_and_keeps_names() {
+        assert_eq!(safe("ipad\x1b[8m"), "ipad\\u{1b}[8m");
+        assert_eq!(safe("a\rb\nc\td"), "a\\rb\\nc\\td");
+        assert_eq!(safe("\u{202e}dapi\u{2066}"), "\\u{202e}dapi\\u{2066}");
+        assert_eq!(safe("x\u{9b}31m\u{200b}\u{feff}"), "x\\u{9b}31m\\u{200b}\\u{feff}");
+        for ordinary in ["George\u{2019}s iPad", "Γιώργος", "it's \"mine\" \\ ok", "laptop-2.lan"] {
+            assert_eq!(safe(ordinary), ordinary);
+        }
+        // The stealthy payload from the review: cursor moves and autowrap off.
+        let payload = "ipad\x1b[17Cgenerate\x1b[21CPending  from 192.168.1.7\x1b[?7l\x1b[999C";
+        let shown = safe(payload);
+        assert!(!shown.chars().any(is_unsafe_char), "{shown}");
+        assert_eq!(safe(&shown), shown, "escaping is idempotent");
+        assert_eq!(safe_lines("line one\x1b[2K\nline two"), "line one\\u{1b}[2K\nline two");
+        assert_eq!(jtext(&serde_json::json!("a\u{1b}b")), "a\\u{1b}b");
+        assert_eq!(jtext(&serde_json::Value::Null), "?");
+        assert_eq!(jtext(&serde_json::json!(3)), "3");
+        assert_eq!(jlist(&serde_json::json!(["admin", "x\u{7}"])), vec!["admin".to_string(), "x\\u{7}".to_string()]);
+    }
+
+    #[test]
+    fn pair_list_puts_scopes_before_the_name_and_flags_admin() {
+        let row = PairRow::remote(&serde_json::json!({
+            "id": "6de47a30928f4f15", "status": "pending", "from": "127.0.0.1",
+            "name": "ipad                 generate   Pending\u{1b}[8m", "scopes": ["admin"],
+        }));
+        let lines = pairing_lines(&[row]);
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        let line = &lines[1];
+        assert!(!line.contains('\x1b'), "{line}");
+        let (scopes_at, name_at) = (line.find("admin").unwrap(), line.find("ipad").unwrap());
+        assert!(scopes_at < name_at, "scopes must come before the untrusted name: {line}");
+        assert!(line.ends_with("Pending\\u{1b}[8m"), "{line}");
+        assert!(lines[2].contains("admin") && lines[2].contains("--allow-admin"), "{}", lines[2]);
+        // Plain inference scopes get no warning.
+        let plain = PairRow::remote(&serde_json::json!({"id": "a", "status": "pending", "scopes": ["generate"], "name": "phone"}));
+        assert_eq!(pairing_lines(&[plain]).len(), 2);
+    }
+
+    #[test]
+    fn approve_refuses_admin_without_the_flag() {
+        use estia_server::pairing::{PairingStatus, PairingStore};
+        let dir = scratch("approve");
+        let ctx = ctx_for(&dir);
+        let store = PairingStore::new(&dir);
+        let admin = store.request("ipad", &["admin".into()], Some("10.0.0.9".into())).unwrap();
+        // The server now refuses such names; records written before that
+        // still hold them, and are what the CLI must print safely.
+        let file = dir.join("pairings.json");
+        let text = std::fs::read_to_string(&file).unwrap().replace("\"ipad\"", "\"ipad\\u001b[8m\"");
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(store.list()[0].name, "ipad\x1b[8m");
+        let err = pair(&ctx, PairAction::Approve { id: admin.id.clone(), engine: None, token: None, allow_admin: false }).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[admin]") && msg.contains("10.0.0.9") && msg.contains("--allow-admin"), "{msg}");
+        assert!(!msg.contains('\x1b'), "{msg}");
+        let still = store.list().into_iter().find(|p| p.id == admin.id).unwrap();
+        assert_eq!(still.status, PairingStatus::Pending, "refused means nothing was minted");
+        assert!(estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().is_empty());
+        pair(&ctx, PairAction::Approve { id: admin.id.clone(), engine: None, token: None, allow_admin: true }).unwrap();
+        assert_eq!(store.list().into_iter().find(|p| p.id == admin.id).unwrap().status, PairingStatus::Approved);
+        let tokens = || estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().list();
+        assert_eq!(tokens().len(), 1);
+        pair(&ctx, PairAction::Deny { id: admin.id.clone(), engine: None, token: None }).unwrap();
+        assert!(tokens().is_empty(), "deny after approve revokes the minted token");
+        // models:write is approved with a warning; plain scopes need nothing.
+        assert!(check_approval("x", &["models:write".into()], "?", "n", false).is_ok());
+        assert!(check_approval("x", &["generate".into(), "embed".into()], "?", "n", false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_names_are_unique_and_revoke_fails_loudly() {
+        use estia_server::tokens::TokenStore;
+        let dir = scratch("tokens");
+        let ctx = ctx_for(&dir);
+        let new = |name: &str, scopes: Option<Vec<&str>>, replace: bool| {
+            token(&ctx, TokenAction::New { name: name.into(), scopes: scopes.map(|v| v.into_iter().map(String::from).collect()), replace })
+        };
+        new("editor", Some(vec!["generate", "embed"]), false).unwrap();
+        let first = TokenStore::open(dir.join("tokens.json")).unwrap().list();
+        let err = new("editor", Some(vec!["embed"]), false).unwrap_err().to_string();
+        assert!(err.contains("already exists") && err.contains("--replace"), "{err}");
+        assert_eq!(TokenStore::open(dir.join("tokens.json")).unwrap().list()[0].sha256, first[0].sha256, "refused mint left it alone");
+        // --replace rotates and keeps the scopes when none are given.
+        new("editor", None, true).unwrap();
+        let after = TokenStore::open(dir.join("tokens.json")).unwrap().list();
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].sha256, first[0].sha256);
+        assert_eq!(after[0].scopes, vec!["generate".to_string(), "embed".to_string()]);
+        assert!(new("bad\x1bname", None, false).is_err());
+
+        assert!(token(&ctx, TokenAction::Revoke { name: "nosuch".into() }).is_err());
+        // A device-chosen name with escapes is revocable as `token list` shows it.
+        let raw = "pair:ipad\x1b[8m:6de47a30928f4f15";
+        TokenStore::open(dir.join("tokens.json")).unwrap().mint(raw, &["admin"]).unwrap();
+        token(&ctx, TokenAction::Revoke { name: safe(raw) }).unwrap();
+        assert!(TokenStore::open(dir.join("tokens.json")).unwrap().list().iter().all(|r| r.name != raw));
+        token(&ctx, TokenAction::Revoke { name: "editor".into() }).unwrap();
+        assert!(token(&ctx, TokenAction::Revoke { name: "editor".into() }).is_err(), "second revoke finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roles_rm_of_an_unbound_role_fails() {
+        let dir = scratch("roles");
+        let mut ctx = ctx_for(&dir);
+        assert!(roles(&mut ctx, Some(RolesAction::Rm { role: "nosuch".into() })).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn systemd_unit_quotes_paths() {
+        let data = r#"/home/u/My Models/100%/$HOME/"q"\b"#;
+        let unit = systemd_unit(&format!("{data}/engine/estia"), &["serve".into(), "--lan".into()], data, &format!("{data}/r.py")).unwrap();
+        let line = |key: &str| unit.lines().find(|l| l.starts_with(key)).unwrap().to_string();
+        assert_eq!(line("ExecStart="), r#"ExecStart="/home/u/My Models/100%%/$$HOME/\"q\"\\b/engine/estia" "serve" "--lan""#);
+        let env: Vec<&str> = unit.lines().filter(|l| l.starts_with("Environment=")).collect();
+        assert_eq!(env[0], r#"Environment="ESTIA_DATA_DIR=/home/u/My Models/100%%/$HOME/\"q\"\\b""#);
+        assert_eq!(env[1], r#"Environment="ESTIA_RUNNER=/home/u/My Models/100%%/$HOME/\"q\"\\b/r.py""#);
+        assert_eq!(line("WorkingDirectory="), r#"WorkingDirectory=/home/u/My Models/100%%/$HOME/"q"\b"#);
+        assert_eq!(unit.lines().count(), 14, "no path added a line:\n{unit}");
+        assert!(systemd_unit("/x/estia", &[], "/data\\", "/r.py").is_err(), "a trailing backslash would continue the line");
+        assert!(service_path(Path::new("/tmp/a\nExecStartPre=/bin/sh")).is_err());
+        assert!(service_path(Path::new("/tmp/My Models")).is_ok());
+        assert_eq!(xml_escape(r#"/a&b/<c>/"d""#), "/a&amp;b/&lt;c&gt;/&quot;d&quot;");
+    }
+
+    /// `service install --allow-host` reaches `serve`, and a name that could
+    /// break out of a plist string or a systemd word is refused up front.
+    #[test]
+    fn service_args_carry_allowed_hosts() {
+        assert_eq!(service_args(27200, true, &[]).unwrap(), ["serve", "--port", "27200"]);
+        assert_eq!(
+            service_args(1, false, &["studio.lan".into(), " *.home.arpa ".into(), "".into()]).unwrap(),
+            ["serve", "--port", "1", "--lan", "--allow-host", "studio.lan", "--allow-host", "*.home.arpa"]
+        );
+        for bad in ["a b", "a\nExecStartPre=/bin/sh", "x\"y", "100%", "$HOME"] {
+            assert!(service_args(1, false, &[bad.into()]).is_err(), "{bad:?} accepted");
+        }
+    }
+
+    #[test]
+    fn bind_accepts_localhost_and_ipv6() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(parse_bind("127.0.0.1", 1).unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(parse_bind("localhost", 1).unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(parse_bind("::1", 7).unwrap(), "[::1]:7".parse().unwrap());
+        assert_eq!(parse_bind("[::1]", 7).unwrap().ip(), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert!(parse_bind("0.0.0.0", 1).unwrap().ip().is_unspecified());
+        assert!(parse_bind("no such host.invalid", 1).is_err());
+        assert_eq!(http_url("::1", 27200), "http://[::1]:27200");
+        assert_eq!(http_url("192.168.1.7", 27200), "http://192.168.1.7:27200");
+        assert_eq!(http_url("fe80::1%en0", 1), "http://[fe80::1%25en0]:1");
+        assert_eq!(local_url("0.0.0.0", 5), "http://127.0.0.1:5");
+        assert_eq!(local_url("::", 5), "http://[::1]:5");
+        assert_eq!(local_url("::1", 5), "http://[::1]:5");
+        assert_eq!(local_url("127.0.0.1", 5), "http://127.0.0.1:5");
+    }
+
+    #[test]
+    fn dashboard_clock_is_a_time_of_day() {
+        assert_eq!(utc_clock(3603), "01:00:03 UTC");
+        assert_eq!(utc_clock(86_399), "23:59:59 UTC");
+        let now = clock_now();
+        let hms = now.split(' ').next().unwrap();
+        assert_eq!(hms.len(), 8, "{now}");
+        assert!(hms.chars().enumerate().all(|(i, c)| if i == 2 || i == 5 { c == ':' } else { c.is_ascii_digit() }), "{now}");
+    }
+
+    #[test]
+    fn runner_is_never_taken_from_the_current_directory() {
+        let dir = scratch("runner");
+        let planted = dir.join("cwd/runners/mlx-python");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("estia-runner.py"), "raise SystemExit('planted')\n").unwrap();
+        let data = dir.join("data");
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.join("cwd")).unwrap();
+        let found = find_runner(None, &data);
+        std::env::set_current_dir(before).unwrap();
+        let found = found.expect("the compiled-in runner");
+        assert_eq!(found, data.join("engine/runners/mlx-python/estia-runner.py"));
+        assert_eq!(std::fs::read_to_string(&found).unwrap(), EMBEDDED_RUNNER);
+        assert_eq!(find_runner(Some(PathBuf::from("/x/r.py")), &data), Some(PathBuf::from("/x/r.py")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `cli/estia-runner.py` is a symlink; a checkout without symlink support
+    /// would turn it into a one-line text file holding the target path.
+    #[test]
+    fn embedded_runner_is_the_real_script() {
+        assert!(EMBEDDED_RUNNER.starts_with("#!/usr/bin/env python3"), "{}", &EMBEDDED_RUNNER[..EMBEDDED_RUNNER.len().min(80)]);
+        if let Ok(canonical) = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../runners/mlx-python/estia-runner.py")) {
+            assert_eq!(EMBEDDED_RUNNER, canonical);
+        }
     }
 }

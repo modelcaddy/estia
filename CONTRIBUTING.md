@@ -4,7 +4,9 @@ Thanks for helping. This file covers how to build, test and send a change.
 
 ## Build
 
-You need a stable Rust toolchain.
+You need Rust 1.89 or newer: the `rust-version` in `Cargo.toml`, which CI
+builds with. Raise it only when a change needs a newer Rust, and say so in the
+pull request.
 
 ```bash
 cargo build
@@ -46,6 +48,19 @@ cargo deny check
 `rustfmt.toml` sets the line width. `deny.toml` sets the dependency policy:
 permissive licences only (no GPL, AGPL, LGPL or other copyleft) and crates.io
 sources only. Install the tool with `cargo install cargo-deny --locked`.
+
+Release tarballs include `THIRD_PARTY_LICENSES`, the licence texts of the
+crates compiled into `estia`, built by
+[cargo-about](https://github.com/EmbarkStudios/cargo-about) from `about.toml`.
+Its `accepted` list mirrors the `allow` list in `deny.toml`, so change the two
+together. CI also builds the file, and fails when a dependency ships no
+licence file or a checksum in `about.toml` no longer matches; the fix is a
+`clarify` entry in `about.toml`. To run the same check locally (install the
+tool with `cargo install cargo-about --locked --features cli`):
+
+```bash
+.github/scripts/third-party-licenses.sh target/THIRD_PARTY_LICENSES
+```
 
 ## Changes to the runner protocol
 

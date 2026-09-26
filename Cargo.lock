@@ -437,6 +437,7 @@ dependencies = [
  "clap",
  "estia-engine",
  "estia-server",
+ "libc",
  "log",
  "reqwest",
  "serde",
@@ -478,6 +479,9 @@ dependencies = [
  "axum",
  "estia-engine",
  "getrandom 0.2.17",
+ "hyper",
+ "hyper-util",
+ "libc",
  "mdns-sd",
  "reqwest",
  "serde",
@@ -486,6 +490,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "tower-service",
 ]
 
 [[package]]

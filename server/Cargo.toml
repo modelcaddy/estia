@@ -3,14 +3,26 @@ name = "estia-server"
 description = "Estia HTTP server: OpenAI-compatible /v1/* plus native /engine/* routes over the engine."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "inference", "openai", "embeddings", "estia"]
+categories = ["artificial-intelligence", "web-programming::http-server"]
 
 [dependencies]
 estia-engine = { path = "../engine", version = "0.1.0" }
 anyhow.workspace = true
 axum.workspace = true
 getrandom.workspace = true
+# Our own accept loop (see `serve_router`): a header-read timeout needs hyper's
+# timer, which `axum::serve` does not set, and a connection cap needs the
+# accept loop; libc raises the open-files limit. All four are already in
+# Cargo.lock through axum and tokio.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
+tower-service = "0.3"
+libc = "0.2"
 mdns-sd.workspace = true
 serde.workspace = true
 serde_json.workspace = true

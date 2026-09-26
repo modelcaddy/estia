@@ -3,8 +3,12 @@ name = "estia-engine"
 description = "Estia inference engine: runner sessions, model management, roles, structured output."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "inference", "mlx", "embeddings", "estia"]
+categories = ["artificial-intelligence"]
 
 [dependencies]
 estia-proto = { path = "../proto", version = "0.1.0" }

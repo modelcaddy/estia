@@ -2,6 +2,7 @@
 
 use crate::jobs::JobStatus;
 use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, task_name, to_messages, OaiMessage};
+use crate::pairing::PairingError;
 use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION};
 use axum::{
     extract::{Path, State},
@@ -21,6 +22,50 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+// Work caps: one request must not be able to hold a model indefinitely.
+// Public so the `/v1/*` handlers apply the same limits.
+
+/// Ceiling on `max_tokens`; larger requests are clamped to it.
+pub const MAX_TOKENS_CEILING: u32 = 8192;
+/// Most structured-output attempts one `/engine/generate` may make; larger
+/// `max_attempts` values are clamped to it (and 0 is raised to 1).
+pub const MAX_ATTEMPTS: u32 = 3;
+/// Most inputs one embed request may carry; more is a 400.
+pub const MAX_EMBED_INPUTS: usize = 256;
+
+/// `max_tokens` as requested (or `default`), clamped to [`MAX_TOKENS_CEILING`].
+pub fn capped_max_tokens(requested: Option<u32>, default: u32) -> u32 {
+    requested.unwrap_or(default).min(MAX_TOKENS_CEILING)
+}
+
+/// 400 when an embed request carries more than [`MAX_EMBED_INPUTS`] inputs.
+pub fn check_embed_inputs(count: usize) -> Result<(), ApiError> {
+    if count > MAX_EMBED_INPUTS {
+        return Err(ApiError::bad_request(format!(
+            "{count} inputs in one request; at most {MAX_EMBED_INPUTS} (split them across requests)"
+        )));
+    }
+    Ok(())
+}
+
+/// A pairing failure as HTTP: bad input 400, a full queue 429, storage
+/// trouble 500 (details to the log, not to the unauthenticated caller), and
+/// an unknown id `missing` (404 when polling; 400 on approve/deny, as
+/// documented).
+fn pairing_error(e: PairingError, missing: fn(String) -> ApiError) -> ApiError {
+    match e {
+        PairingError::NotFound { .. } => missing(e.to_string()),
+        PairingError::Invalid(_) => ApiError::bad_request(e.to_string()),
+        PairingError::TooMany(_) => {
+            ApiError { status: axum::http::StatusCode::TOO_MANY_REQUESTS, kind: "rate_limit_error", message: e.to_string() }
+        }
+        PairingError::Storage(_) => {
+            eprintln!("pairing: {e}");
+            ApiError::internal("the pairing store could not be read or written; see the engine's log")
+        }
+    }
+}
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
     let rt = state.engine.runtime().status();
@@ -240,9 +285,9 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     let artifact = state.resolve_generation(&name)?;
     let format = parse_response_format(&req.format)?;
     let prio = if req.priority.as_deref() == Some("background") { Priority::Background } else { Priority::Interactive };
-    let max_tokens = req.max_tokens.unwrap_or(1024);
+    let max_tokens = capped_max_tokens(req.max_tokens, 1024);
     let temperature = req.temperature.unwrap_or(0.2);
-    let attempts = req.max_attempts.unwrap_or(2).max(1);
+    let attempts = req.max_attempts.unwrap_or(2).clamp(1, MAX_ATTEMPTS);
     let st = Arc::clone(&state);
     let session = tokio::task::spawn_blocking(move || st.gen_session(artifact)).await??;
 
@@ -254,7 +299,11 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
         return Err(ApiError::bad_request("prompt or messages is required"));
     }
     let tools = req.tools.clone().filter(|t| !t.is_empty());
-    let cache_key = req.cache_key.clone().or_else(|| messages.as_ref().map(|m| derive_cache_key(artifact.id, m)));
+    let cache_key = req
+        .cache_key
+        .clone()
+        .or_else(|| messages.as_ref().map(|m| derive_cache_key(artifact.id, m)))
+        .map(|k| crate::Caller::current().scoped_key(&k));
 
     if req.stream.unwrap_or(false) && !format.wants_json() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
@@ -381,6 +430,7 @@ pub struct EmbedRequest {
 pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequest>) -> Result<Json<Value>, ApiError> {
     let model = state.resolve_embedding(req.model.as_deref())?;
     let inputs = inputs_of(&req.inputs)?;
+    check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
     let fingerprint = model.fingerprint_for(state.embed_backend());
     if let Some(expected) = &req.expect_fingerprint {
@@ -416,12 +466,14 @@ pub async fn pair_request(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(body): Json<PairRequestBody>,
 ) -> Result<Response, ApiError> {
-    if body.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name is required"));
-    }
+    // The store checks the name (it ends up in the operator's terminal) and
+    // the scopes, and caps pending requests overall and per address.
     let scopes = body.scopes.unwrap_or_else(|| vec!["generate".into(), "embed".into(), "models:read".into()]);
-    let p =
-        state.pairings.request(body.name.trim(), &scopes, Some(peer.ip().to_string())).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let from = peer.ip().to_string();
+    // The store takes a file lock (the CLI edits the same file): off the runtime.
+    let p = tokio::task::spawn_blocking(move || state.pairings.request(&body.name, &scopes, Some(from)))
+        .await?
+        .map_err(|e| pairing_error(e, ApiError::not_found))?;
     Ok((
         axum::http::StatusCode::ACCEPTED,
         Json(json!({
@@ -434,7 +486,9 @@ pub async fn pair_request(
 
 /// The client polls; the token is returned exactly once when approved.
 pub async fn pair_poll(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let (status, token) = state.pairings.poll(&id).map_err(|e| ApiError::not_found(e.to_string()))?;
+    let key = id.clone();
+    let (status, token) =
+        tokio::task::spawn_blocking(move || state.pairings.poll(&key)).await?.map_err(|e| pairing_error(e, ApiError::not_found))?;
     Ok(Json(json!({"id": id, "status": status, "token": token})))
 }
 
@@ -445,19 +499,30 @@ pub async fn list_pairings(State(state): State<Arc<AppState>>) -> Json<Value> {
         .pairings
         .list()
         .into_iter()
-        .map(|p| json!({"id": p.id, "name": p.name, "scopes": p.scopes, "status": p.status, "from": p.from, "created_unix": p.created_unix, "claimed": p.claimed}))
+        .map(|p| {
+            json!({
+                "id": p.id, "name": p.name, "scopes": p.scopes, "status": p.status, "from": p.from,
+                "created_unix": p.created_unix, "claimed": p.claimed, "revoked": p.revoked,
+            })
+        })
         .collect();
     Json(json!({"pairings": list}))
 }
 
 pub async fn approve_pairing(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let p = state.pairings.approve(&id, &state.tokens).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let p = tokio::task::spawn_blocking(move || state.pairings.approve(&id, &state.tokens))
+        .await?
+        .map_err(|e| pairing_error(e, ApiError::bad_request))?;
     Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status, "scopes": p.scopes})))
 }
 
+/// Deny a pending request, or take back an approved one: its token is revoked
+/// (`"revoked": true`) whether or not the device has collected it yet.
 pub async fn deny_pairing(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    let p = state.pairings.deny(&id).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status})))
+    let p = tokio::task::spawn_blocking(move || state.pairings.deny_with(&id, &state.tokens))
+        .await?
+        .map_err(|e| pairing_error(e, ApiError::bad_request))?;
+    Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status, "revoked": p.revoked, "token_name": p.token_name})))
 }
 
 pub async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {

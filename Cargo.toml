@@ -14,8 +14,12 @@ members = ["proto", "engine", "server", "cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# 1.89: std::fs::File::lock. Dependencies alone need 1.88. CI checks this (the
+# msrv job in .github/workflows/ci.yml).
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/modelcaddy/estia"
+readme = "README.md"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

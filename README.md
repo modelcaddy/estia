@@ -31,8 +31,8 @@ changes before 1.0.
 
 You need:
 
-- A recent stable Rust toolchain ([rustup](https://rustup.rs)) and, on macOS,
-  the Xcode Command Line Tools.
+- Rust 1.89 or newer ([rustup](https://rustup.rs)) and, on macOS, the Xcode
+  Command Line Tools.
 - An Apple Silicon Mac to run models. `estia setup` downloads Python and the
   MLX packages; nothing else needs to be installed first.
 - About 10 GB of free disk for the runtime and the default models.
@@ -41,16 +41,24 @@ You need:
 ```bash
 git clone https://github.com/modelcaddy/estia
 cd estia
-cargo install --path cli     # puts `estia` in ~/.cargo/bin
+cargo install --locked --path cli   # puts `estia` in ~/.cargo/bin
 # or
-cargo build --release        # binary at target/release/estia
+cargo build --release               # binary at target/release/estia
 ```
 
-The CLI needs the runner script `runners/mlx-python/estia-runner.py`. It uses
-the copy beside the binary or in the checkout when there is one; otherwise it
-writes the copy compiled into the binary to `<data_dir>/engine/runners/` and
-uses that, so a binary installed with `cargo install` works from any
-directory. `ESTIA_RUNNER` (or `--runner`) overrides both.
+The CLI needs the runner script `runners/mlx-python/estia-runner.py`. It
+takes the first of:
+
+1. `--runner` or `ESTIA_RUNNER`;
+2. `runners/mlx-python/estia-runner.py` beside the binary (a release tarball,
+   or the copy `service install` stages);
+3. the checkout the binary was built in, only when the binary sits in a cargo
+   `target/<profile>/` directory;
+4. the copy compiled into the binary, written to `<data_dir>/engine/runners/`.
+
+It never looks in the current directory, so running `estia` inside a folder
+you downloaded cannot make it execute a script from that folder. A binary
+installed with `cargo install` works from any directory through step 4.
 
 `estia service install` copies the binary and the runner scripts into the data
 directory, so an installed service keeps working if the checkout moves. Run it
@@ -93,7 +101,8 @@ estia service install          # also serves the LAN; see the next section
 
 Open <http://127.0.0.1:27200/client> in a browser and paste the token. The
 page has tabs to chat, embed, pull models, set roles and approve devices. It is
-a static page served by the engine and uses only the public API.
+a static page served by the engine and uses only the public API. Its source is
+`server/client/index.html`.
 
 From the command line:
 
@@ -133,7 +142,14 @@ Give other programs their own tokens with only the scopes they need:
 
 ```bash
 estia token new editor --scopes generate,embed
+estia token list
+estia token revoke editor                  # refused on its next request
+estia token new editor --replace           # rotate: the old token stops working now
 ```
+
+Token names are unique. `token new` refuses a name that already exists;
+`--replace` rotates it, keeping the old token's scopes unless you pass
+`--scopes`.
 
 ## Using it from other devices
 
@@ -149,6 +165,15 @@ estia status                   # prints the URL other devices should use
 `--lan` binds `0.0.0.0` and advertises the engine over Bonjour. Authentication
 stays on: every route except health, pairing and `/client` needs a token, and
 `--no-auth` is refused on any non-loopback bind, so a LAN server always requires a token.
+
+Devices must reach the engine by its IP address, by `<hostname>.local`, or by
+this machine's own hostname. Any other name in the `Host` header gets a 403
+(see [Host names](#host-names)); allow one with `--allow-host`:
+
+```bash
+estia serve --lan --allow-host studio.lan          # repeatable, or comma-separated
+estia service install --allow-host studio.lan
+```
 
 ### Pair a device
 
@@ -183,16 +208,37 @@ curl -s http://192.168.1.20:27200/engine/pair/772ca7c0bf6ada4b
 Approve on the engine's machine:
 
 ```bash
-estia pair list
+estia pair list                         # ID, STATUS, SCOPES, FROM, NAME
 estia pair approve 772ca7c0bf6ada4b     # or: estia pair deny 772ca7c0bf6ada4b
 ```
 
 A client holding an `admin` token can approve from anywhere: with
 `estia pair approve <id> --engine http://192.168.1.20:27200 --token <admin token>`,
 from the Admin tab of `/client`, or with `POST /engine/pairings/<id>/approve`.
-Read the requested scopes before you approve. A device can ask for `admin`.
 
-Pending requests expire after 5 minutes. At most 24 can wait at once.
+Read the requested scopes before you approve. A device can ask for `admin`,
+which is full control of the engine. `estia pair approve` refuses such a
+request unless you add `--allow-admin`, and warns about `models:write`. The
+HTTP route and the `/client` Admin tab approve exactly what was asked, so check
+the scopes column there.
+
+`estia pair deny` also works after an approval: it revokes the token the
+approval minted, whether or not the device has collected it yet, and the
+engine refuses that token from the next request on. A pairing leaves the list
+5 minutes after it was requested (10 if its token is still uncollected); after
+that, find the token as `pair:<name>:<id>` in `estia token list` and remove it
+with `estia token revoke`.
+
+Limits on pairing requests, which anyone who can reach the port may send:
+
+- The name is at most 64 characters: letters and digits in any script, single
+  spaces, and `. _ - ' ’ ( )`. Anything else, such as control characters,
+  escape sequences, invisible or bidi characters, emoji, colons or double
+  spaces, is refused with 400, because names are printed in your terminal.
+  Unknown scopes are refused too.
+- Requests expire after 5 minutes. At most 24 can wait at once, and at most 4
+  from one address. Past either limit the engine answers 429 until a request is
+  decided or expires.
 
 The paired device then uses the engine like a local one:
 
@@ -223,7 +269,38 @@ Discovery is a convenience. Pairing by address always works, and the URL from
 On macOS the engine registers through `dns-sd`, so mDNSResponder sends the
 multicast. A service started by launchd is a plain executable without the
 local-network permission, and its own multicast would fail silently. Going
-through mDNSResponder avoids that.
+through mDNSResponder avoids that. The `dns-sd` process is tied to the
+engine's lifetime: if the engine is killed or crashes, the advertisement goes
+with it.
+
+### Host names
+
+The engine serves a request only when its `Host` header is:
+
+- an IP address (IPv4 or IPv6, any port),
+- `localhost` or a name ending in `.localhost`,
+- a name ending in `.local`,
+- this machine's hostname, short or fully qualified,
+- or a name you allowed with `--allow-host` or `ESTIA_ALLOWED_HOSTS`.
+
+Anything else gets 403 before authentication runs, on every route. This stops
+DNS rebinding, where a web page points a name it controls at your machine and
+then reads the engine's answers as if it were the engine's own page. It
+matters most with `--no-auth`, which would otherwise be open to any website
+you visit.
+
+`--allow-host` is repeatable and takes comma-separated lists; `service install`
+passes it on to the service. `ESTIA_ALLOWED_HOSTS` takes a comma-separated
+list. A port on an entry is ignored. `*.example.com` allows every subdomain of
+`example.com`, but not `example.com` itself. `*` turns the check off; use it
+only behind a reverse proxy that checks `Host` itself. A reverse proxy must
+pass the original `Host` through, or be allowed by name.
+
+Browsers also send `Origin` on cross-site requests. A request other than GET,
+HEAD or OPTIONS whose `Origin` is not the scheme, host and port it was sent to
+gets 403, and so does `Origin: null`. Clients that send no `Origin`, such as
+curl and the SDKs, are not affected, and neither is the `/client` page, which
+is served from the engine itself.
 
 ## Roles
 
@@ -253,10 +330,14 @@ vision-capable family and every other name needs text. Bindings are stored in
 after `estia roles set`, or change roles live with `PUT /engine/defaults`
 (admin scope) or the Setup tab of `/client`.
 
-Bound roles are listed first in `GET /v1/models`, with
-`"x_estia": {"role": true, "family": ...}`. A request's `model` can also be a
-family (`gemma4-e2b`) or an artifact id (`gemma4-e2b-it-4bit-mlx`). An artifact
-id wins over a family, and a family over a role.
+`GET /v1/models` lists the roles in the role table first, each with
+`"x_estia": {"role": true, "family": ...}`. These are the generation roles that
+`estia roles` shows, such as `text`, `fast` and `vision`. `embed` is not listed
+as a role: it is fixed to `embeddinggemma-300m-4bit` instead of being kept in
+the table, but `"model": "embed"` works on the embedding routes. A request's
+`model` can also be a family (`gemma4-e2b`) or an artifact id
+(`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family, and a family
+over a role.
 
 A binding can carry `temperature`, `max_tokens` and `pin`. They are stored but
 the server does not apply them yet.
@@ -306,7 +387,13 @@ All are MLX weights from Hugging Face. `estia models` shows what is installed;
 `/v1/chat/completions` supports streaming, `tools` (the model's native call
 syntax is parsed into `tool_calls`), and `response_format` with `json_object`
 or `json_schema` (validated after generation, repaired where possible, retried
-once). `user` is used as the prompt-cache key.
+once). `user` is used as the prompt-cache key. Prompt caches are kept per
+token: two tokens never share a cache entry, even with the same `user`.
+
+Limits per request: `max_tokens` above 8192 is lowered to 8192, `max_attempts`
+on `/engine/generate` is held between 1 and 3, and an embedding request may
+carry at most 256 inputs (more is a 400). A path that matches no route gets a
+JSON 404.
 
 Estia adds a few fields that standard clients can ignore:
 
@@ -329,13 +416,13 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | Command | What it does |
 |---|---|
 | `setup` | Install the runtime, pull models for the roles (`--roles`, default `text,fast,embed`), write `config.json`, mint the first admin token |
-| `service install [--local] [--port]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
+| `service install [--local] [--port] [--allow-host]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
 | `service uninstall`, `start`, `stop`, `restart`, `status`, `logs` | Manage that service |
-| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--no-auth`) |
+| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--no-auth`) |
 | `status` | Data directory, runtime, runner, installed models, roles, running server, pending pairings, service |
 | `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--once` for one snapshot) |
-| `token new <name> [--scopes]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin` |
-| `pair list`, `pair approve <id>`, `pair deny <id>` | Decide pairing requests; add `--engine` and `--token` to act on another engine |
+| `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one |
+| `pair list`, `pair approve <id> [--allow-admin]`, `pair deny <id>` | Decide pairing requests; add `--engine` and `--token` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
 | `pair request --engine <url>` | Ask an engine for a token and wait for approval |
 | `discover` | Find engines on the LAN |
 | `remote-check --engine <url>` | Health, one generation and one embedding against a server |
@@ -372,6 +459,7 @@ directory answers.
 | `config.json` | `{"roles": {...}}`, the role table |
 | `tokens.json` | Token names, SHA-256 hashes of the tokens, scopes, creation times |
 | `pairings.json` | Recent pairing requests |
+| `tokens.lock`, `pairings.lock` | Empty lock files that keep the server and the CLI from writing those two files at the same time |
 | `engine.json` | PID, address and port of the running server; removed when it exits cleanly |
 | `engine/` | The copy of the binary and runner scripts that the service runs |
 | `logs/` | `estia.out.log` and `estia.err.log` from the launchd service |
@@ -383,6 +471,7 @@ directory answers.
 | `ESTIA_DATA_DIR` | Data directory (same as `--data-dir`) |
 | `ESTIA_RUNNER` | Path to `estia-runner.py` (same as `--runner`) |
 | `ESTIA_PYTHON` | Python interpreter for the runner (same as `--python`). Default: the installed runtime, else `python3` on `PATH`. |
+| `ESTIA_ALLOWED_HOSTS` | Extra `Host` names the server answers to, comma-separated (same syntax as `serve --allow-host`) |
 | `ESTIA_MDNS_REFRESH_SECS` | How often the built-in Bonjour advertiser re-registers, in seconds (default 300). A testing aid; not used when macOS `dns-sd` does the advertising. |
 | `RUST_LOG` | Library logging to stderr, for example `RUST_LOG=mdns_sd=debug` |
 
@@ -406,23 +495,35 @@ directory, set `ESTIA_DATA_DIR` before installing.
 - **Tokens on every route.** Everything except `/engine/health`, the two
   pairing routes and the static `/client` page needs a bearer token, on
   loopback too. `--no-auth` turns this off and is allowed on loopback only.
+- **Known host names only.** Requests for a `Host` the engine does not
+  recognise, and cross-origin browser writes, get 403 before authentication
+  (see [Host names](#host-names)). A web page cannot reach the engine by DNS
+  rebinding, even with `--no-auth`.
 - **Scopes.** `generate`, `embed`, `models:read`, `models:write`, `admin`.
   `admin` includes the others. Give each client the least it needs.
 - **Hashed at rest.** Tokens are 24 random bytes, shown once when minted.
   `tokens.json` stores only their SHA-256 hashes. A running server picks up
-  tokens minted by the CLI without a restart. It can keep accepting a token
-  removed with `estia token revoke` until it restarts, so restart it after a
-  revoke.
+  tokens minted or revoked by the CLI on the next request; no restart is
+  needed.
 - **Pairing.** Anyone who can reach the port can file a pairing request, so
-  approvals are manual and requests expire after 5 minutes. An approved token
-  waits in `pairings.json` in plain text until the device's next poll collects
-  it, then it is removed. Whoever can write the data directory can approve
-  pairings and mint tokens.
+  approvals are manual, requests expire after 5 minutes, and names are
+  restricted so they cannot rewrite your terminal. `estia pair approve` will
+  not grant `admin` without `--allow-admin`. An approved token waits in
+  `pairings.json` (mode 0600) in plain text until the device's next poll
+  collects it, then it is removed. Denying an approved pairing revokes its
+  token. Whoever can write the data directory can approve pairings and mint
+  tokens.
 - **No TLS.** Tokens, prompts and outputs cross the network unencrypted. Serve
   the LAN only on a network you trust. For anything else, keep the server on
   loopback and reach it through a tunnel you trust, such as SSH port
   forwarding.
-- **No rate limiting**, apart from the cap of 24 pending pairing requests.
+- **Limits, not rate limiting.** There is no per-client request rate limit.
+  There are caps: 24 pending pairing requests, 4 from one address; 8192
+  `max_tokens`; 256 inputs per embedding request; a 10-second limit to send a
+  request's headers (which also closes idle keep-alive connections); 32 open
+  connections per client address (loopback exempt); and a total connection cap
+  kept below the open-files limit, which the server raises at start. The
+  server speaks HTTP/1.1 only.
 - **The browser client** keeps its token in the page's `localStorage`.
 - **Downloads.** The Python build is checked against a SHA-256 pinned in the
   source. Model weights are checked against the SHA-256 Hugging Face publishes
@@ -448,7 +549,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `estia-server` | `server/` | The axum server: `/v1/*`, `/engine/*`, tokens, pairing, Bonjour |
 | `estia` | `cli/` | The `estia` binary |
 
-`clients/web/index.html` is the `/client` page, compiled into the server.
+`server/client/index.html` is the `/client` page, compiled into the server
+(`clients/web/index.html` is a link to it).
 
 **Runners** are the processes that run models. The engine talks to them with a
 newline-delimited JSON protocol, currently version 2: one request per line on
@@ -474,8 +576,8 @@ resident runner.
 See [runners/README.md](runners/README.md) for how each is built.
 
 The **Python runtime** is a pinned `python-build-standalone` build (Python
-3.12.7 for arm64 macOS) with `mlx-vlm` and `mlx-embeddings` installed from
-PyPI, all under `<data dir>/runtime/`. No system Python, Homebrew or pip is
+3.12.7 for arm64 macOS) with `mlx-vlm`, `mlx-lm` and `mlx-embeddings`
+installed from PyPI, all under `<data dir>/runtime/`. No system Python, Homebrew or pip is
 needed.
 
 **Structured output.** The MLX runner cannot constrain decoding, so the engine
@@ -496,7 +598,13 @@ number.
 
 Estia is licensed under the Apache License 2.0. See [LICENSE](LICENSE) and
 [NOTICE](NOTICE). The licence covers the code, not the names "Estia" or
-"ModelCaddy".
+"ModelCaddy"; see [TRADEMARKS.md](TRADEMARKS.md).
+
+The release binary links many Rust crates, under MIT, Apache-2.0, BSD-3-Clause
+and Unicode-3.0 licences. Each release tarball includes
+`THIRD_PARTY_LICENSES` with their licence texts, generated from `Cargo.lock`
+by [cargo-about](https://github.com/EmbarkStudios/cargo-about) (configuration
+in `about.toml`).
 
 Models and the Python packages Estia downloads come under their own licences.
 The Gemma models are under the Gemma Terms of Use. `GET /engine/models` lists

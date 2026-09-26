@@ -13,6 +13,11 @@
 //! and auth on; LAN clients pair for a token. One engine per machine:
 //! `engine.json` in the data directory records where it bound, and a second
 //! `serve` refuses when that port answers.
+//!
+//! In front of auth sits a DNS-rebinding guard ([`HostPolicy`]): a request is
+//! served only when its `Host` is an IP literal, `localhost`, a `.local` name,
+//! this machine's hostname or a name the operator allowed, and a state-changing
+//! request carrying an `Origin` must come from the same origin it is sent to.
 
 pub mod engine_api;
 pub mod jobs;
@@ -24,7 +29,7 @@ pub mod toolcalls;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{header, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -38,12 +43,16 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokens::TokenStore;
 
 /// Version of the `/engine/*` contract. Clients check it in `/engine/health`.
 pub const API_VERSION: u32 = 1;
+
+/// Environment variable with extra `Host` names to answer to, comma-separated.
+/// Same syntax as [`ServeOptions::allowed_hosts`].
+pub const ALLOWED_HOSTS_ENV: &str = "ESTIA_ALLOWED_HOSTS";
 
 pub struct AppState {
     pub engine: Arc<Engine>,
@@ -57,11 +66,20 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     gen: Mutex<HashMap<String, Arc<GenSession>>>,
     embed: Mutex<HashMap<String, Arc<EmbedSession>>>,
+    hosts: RwLock<HostPolicy>,
 }
 
 impl AppState {
+    /// Answers to IP literals, `localhost`, `.local` names, this machine's
+    /// hostname and whatever `ESTIA_ALLOWED_HOSTS` lists; add more with
+    /// [`AppState::allow_hosts`].
     pub fn new(engine: Arc<Engine>, tokens: TokenStore, require_auth: bool, bind: SocketAddr) -> Self {
         let data_dir = tokens.path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let mut hosts = HostPolicy::default();
+        hosts.allow(machine_hostnames());
+        if let Ok(v) = std::env::var(ALLOWED_HOSTS_ENV) {
+            hosts.allow([v]);
+        }
         Self {
             engine,
             tokens,
@@ -73,7 +91,22 @@ impl AppState {
             bind,
             gen: Mutex::new(HashMap::new()),
             embed: Mutex::new(HashMap::new()),
+            hosts: RwLock::new(hosts),
         }
+    }
+
+    /// Also answer to these `Host` names (see [`ServeOptions::allowed_hosts`]).
+    pub fn allow_hosts<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.hosts.write().unwrap_or_else(|e| e.into_inner()).allow(names);
+    }
+
+    /// The `Host` names this server currently answers to, beyond the built-in rules.
+    pub fn host_policy(&self) -> HostPolicy {
+        self.hosts.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The backend identity vectors from this server carry.
@@ -230,13 +263,12 @@ impl From<tokio::task::JoinError> for ApiError {
 }
 
 /// Which scope a request needs, by method and path. `None` = open.
-pub fn required_scope(method: &axum::http::Method, path: &str) -> Option<&'static str> {
-    use axum::http::Method;
+pub fn required_scope(method: &Method, path: &str) -> Option<&'static str> {
     match (method, path) {
         (_, "/engine/health") => None,
         // The bundled test client is a static page; everything it does goes
         // through the routes below with the token the user gives it.
-        (_, "/") | (_, "/client") => None,
+        (_, "/") | (_, "/client") | (_, "/client/") => None,
         (_, "/engine/runtime/install") => Some(tokens::SCOPE_ADMIN),
         // Pairing is how a client *gets* a token; it cannot require one.
         (_, p) if p == "/engine/pair" || p.starts_with("/engine/pair/") => None,
@@ -250,24 +282,299 @@ pub fn required_scope(method: &axum::http::Method, path: &str) -> Option<&'stati
     }
 }
 
-async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
-    let needed = required_scope(req.method(), req.uri().path());
-    let Some(scope) = needed else {
-        return next.run(req).await;
+/// Runs on matched routes only (a `route_layer`), so an unknown path is a 404
+/// from the fallback rather than a 401. Attaches the [`Caller`] every handler
+/// sees.
+async fn auth(State(state): State<Arc<AppState>>, mut req: Request<Body>, next: Next) -> Response {
+    let caller = match required_scope(req.method(), req.uri().path()) {
+        None => Caller::anonymous(),
+        Some(_) if !state.require_auth => Caller::anonymous(),
+        Some(scope) => {
+            let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+            let token = bearer.strip_prefix("Bearer ").unwrap_or("").trim();
+            if token.is_empty() {
+                return ApiError::unauthorized("missing bearer token (Authorization: Bearer …)").into_response();
+            }
+            match state.tokens.verify(token) {
+                Some(record) if record.allows(scope) => Caller::token(&record),
+                Some(_) => return ApiError::forbidden(format!("token lacks the `{scope}` scope")).into_response(),
+                None => return ApiError::unauthorized("unknown token").into_response(),
+            }
+        }
     };
-    if !state.require_auth {
-        return next.run(req).await;
+    req.extensions_mut().insert(caller.clone());
+    CURRENT_CALLER.scope(caller, next.run(req)).await
+}
+
+/// Who a request is from, as far as state shared between clients is concerned.
+///
+/// The auth middleware attaches one to every routed request, both as a request
+/// extension and as [`Caller::current`] for the handler's duration, so the
+/// prompt cache can be partitioned per token. That matters because the cache
+/// is an oracle: responses report how many prompt tokens came from it (and
+/// prefill time says the same), so a token that could reach another token's
+/// cache entry could test guesses against that conversation's prefix. With
+/// [`Caller::scoped_key`] two tokens never share an entry, even when they send
+/// the same `user` / `cache_key` or the same opening messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    /// The token's name, for display. `None` when unauthenticated.
+    pub name: Option<String>,
+    /// Cache namespace: the token's hash rather than its name, so a revoked
+    /// name minted again for another device does not inherit the old caches.
+    namespace: String,
+}
+
+tokio::task_local! {
+    static CURRENT_CALLER: Caller;
+}
+
+impl Caller {
+    /// A request authenticated with this token.
+    pub fn token(record: &tokens::TokenRecord) -> Self {
+        Caller { name: Some(record.name.clone()), namespace: format!("token:{}", record.sha256) }
     }
-    let header = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let token = header.strip_prefix("Bearer ").unwrap_or("").trim();
-    if token.is_empty() {
-        return ApiError::unauthorized("missing bearer token (Authorization: Bearer …)").into_response();
+
+    /// No identity: auth is off (`--no-auth`, loopback only) or the route is
+    /// open. All such requests share one namespace.
+    pub fn anonymous() -> Self {
+        Caller { name: None, namespace: "anonymous".to_string() }
     }
-    match state.tokens.verify(token) {
-        Some(record) if record.allows(scope) => next.run(req).await,
-        Some(_) => ApiError::forbidden(format!("token lacks the `{scope}` scope")).into_response(),
-        None => ApiError::unauthorized("unknown token").into_response(),
+
+    /// The caller of the request this task is handling — the same value as the
+    /// request's `Caller` extension. [`Caller::anonymous`] outside a request.
+    pub fn current() -> Self {
+        CURRENT_CALLER.try_with(Caller::clone).unwrap_or_else(|_| Caller::anonymous())
     }
+
+    /// The prompt-cache key to hand the runner for this caller, from the
+    /// client's key (`user`, `cache_key`) or [`derive_cache_key`]. An empty
+    /// key stays empty: the runner reads that as "no cache", as before.
+    pub fn scoped_key(&self, raw: &str) -> String {
+        use sha2::{Digest, Sha256};
+        if raw.is_empty() {
+            return String::new();
+        }
+        let mut h = Sha256::new();
+        h.update(self.namespace.as_bytes());
+        h.update([0]);
+        h.update(raw.as_bytes());
+        h.finalize().iter().take(16).map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// Which `Host` names the engine answers to: the DNS-rebinding guard.
+///
+/// A web page can point a DNS name it controls at 127.0.0.1 (or a LAN
+/// address) and then talk to the engine as a same-origin page, reading every
+/// response. What it cannot do is make the browser send a `Host` other than
+/// its own name, so the engine refuses names it does not know. Always allowed:
+/// IP literals (v4 and v6, any port), `localhost` and `*.localhost`, `*.local`
+/// (mDNS, which a remote site cannot answer), and this machine's hostname,
+/// short and fully qualified. The port is never checked: the attacker picks
+/// the name, not the port, and port-forwards would break.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostPolicy {
+    /// `*` was given: the check is off (a reverse proxy that validates Host).
+    any: bool,
+    exact: Vec<String>,
+    /// From `*.example.com`: matches `a.example.com`, not `example.com`.
+    suffixes: Vec<String>,
+}
+
+impl HostPolicy {
+    /// Add names. Each item may itself be a comma-separated list; a port is
+    /// ignored; `*.example.com` allows every subdomain; `*` allows any name.
+    pub fn allow<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for item in names {
+            for raw in item.as_ref().split(',') {
+                let raw = raw.trim();
+                if raw == "*" {
+                    self.any = true;
+                    continue;
+                }
+                let (wild, rest) = match raw.strip_prefix("*.").or_else(|| raw.strip_prefix('.')) {
+                    Some(r) => (true, r),
+                    None => (false, raw),
+                };
+                let Some(HostName::Name(name)) = parse_host(rest) else { continue };
+                let list = if wild { &mut self.suffixes } else { &mut self.exact };
+                let entry = if wild { format!(".{name}") } else { name };
+                if !list.contains(&entry) {
+                    list.push(entry);
+                }
+            }
+        }
+    }
+
+    /// Is a request with this `Host` header value for us?
+    pub fn allows(&self, host: &str) -> bool {
+        match parse_host(host) {
+            None => false,
+            Some(HostName::Ip) => true,
+            Some(HostName::Name(n)) => {
+                self.any
+                    || n == "localhost"
+                    || n.ends_with(".localhost")
+                    || n.ends_with(".local")
+                    || self.exact.contains(&n)
+                    || self.suffixes.iter().any(|s| n.ends_with(s.as_str()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HostName {
+    Ip,
+    /// Lowercased, without port or trailing dot.
+    Name(String),
+}
+
+/// Split `host[:port]` / `[v6][:port]` into the host (lowercased, trailing dot
+/// dropped, brackets kept for v6) and the port. `None` when malformed.
+fn split_host_port(s: &str) -> Option<(String, Option<u16>)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (host, port) = if s.starts_with('[') {
+        let end = s.find(']')?;
+        let (h, rest) = s.split_at(end + 1);
+        match rest {
+            "" => (h, None),
+            r => (h, Some(r.strip_prefix(':')?)),
+        }
+    } else if s.parse::<std::net::IpAddr>().is_ok() {
+        // A bare IPv6 literal (not valid in a Host header, but unambiguous).
+        (s, None)
+    } else {
+        match s.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (s, None),
+        }
+    };
+    let port = match port {
+        None => None,
+        Some(p) => Some(p.parse::<u16>().ok()?),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() || (host.contains(':') && !host.starts_with('[') && host.parse::<std::net::IpAddr>().is_err()) {
+        return None;
+    }
+    Some((host, port))
+}
+
+fn parse_host(s: &str) -> Option<HostName> {
+    let (host, _) = split_host_port(s)?;
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(&host);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return Some(HostName::Ip);
+    }
+    if host.starts_with('[') {
+        return None;
+    }
+    Some(HostName::Name(host))
+}
+
+/// Does `origin` (an `Origin` header) name the same scheme-host-port the
+/// request was sent to (`host`, its `Host` header)? `null` never does.
+fn same_origin(origin: &str, host: &str) -> bool {
+    let Some((scheme, rest)) = origin.trim().split_once("://") else { return false };
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return false,
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    match (split_host_port(authority), split_host_port(host)) {
+        (Some((oh, op)), Some((hh, hp))) => oh == hh && op.unwrap_or(default_port) == hp.unwrap_or(default_port),
+        _ => false,
+    }
+}
+
+/// This machine's hostname, short and fully qualified (`hostname -s`,
+/// `hostname`; the kernel's name on a Linux without the command), computed
+/// once per process.
+fn machine_hostnames() -> Vec<String> {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            let run = |args: &[&str]| {
+                std::process::Command::new("hostname")
+                    .args(args)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            };
+            let mut v: Vec<String> = [run(&["-s"]), run(&[])].into_iter().flatten().collect();
+            if v.is_empty() {
+                if let Ok(s) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
+                    v.extend(Some(s.trim().to_string()).filter(|s| !s.is_empty()));
+                }
+            }
+            v.dedup();
+            v
+        })
+        .clone()
+}
+
+/// The DNS-rebinding and cross-origin guard; outermost, so it covers open
+/// routes (health, pairing, the client page) and unknown paths too.
+async fn host_guard(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+    // HTTP/2 carries the authority in the URI rather than a Host header.
+    let host = match req.headers().get(header::HOST) {
+        Some(v) => match v.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => return ApiError::forbidden("unreadable Host header").into_response(),
+        },
+        None => req.uri().authority().map(|a| a.to_string()),
+    };
+    // No Host at all is not a browser (browsers always send one), so it
+    // cannot be a rebinding page; let it through.
+    if let Some(h) = &host {
+        if !state.hosts.read().unwrap_or_else(|e| e.into_inner()).allows(h) {
+            let Some(HostName::Name(name)) = parse_host(h) else {
+                return ApiError::forbidden(format!("malformed Host header `{h}`")).into_response();
+            };
+            return ApiError::forbidden(format!(
+                "this engine does not answer to the host name `{name}` (DNS-rebinding guard). Use an IP address, \
+                 localhost or <machine>.local, or allow the name with `estia serve --allow-host {name}` \
+                 or {ALLOWED_HOSTS_ENV}={name}"
+            ))
+            .into_response();
+        }
+    }
+    // A state-changing request from a browser page must come from the origin
+    // it is sent to. Same-origin pages (the /client page) send a matching
+    // Origin; non-browser clients send none.
+    if !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        if let Some(origin) = req.headers().get(header::ORIGIN) {
+            let origin = origin.to_str().unwrap_or("");
+            let ok = host.as_deref().is_some_and(|h| same_origin(origin, h));
+            if !ok {
+                return ApiError::forbidden(format!(
+                    "cross-origin request refused: Origin `{origin}` is not the origin this request was sent to (`{}`)",
+                    host.as_deref().unwrap_or("")
+                ))
+                .into_response();
+            }
+        }
+    }
+    next.run(req).await
+}
+
+/// JSON 404 for paths no route matches (instead of a bare 404, or the 401 an
+/// unknown path got while auth ran on everything).
+async fn no_route(method: Method, uri: axum::http::Uri) -> ApiError {
+    ApiError::not_found(format!("no route for {method} {}", uri.path()))
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -296,8 +603,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/engine/jobs/:id/events", get(engine_api::job_events))
         .route("/engine/runtime/install", post(engine_api::install_runtime))
         .route("/client", get(client_page))
+        .route("/client/", get(|| async { axum::response::Redirect::permanent("/client") }))
         .route("/", get(|| async { axum::response::Redirect::temporary("/client") }))
-        .layer(middleware::from_fn_with_state(Arc::clone(&state), auth))
+        // Auth on matched routes only; `required_scope` stays fail-closed for
+        // every one of them.
+        .route_layer(middleware::from_fn_with_state(Arc::clone(&state), auth))
+        .fallback(no_route)
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), host_guard))
         .with_state(state)
 }
 
@@ -319,8 +631,24 @@ pub fn engine_record_path(data_dir: &std::path::Path) -> PathBuf {
 pub fn another_engine_running(data_dir: &std::path::Path) -> Option<EngineRecord> {
     let text = std::fs::read_to_string(engine_record_path(data_dir)).ok()?;
     let rec: EngineRecord = serde_json::from_str(&text).ok()?;
-    let addr: SocketAddr = format!("{}:{}", rec.bind, rec.port).parse().ok()?;
+    let addr = rec.dial_addr()?;
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok().map(|_| rec)
+}
+
+impl EngineRecord {
+    /// Where a local client reaches this engine: the bound address, with a
+    /// wildcard bind (`0.0.0.0`, `::`) mapped to loopback of the same family.
+    /// Parsed as an IP rather than as `"{bind}:{port}"`, which an IPv6 bind
+    /// such as `::1` does not survive.
+    pub fn dial_addr(&self) -> Option<SocketAddr> {
+        let ip: std::net::IpAddr = self.bind.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
+        let ip = match ip {
+            std::net::IpAddr::V4(v4) if v4.is_unspecified() => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(v6) if v6.is_unspecified() => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            other => other,
+        };
+        Some(SocketAddr::new(ip, self.port))
+    }
 }
 
 /// How the daemon presents itself on the network.
@@ -334,6 +662,12 @@ pub struct ServeOptions {
     pub name: Option<String>,
     /// Drop a resident model after this much idle time (None = never).
     pub idle_unload: Option<std::time::Duration>,
+    /// Extra `Host` names to answer to (the CLI's `--allow-host`, repeatable),
+    /// on top of IP literals, `localhost`, `*.local`, this machine's hostname
+    /// and `ESTIA_ALLOWED_HOSTS`. For a reverse proxy or a name like
+    /// `studio.lan`. An entry may be a comma-separated list; `*.example.com`
+    /// allows the subdomains; `*` switches the DNS-rebinding guard off.
+    pub allowed_hosts: Vec<String>,
 }
 
 pub const MDNS_SERVICE_TYPE: &str = "_estia._tcp.local.";
@@ -389,10 +723,7 @@ impl Registration {
     fn stop(self) {
         match self {
             #[cfg(target_os = "macos")]
-            Registration::System(mut c) => {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
+            Registration::System(c) => stop_tethered(c),
             Registration::Rust(d) => {
                 let _ = d.shutdown();
             }
@@ -424,14 +755,10 @@ impl Registration {
 #[cfg(target_os = "macos")]
 fn register_via_dns_sd(port: u16, instance: &str) -> anyhow::Result<std::process::Child> {
     let ty = MDNS_SERVICE_TYPE.trim_end_matches(".local.");
-    let mut cmd = std::process::Command::new("dns-sd");
-    cmd.arg("-R").arg(instance).arg(ty).arg("local.").arg(port.to_string());
-    for (k, v) in advert_props() {
-        cmd.arg(format!("{k}={v}"));
-    }
-    // The registration lives as long as the process; nothing is read back.
-    cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).stdin(std::process::Stdio::null());
-    let mut child = cmd.spawn()?;
+    let mut args: Vec<String> = vec!["-R".into(), instance.into(), ty.into(), "local.".into(), port.to_string()];
+    args.extend(advert_props().into_iter().map(|(k, v)| format!("{k}={v}")));
+    // The registration lives exactly as long as this process; nothing is read back.
+    let mut child = spawn_tethered("dns-sd", &args)?;
     // `dns-sd` exits immediately on a bad type or a missing responder; give it
     // a moment and fail loudly rather than supervising a corpse.
     std::thread::sleep(std::time::Duration::from_millis(400));
@@ -439,6 +766,59 @@ fn register_via_dns_sd(port: u16, instance: &str) -> anyhow::Result<std::process
         anyhow::bail!("dns-sd -R exited immediately ({status})");
     }
     Ok(child)
+}
+
+/// Runs `program` under a small `sh` that ends it when our end of its stdin
+/// pipe closes, which happens however this process ends: a clean stop, a
+/// panic, SIGKILL, an OOM kill. A `dns-sd -R` child that merely had its stdin
+/// set to null outlived a killed server, was adopted by launchd and kept
+/// advertising an engine that no longer existed (one more after every crash
+/// under the service's restart policy).
+///
+/// The returned child is the `sh`; it exits when `program` does, so
+/// `try_wait` on it still reports a registrar that died. The watcher is
+/// stopped once `program` has exited, so it never signals a recycled pid.
+/// Stop it with [`stop_tethered`], not `kill`: SIGKILL on the `sh` alone
+/// would leave `program` behind until the pipe closes.
+#[cfg(target_os = "macos")]
+fn spawn_tethered(program: &str, args: &[String]) -> std::io::Result<std::process::Child> {
+    const TETHER: &str = "exec 3<&0 </dev/null
+\"$@\" >/dev/null 2>&1 3<&- &
+p=$!
+{ read _ <&3; kill \"$p\" 2>/dev/null; } &
+r=$!
+exec 3<&-
+wait \"$p\"
+s=$?
+kill \"$r\" 2>/dev/null
+exit \"$s\"";
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(TETHER)
+        .arg("estia-tether")
+        .arg(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+/// Stop a [`spawn_tethered`] child: close its pipe so the watcher ends the
+/// program, then reap the `sh`, killing it only if it has not gone within
+/// two seconds (the closed pipe still takes the program down).
+#[cfg(target_os = "macos")]
+fn stop_tethered(mut child: std::process::Child) {
+    drop(child.stdin.take());
+    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Register the mDNS advertisement with our own multicast sockets.
@@ -587,8 +967,51 @@ fn refresh_interval() -> std::time::Duration {
 
 /// The test client: one static page, no build step, same origin as the API so
 /// a phone on the LAN opens `http://<host>:<port>/client` and nothing else.
-async fn client_page() -> axum::response::Html<&'static str> {
-    axum::response::Html(include_str!("../../clients/web/index.html"))
+async fn client_page() -> impl axum::response::IntoResponse {
+    use axum::http::header;
+    (
+        [
+            (header::CONTENT_SECURITY_POLICY, client_csp()),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        axum::response::Html(CLIENT_PAGE),
+    )
+}
+
+const CLIENT_PAGE: &str = include_str!("../client/index.html");
+
+/// Content-Security-Policy for the test page. Its one inline script is allowed
+/// by hash, so markup injected through a server-supplied string cannot run
+/// script (`'unsafe-inline'` would let an injected `onerror=` run). The page
+/// may talk to any engine URL the user types, hence `connect-src *`.
+fn client_csp() -> &'static str {
+    static CSP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let start = CLIENT_PAGE.find("<script>").map(|i| i + "<script>".len()).unwrap_or(0);
+        let end = CLIENT_PAGE[start..].find("</script>").map(|i| start + i).unwrap_or(start);
+        let digest = Sha256::digest(&CLIENT_PAGE.as_bytes()[start..end]);
+        format!(
+            "default-src 'none'; script-src 'sha256-{}'; style-src 'unsafe-inline'; connect-src *; img-src 'self' data:; \
+             frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            base64_std(&digest)
+        )
+    })
+}
+
+fn base64_std(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// Bind and serve until Ctrl-C. A non-loopback bind needs `opts.lan` and
@@ -604,13 +1027,14 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         }
     }
     if let Some(rec) = another_engine_running(&data_dir) {
+        let host = if rec.bind.contains(':') { format!("[{}]", rec.bind) } else { rec.bind.clone() };
         anyhow::bail!(
-            "an engine is already running for this data directory (pid {} on {}:{}); one engine per machine",
+            "an engine is already running for this data directory (pid {} on {host}:{}); one engine per machine",
             rec.pid,
-            rec.bind,
             rec.port
         );
     }
+    state.allow_hosts(&opts.allowed_hosts);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let record = EngineRecord {
@@ -665,8 +1089,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         });
     }
     let app = router(state);
-    let result =
-        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await;
+    let result = serve_router(listener, app, ConnLimits::default(), shutdown_signal()).await;
     let _ = std::fs::remove_file(engine_record_path(&data_dir));
     if let Some(t) = advert_task {
         t.abort();
@@ -679,6 +1102,161 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         }
     }
     result?;
+    Ok(())
+}
+
+/// Connection limits for [`serve_router`].
+///
+/// Without them a few hundred connections that never finish their request
+/// head exhaust the process's file descriptors (launchd starts agents with a
+/// soft limit of 256): `accept` fails, and so do runner spawns, which need
+/// pipes. Nothing needs a token to do that.
+#[derive(Debug, Clone)]
+pub struct ConnLimits {
+    /// Longest a client may take to send a request head. The timer restarts
+    /// at every request, so it also closes idle keep-alive connections.
+    pub header_read_timeout: std::time::Duration,
+    /// Most connections one peer may hold (IPv6 counted per /64).
+    pub per_peer: usize,
+    /// Loopback peers skip `per_peer` (a local process can do worse anyway).
+    pub exempt_loopback: bool,
+    /// Most connections in total; `None` sizes it from the open-files limit,
+    /// which [`serve_router`] first raises.
+    pub total: Option<usize>,
+}
+
+impl Default for ConnLimits {
+    fn default() -> Self {
+        ConnLimits { header_read_timeout: std::time::Duration::from_secs(10), per_peer: 32, exempt_loopback: true, total: None }
+    }
+}
+
+/// File descriptors kept free for runner pipes, `tokens.json` / `config.json`
+/// writes and logs, below the connection cap.
+const FD_HEADROOM: u64 = 64;
+
+/// Raise the soft open-files limit toward the hard one; returns the soft limit
+/// now in force. macOS refuses more than `OPEN_MAX` (10240) here.
+#[allow(clippy::unnecessary_cast)] // rlim_t is not u64 on every target
+fn raise_fd_limit() -> u64 {
+    #[cfg(unix)]
+    // SAFETY: getrlimit/setrlimit only read and write the struct we pass.
+    unsafe {
+        let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return 256;
+        }
+        for want in [rl.rlim_max.min(65_536), 10_240, 4_096] {
+            if want <= rl.rlim_cur {
+                break;
+            }
+            let new = libc::rlimit { rlim_cur: want, rlim_max: rl.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &new) == 0 {
+                return want as u64;
+            }
+        }
+        rl.rlim_cur as u64
+    }
+    #[cfg(not(unix))]
+    1_024
+}
+
+/// A peer's share of the connection budget, returned when the connection ends.
+struct PeerSlot {
+    map: Arc<Mutex<HashMap<std::net::IpAddr, usize>>>,
+    key: Option<std::net::IpAddr>,
+}
+
+impl PeerSlot {
+    fn take(map: &Arc<Mutex<HashMap<std::net::IpAddr, usize>>>, ip: std::net::IpAddr, limits: &ConnLimits) -> Option<Self> {
+        let ip = ip.to_canonical();
+        if limits.exempt_loopback && ip.is_loopback() {
+            return Some(PeerSlot { map: Arc::clone(map), key: None });
+        }
+        // One IPv6 host can use a whole /64; count it as one peer.
+        let key = match ip {
+            std::net::IpAddr::V6(v6) => std::net::IpAddr::V6((u128::from(v6) & !0u128 << 64).into()),
+            v4 => v4,
+        };
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(key).or_insert(0);
+        if *n >= limits.per_peer {
+            return None;
+        }
+        *n += 1;
+        Some(PeerSlot { map: Arc::clone(map), key: Some(key) })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let Some(key) = self.key else { return };
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&key) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&key);
+            }
+        }
+    }
+}
+
+/// Serve `app` on `listener` over HTTP/1.1 until `shutdown` resolves, with
+/// the limits `axum::serve` lacks: a request-head timeout, a per-peer
+/// connection cap and a total cap below the open-files limit. Accept errors
+/// are printed (there is no tracing subscriber to catch them). On shutdown,
+/// in-flight requests get ten seconds; a long SSE stream does not hold the
+/// process hostage.
+pub async fn serve_router(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ConnLimits,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
+    use tower_service::Service as _;
+    let soft = raise_fd_limit();
+    let total = limits.total.unwrap_or_else(|| soft.saturating_sub(FD_HEADROOM).clamp(16, 4_096) as usize);
+    let budget = Arc::new(tokio::sync::Semaphore::new(total));
+    let peers: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> = Arc::default();
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(limits.header_read_timeout);
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut make = app.into_make_service_with_connect_info::<SocketAddr>();
+    tokio::pin!(shutdown);
+    loop {
+        // Take a slot before accepting: at the cap, new connections wait in
+        // the kernel's backlog instead of costing us a descriptor.
+        let permit = tokio::select! {
+            p = Arc::clone(&budget).acquire_owned() => p.expect("the semaphore is never closed"),
+            () = &mut shutdown => break,
+        };
+        let (stream, peer) = tokio::select! {
+            r = listener.accept() => match r {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("accept failed: {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        let Some(slot) = PeerSlot::take(&peers, peer.ip(), &limits) else {
+            // This peer holds its share already; close at once.
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let svc = make.call(peer).await.unwrap_or_else(|e| match e {});
+        let conn = http.serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(svc));
+        let conn = graceful.watch(conn);
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(slot);
+            drop(permit);
+        });
+    }
+    drop(listener);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), graceful.shutdown()).await;
     Ok(())
 }
 
@@ -894,6 +1472,8 @@ fn discover_via_dns_sd(window: std::time::Duration) -> Vec<Discovered> {
 
 /// Stable conversation key for the prompt cache when the client gives none:
 /// the model, the leading system message(s) and the first non-system turn.
+/// Handlers pass it (or the client's key) through [`Caller::scoped_key`], so
+/// two tokens with the same opening still get separate cache entries.
 /// That prefix is identical on every turn of a conversation that grows by
 /// appending, so turn two reuses turn one's KV cache. (Hashing a fixed count
 /// of messages did not: turn one has one message, turn two starts
@@ -915,8 +1495,32 @@ pub fn derive_cache_key(model: &str, messages: &[estia_engine::proto::Message]) 
 
 #[cfg(test)]
 mod cache_key_tests {
-    use super::derive_cache_key;
+    use super::{derive_cache_key, tokens::TokenRecord, Caller};
     use estia_engine::proto::Message;
+
+    fn caller(name: &str, sha: &str) -> Caller {
+        Caller::token(&TokenRecord { name: name.into(), sha256: sha.into(), scopes: vec![], created_unix: 0 })
+    }
+
+    /// What reaches the runner is always per caller: the same raw key (a
+    /// client's `user`, or a derived key from the same opening) never names
+    /// the same cache entry for two tokens.
+    #[test]
+    fn scoped_per_caller() {
+        let (a, b) = (caller("alice", "aa"), caller("bob", "bb"));
+        let raw = derive_cache_key("m", &[Message::new("user", "hi")]);
+        assert_eq!(a.scoped_key(&raw), a.scoped_key(&raw), "stable for one caller");
+        assert_ne!(a.scoped_key(&raw), b.scoped_key(&raw));
+        assert_ne!(a.scoped_key("conv-1"), b.scoped_key("conv-1"));
+        assert_ne!(a.scoped_key("conv-1"), "conv-1");
+        assert_ne!(a.scoped_key("conv-1"), a.scoped_key("conv-2"));
+        assert_ne!(a.scoped_key("conv-1"), Caller::anonymous().scoped_key("conv-1"));
+        // Keyed by the token's hash, not its name: a name minted again for
+        // another device does not inherit the old caches.
+        assert_ne!(caller("alice", "aa").scoped_key("k"), caller("alice", "a2").scoped_key("k"));
+        assert_eq!(a.scoped_key(""), "", "an empty key still means no cache");
+        assert_eq!(Caller::current(), Caller::anonymous(), "outside a request");
+    }
 
     #[test]
     fn stable_as_a_conversation_grows() {
@@ -934,6 +1538,78 @@ mod cache_key_tests {
         assert_ne!(derive_cache_key("m", &t1), derive_cache_key("m", &s1), "system prompt is part of the key");
         assert_ne!(derive_cache_key("m", &t1), derive_cache_key("other", &t1), "model is part of the key");
         assert_ne!(derive_cache_key("m", &t1), derive_cache_key("m", &[Message::new("user", "bye")]));
+    }
+}
+
+#[cfg(test)]
+mod host_guard_tests {
+    use super::{same_origin, HostPolicy};
+
+    #[test]
+    fn built_in_names_and_ip_literals() {
+        let p = HostPolicy::default();
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:27200",
+            "10.0.0.5:1",
+            "[::1]",
+            "[::1]:27200",
+            "[fe80::1]:80",
+            "::1",
+            "localhost",
+            "LOCALHOST:27200",
+            "localhost.",
+            "a.localhost",
+            "mac.local",
+            "Mac.Local.:27200",
+        ] {
+            assert!(p.allows(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "evil.example:27200",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "local",
+            "notlocalhost",
+            "evil.localhost.example",
+            "[::1",
+            "[evil.example]:80",
+            "a:b:c",
+            "mac.local:notaport",
+        ] {
+            assert!(!p.allows(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn operator_names() {
+        let mut p = HostPolicy::default();
+        p.allow(["studio.lan:27200,  *.tail.example", "", "10.0.0.1", ".corp.example"]);
+        assert!(p.allows("studio.lan") && p.allows("STUDIO.lan.:1"));
+        assert!(p.allows("mac.tail.example") && !p.allows("tail.example") && !p.allows("mac.tail.example.evil"));
+        assert!(p.allows("x.corp.example"));
+        assert!(!p.allows("evil.example"));
+        p.allow(["*"]);
+        assert!(p.allows("evil.example"), "`*` switches the guard off");
+        assert!(!p.allows("[evil"), "but a malformed Host is still refused");
+    }
+
+    #[test]
+    fn origin_matching() {
+        assert!(same_origin("http://127.0.0.1:27200", "127.0.0.1:27200"));
+        assert!(same_origin("http://Mac.local:27200", "mac.local:27200"));
+        assert!(same_origin("http://[::1]:27200", "[::1]:27200"));
+        assert!(same_origin("http://example.lan", "example.lan:80"), "default port");
+        assert!(same_origin("https://proxy.example", "proxy.example"), "TLS-terminating proxy that keeps Host");
+        assert!(!same_origin("http://127.0.0.1:27201", "127.0.0.1:27200"));
+        assert!(!same_origin("http://localhost:27200", "127.0.0.1:27200"));
+        assert!(!same_origin("http://evil.example", "127.0.0.1:27200"));
+        assert!(!same_origin("null", "127.0.0.1:27200"));
+        assert!(!same_origin("", "127.0.0.1:27200"));
+        assert!(!same_origin("file://", "127.0.0.1:27200"));
+        assert!(!same_origin("http://127.0.0.1:27200", ""));
     }
 }
 
@@ -985,5 +1661,143 @@ mod advert_tests {
         let found = discover_via_dns_sd(std::time::Duration::from_secs(4));
         a.stop();
         assert!(found.iter().any(|d| d.name == "estia-test-probe"), "dns-sd fallback did not see the probe: {found:?}");
+    }
+}
+
+#[cfg(test)]
+mod engine_record_tests {
+    use super::*;
+
+    fn rec(bind: &str) -> EngineRecord {
+        EngineRecord { pid: 1, port: 27182, bind: bind.to_string(), started_unix: 0, api_version: API_VERSION }
+    }
+
+    /// `"{bind}:{port}"` does not parse for an IPv6 bind, which made a running
+    /// `serve --bind ::1` invisible to `status`, `dashboard` and the
+    /// one-engine-per-data-dir guard.
+    #[test]
+    fn dial_addr_handles_ipv6_and_wildcards() {
+        assert_eq!(rec("127.0.0.1").dial_addr(), Some("127.0.0.1:27182".parse().unwrap()));
+        assert_eq!(rec("::1").dial_addr(), Some("[::1]:27182".parse().unwrap()));
+        assert_eq!(rec("[::1]").dial_addr(), Some("[::1]:27182".parse().unwrap()));
+        assert_eq!(rec("0.0.0.0").dial_addr(), Some("127.0.0.1:27182".parse().unwrap()));
+        assert_eq!(rec("::").dial_addr(), Some("[::1]:27182".parse().unwrap()));
+        assert_eq!(rec("192.168.1.7").dial_addr(), Some("192.168.1.7:27182".parse().unwrap()));
+        assert_eq!(rec("not-an-ip").dial_addr(), None);
+    }
+
+    #[test]
+    fn another_engine_running_sees_an_ipv6_listener() {
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            eprintln!("skip: no IPv6 loopback");
+            return;
+        };
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "estia-engine-record-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut r = rec("::1");
+        r.port = listener.local_addr().unwrap().port();
+        std::fs::write(engine_record_path(&dir), serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(another_engine_running(&dir).is_some(), "an engine bound to ::1 is running");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tether_tests {
+    use super::*;
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    fn within(ms: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_millis(ms);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// A tethered `sleep` that reports its own pid, standing in for `dns-sd -R`.
+    fn tethered_sleeper() -> (std::process::Child, i32, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "estia-tether-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pidfile.display());
+        let child = spawn_tethered("/bin/sh", &["-c".to_string(), script]).expect("spawn");
+        let mut pid = 0;
+        assert!(
+            within(3_000, || {
+                pid = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                pid > 0
+            }),
+            "the tethered program started"
+        );
+        (child, pid, dir)
+    }
+
+    /// What a killed server looks like from the child's side: its end of the
+    /// pipe closes. The program must go, and the `sh` with it.
+    #[test]
+    fn closing_the_pipe_ends_the_program() {
+        let (mut child, pid, dir) = tethered_sleeper();
+        assert!(alive(pid));
+        drop(child.stdin.take());
+        assert!(within(3_000, || !alive(pid)), "the program outlived its parent's pipe");
+        assert!(within(3_000, || matches!(child.try_wait(), Ok(Some(_)))), "the sh exits too");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stop_reaps_the_program() {
+        let (child, pid, dir) = tethered_sleeper();
+        stop_tethered(child);
+        assert!(within(1_000, || !alive(pid)), "stop left the program running");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The advertiser's liveness check is `try_wait` on the `sh`, so a program
+    /// that dies on its own must end the `sh` while our end is still open.
+    #[test]
+    fn a_program_that_exits_ends_the_sh() {
+        let mut child = spawn_tethered("/bin/sh", &["-c".to_string(), "exit 3".to_string()]).expect("spawn");
+        assert!(within(3_000, || matches!(child.try_wait(), Ok(Some(_)))), "the sh outlived its program");
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+        drop(child.stdin.take());
+    }
+}
+
+#[cfg(test)]
+mod client_page_tests {
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        for (i, o) in
+            [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")]
+        {
+            assert_eq!(super::base64_std(i.as_bytes()), o);
+        }
+    }
+
+    #[test]
+    fn csp_pins_the_one_inline_script() {
+        let csp = super::client_csp();
+        assert!(csp.contains("script-src 'sha256-"), "{csp}");
+        assert!(!csp.split(';').any(|d| d.trim().starts_with("script-src") && d.contains("unsafe-inline")), "{csp}");
+        assert_eq!(super::CLIENT_PAGE.matches("<script").count(), 1, "one inline script, allowed by hash");
     }
 }

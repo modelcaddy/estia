@@ -67,9 +67,14 @@ const PBS_SHA256: Option<&str> = Some("4c18852bf9c1a11b56f21bcf0df1946f7e98ee43e
 /// The pip requirements of the MLX runner. `mlx-vlm` loads multimodal Gemma
 /// models for generation (floor, not pin: >= 0.6.13 is when it gained the
 /// `gemma4_unified` architecture the 12B QAT model needs); `mlx-embeddings`
-/// loads compact encoder models for embeddings.
+/// loads compact encoder models for embeddings. `mlx-lm` is named explicitly:
+/// mlx-vlm 0.6.x pulled it in (`mlx-lm>=0.31.3`) but 0.7 dropped it, and
+/// [`verify_install`] imports it and stamps its version, so a clean install
+/// that resolved mlx-vlm 0.7 failed verification without it.
 #[cfg(feature = "python-mlx")]
-const PIP_PACKAGES: &[&str] = &["mlx-vlm>=0.6.13", "mlx-embeddings"];
+// Capped below 0.7 until the runner is verified against it: 0.7 changed the
+// dependency set (see above) and nothing has been run on it yet.
+const PIP_PACKAGES: &[&str] = &["mlx-vlm>=0.6.13,<0.7", "mlx-lm>=0.31.3", "mlx-embeddings"];
 
 /// Fetch the release's sibling `<asset>.sha256` and return the 64-char hex
 /// digest. GitHub serves it right next to the asset.
@@ -622,8 +627,9 @@ where
     Ok(())
 }
 
-/// Cheap probe: true when the generation and embedding packages import in
-/// the given interpreter AND mlx-vlm meets the version floor. The floor
+/// Cheap probe: true when the generation and embedding packages (and mlx-lm,
+/// which [`verify_install`] stamps) import in the given interpreter AND
+/// mlx-vlm meets the version floor. The floor
 /// matters: the 12B QAT model is a `gemma4_unified` architecture that
 /// mlx-vlm < 0.6 cannot load, and installs from before the floor sit on 0.5.x
 /// forever unless this probe fails and triggers the top-up.
@@ -632,7 +638,7 @@ fn stack_importable(python_bin: &Path) -> bool {
     Command::new(python_bin)
         .args([
             "-c",
-            "import sys, mlx_vlm, mlx_embeddings\n\
+            "import sys, mlx_lm, mlx_vlm, mlx_embeddings\n\
              from importlib.metadata import version\n\
              v = tuple(int(x) for x in version('mlx-vlm').split('.')[:3])\n\
              sys.exit(0 if v >= (0, 6, 13) else 1)",

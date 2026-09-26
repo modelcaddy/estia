@@ -2,9 +2,10 @@
 //! to the engine. Extra engine facts ride in an `x_estia` field the client can
 //! ignore.
 
-use crate::{derive_cache_key, toolcalls, ApiError, AppState};
+use crate::engine_api::{capped_max_tokens, check_embed_inputs};
+use crate::{derive_cache_key, toolcalls, ApiError, AppState, Caller};
 use axum::{
-    extract::State,
+    extract::{Extension, State},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -53,7 +54,8 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub stream: Option<bool>,
-    /// OpenAI's end-user id; used as the prompt-cache key when present.
+    /// OpenAI's end-user id; used as the prompt-cache key when present, scoped
+    /// to the calling token like every cache key.
     #[serde(default)]
     pub user: Option<String>,
     /// Engine extension: `interactive` (default) or `background`.
@@ -167,7 +169,11 @@ fn x_estia(artifact: &estia_engine::models::Artifact, f: &Finished, backend: &st
     })
 }
 
-pub async fn chat_completions(State(state): State<Arc<AppState>>, Json(req): Json<ChatCompletionRequest>) -> Result<Response, ApiError> {
+pub async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Result<Response, ApiError> {
     let artifact = state.resolve_generation(&req.model)?;
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
@@ -175,8 +181,10 @@ pub async fn chat_completions(State(state): State<Arc<AppState>>, Json(req): Jso
     let messages = to_messages(&req.messages);
     let format = parse_response_format(&req.response_format)?;
     let tools = req.tools.clone().filter(|t| !t.is_empty());
-    let cache_key = req.user.clone().unwrap_or_else(|| derive_cache_key(artifact.id, &messages));
-    let max_tokens = req.max_completion_tokens.or(req.max_tokens).unwrap_or(1024);
+    // Per token: another token sending the same `user` gets its own entry.
+    let cache_key = caller.scoped_key(&req.user.clone().unwrap_or_else(|| derive_cache_key(artifact.id, &messages)));
+    // Same work caps as /engine/generate.
+    let max_tokens = capped_max_tokens(req.max_completion_tokens.or(req.max_tokens), 1024);
     let temperature = req.temperature.unwrap_or(0.2);
     let prio = priority_of(&req.priority);
     let backend = state.embed_backend();
@@ -413,6 +421,7 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<Embe
     if inputs.is_empty() {
         return Err(ApiError::bad_request("input must not be empty"));
     }
+    check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
     let fingerprint = model.fingerprint_for(state.embed_backend());
     if let Some(expected) = &req.expect_fingerprint {
