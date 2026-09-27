@@ -252,6 +252,9 @@ re-tested live on a scratch engine; the ids are the run's finding ids.
   backend is only this machine's default; running it again changes nothing.
   An explicit `--backend` (or `ESTIA_BACKEND`) is still saved.
 - `estia dashboard` shows `loaded : none` instead of a blank list.
+- CI and release builds use a pinned Rust (1.95.0) instead of the newest
+  stable, so a new Rust release cannot fail CI with new lints; it is bumped on
+  purpose (docs/versioning.md).
 
 ### Known limits
 

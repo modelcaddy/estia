@@ -331,7 +331,7 @@ async fn embeddings_in_base64_decode_to_the_floats() {
     for (i, item) in b64["data"].as_array().unwrap().iter().enumerate() {
         assert_eq!(item["index"], i);
         let bytes = b64_decode(item["embedding"].as_str().expect("a base64 string"));
-        let decoded: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        let decoded: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
         assert_eq!(decoded, VEC, "round trip");
         let as_floats: Vec<f32> = floats["data"][i]["embedding"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
         assert_eq!(decoded, as_floats, "the same vector either way");

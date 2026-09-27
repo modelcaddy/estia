@@ -25,6 +25,10 @@ permissions:
   contents: write
 
 env:
+  # The Rust release CI builds, lints and tests with. Pinned so a new stable
+  # release cannot turn CI red with lints nobody has seen locally; bump it on
+  # purpose (docs/versioning.md). The msrv job checks rust-version separately.
+  RUST_TOOLCHAIN: "1.95.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -39,8 +43,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --target "$TARGET"
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
 
       # For THIRD_PARTY_LICENSES (see about.toml). A pinned prebuilt binary,
       # checked against the hash install-action records for it.

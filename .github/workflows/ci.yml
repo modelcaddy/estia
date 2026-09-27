@@ -14,6 +14,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  # The Rust release CI builds, lints and tests with. Pinned so a new stable
+  # release cannot turn CI red with lints nobody has seen locally; bump it on
+  # purpose (docs/versioning.md). The msrv job checks rust-version separately.
+  RUST_TOOLCHAIN: "1.95.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -24,8 +28,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
       - run: cargo fmt --all --check
 
   test:
@@ -45,8 +49,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -88,8 +92,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@v2
 
       - name: Find the pinned llama.cpp build
@@ -292,8 +296,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.2

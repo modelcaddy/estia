@@ -240,6 +240,13 @@ rustup toolchain install 1.89.0 --profile minimal
 cargo +1.89.0 check --workspace --all-targets --all-features --locked
 ```
 
+Separately, CI and the release build use one pinned Rust release,
+`RUST_TOOLCHAIN` in `.github/workflows/ci.yml` and `release.yml` (now 1.95.0),
+so a new stable Rust cannot fail CI with lints that nobody has seen locally.
+Bump it on purpose: install the new version, run `cargo clippy --workspace
+--all-targets --locked -- -D warnings` with it, fix what it reports, and change
+both files in the same commit.
+
 ## Bumping the llama.cpp pin
 
 Estia installs one llama.cpp build per release, named in
