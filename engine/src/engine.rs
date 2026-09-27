@@ -791,7 +791,22 @@ mod tests {
         // A stand-in server: `sleep` under the name llama-server.
         let fake = dir.join("llama-server");
         std::fs::copy("/bin/sleep", &fake).unwrap();
-        let mut server = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+        // Linux: another test thread may fork while the copy is still open for
+        // writing, and exec then fails with ETXTBSY until that child execs or
+        // exits. Retry briefly instead of failing the test.
+        let mut server = {
+            let mut tries = 0;
+            loop {
+                match std::process::Command::new(&fake).arg("30").spawn() {
+                    Ok(child) => break child,
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("spawn the stand-in server: {e}"),
+                }
+            }
+        };
         let mut other = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
         // A dead adapter pid: a process that has exited and been reaped.
         let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
