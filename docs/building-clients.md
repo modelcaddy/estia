@@ -28,9 +28,12 @@ print(r.choices[0].message.content)
 ```
 
 The first request to a model starts a runner and loads the weights, which
-takes a few seconds. Later requests reuse it. The engine unloads a model after
-15 idle minutes by default (`estia serve --idle-unload-minutes`), so the next
-request pays the load again.
+takes a few seconds; requests that arrive meanwhile wait for that same load.
+Later requests reuse it. `x_estia.load_ms` says how long a request waited for
+a load (`null` when the model was ready), and `x_estia.ms` how long the
+generation took. The engine unloads a model after 15 idle minutes by default
+(`estia serve --idle-unload-minutes`), so the next request pays the load
+again.
 
 ## Two APIs on one port
 
@@ -78,7 +81,7 @@ The response tells you what answered: `model` is the artifact id and
 entry with `"x_estia": {"role": true, "family": …}`. An unknown role is a 404:
 
 ```json
-{"error": {"code": 404, "message": "unknown model `writer`: role `writer` is not bound and has no fallback", "type": "not_found_error"}}
+{"error": {"code": 404, "message": "unknown model or role `writer`", "type": "not_found_error", "request_id": "5f0c1d2e3a4b6c7d"}}
 ```
 
 Examples: the chat examples read `ESTIA_MODEL` and default to `fast`.
@@ -143,9 +146,13 @@ What your app should do:
 - Show the pairing id and the approve command, then poll every 2 seconds or so.
 - Save the token the moment it arrives. It is handed out exactly once. Store it
   in the keychain, or in a file created with mode 0600.
-- Handle the outcomes: `denied`; a 404 after about 5 minutes, when the request
-  has expired; 429 when 24 requests are pending, or 4 from your address; 500
-  when the engine could not read or write its pairing file (poll again).
+- Handle the outcomes: `denied`; a 404 once the request has expired, 5
+  minutes after it was made; 429 when 24 requests are pending, or 4 from your
+  address; 500 when the engine could not read or write its pairing file (poll
+  again).
+- Stop polling a little before the 5 minutes are up, and tell the user the
+  request is about to expire and they can ask again. The examples stop at 290
+  seconds.
 
 If the operator later denies the pairing, the token is revoked and your app
 gets 401. Treat 401 as "pair again".
@@ -205,10 +212,12 @@ Rules that follow from how it works:
 - Without `user`, the engine derives a key from the model, the leading system
   messages and the first user message. Two of your conversations that open the
   same way then share one entry. Send `user`.
+- Sending the same messages again (a regenerate) reuses all of the prompt but
+  its last few tokens, the ones that open the model's turn.
 - The runner keeps a small number of conversation caches per loaded model (8
   today), least recently used out first. An idle unload or a runner restart
-  drops them all. A cancelled turn may leave nothing to reuse; in our runs the
-  turn after a cancel prefilled from scratch.
+  drops them all. After a cancelled turn, the next one reuses whatever part of
+  the prompt was prefilled before the cancel.
 
 Examples: [`python/chat.py`](../examples/python/chat.py),
 [`javascript/chat.mjs`](../examples/javascript/chat.mjs),
@@ -219,10 +228,14 @@ Examples: [`python/chat.py`](../examples/python/chat.py),
 `"stream": true` on `/v1/chat/completions` returns server-sent events: one
 `data: {...}` line per piece, then `data: [DONE]`. The last chunk before
 `[DONE]` carries `finish_reason`, `usage` and `x_estia`
-(`cached_tokens`, `template`, `ms`).
+(`cached_tokens`, `template`, `ms`). `finish_reason` is `length` when the
+answer used up `max_tokens` and was cut off, `tool_calls` when the model
+called tools, and `stop` otherwise. Treat `length` as an incomplete answer.
 
 To cancel, close the connection. The engine sees the client go and stops the
-generation in the runner, so the next request does not wait behind it.
+generation in the runner, so the next request does not wait behind it. That
+works before the first token too: a long prompt that is still being read
+(prefill) is abandoned part-way, not read to the end first.
 
 ```python
 stream = client.chat.completions.create(model="fast", messages=history, stream=True, user=conversation_id)
@@ -274,8 +287,9 @@ llama.cpp, decoding is constrained to the schema, so the output parses and has
 the schema's structure, unless `max_tokens` cuts it short: give long string
 fields a `maxLength`, or leave room in `max_tokens`. On MLX, which cannot constrain decoding, the engine
 adds the schema to the system prompt. Either way the engine then checks the
-output: it parses it, repairs common defects (code fences, preambles, bad
-escapes, unescaped quotes), validates, and retries once with the validator's
+output: it parses it, repairs common defects (code fences, preambles, text
+after the closing brace, bad escapes, unescaped quotes), validates, and
+retries once with the validator's
 complaint. `x_estia.repaired` and `x_estia.repairs` say what it fixed. With
 `gemma4-e2b` on MLX, the event extraction in `structured.py`, with no schema
 in its prompt, returned valid JSON in 10 runs out of 10, none repaired.
@@ -328,9 +342,11 @@ Gemma 4's tool calls on llama.cpp have not been tested yet; with a small test
 model and a tool-capable template, the calls and results were checked to
 reach the template.
 
-`tool_choice` is accepted and ignored. Bound the loop (the example stops after
-4 steps), and decide in your code which calls to run: only tools you declare
-can be called, and nothing runs on the engine.
+`tool_choice` is accepted and ignored: `"none"` does not stop the model from
+calling a declared tool, and `"required"` does not force a call. To rule tools
+out for a turn, send the request without `tools`. Bound the loop (the example
+stops after 4 steps), and decide in your code which calls to run: only tools
+you declare can be called, and nothing runs on the engine.
 
 Examples: [`python/tools.py`](../examples/python/tools.py), `quickstart.sh`
 step 9.
@@ -362,8 +378,13 @@ Store the fingerprint with your index and send it back as
 answers 422 before doing any work:
 
 ```text
-fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `embeddinggemma-300m-4bit@mlx-swift` — re-embed before mixing
+fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `embeddinggemma-300m-q8_0-gguf@llama-cpp` — re-embed before mixing
 ```
+
+That is `/v1/embeddings`; `/engine/embed` words it more briefly
+(``fingerprint mismatch: host serves `…`, expected `…` ``). Check for status
+422 and a message that starts with `fingerprint mismatch:`, not for the whole
+text.
 
 **Re-embedding.** Any change of embedding model or backend on the host changes
 the fingerprint. On that 422, rebuild the index from your source texts with
@@ -373,12 +394,15 @@ another model, is such a change. `GET /engine/models` lists each embedding
 model's `fingerprint`, so an app can check before it searches.
 
 Other facts: at most 256 inputs per request (more is a 400, so batch);
-vectors are float arrays whatever `encoding_format` says (pass `"float"` so
-SDKs do not try to decode base64); `usage` is reported as zero; `embed` means
+`encoding_format` may be `"float"` (arrays of numbers) or `"base64"` (what
+the OpenAI SDKs ask for when you pass nothing, and decode for you), so either
+way the SDK hands you numbers; `usage` is reported as zero; `embed` means
 EmbeddingGemma 300M (768 dimensions) unless the operator binds it to another
-model. The native
-`POST /engine/embed` takes `inputs` and returns `vectors`, `fingerprint` and
-`dims` at the top level.
+model. The snippets pass `"float"` anyway: engines from before base64
+support (0.4.0 and earlier) always send arrays, and the JavaScript SDK, unless
+it asked for `"float"`, decodes those arrays as base64 into wrong numbers (192
+of them for a 768-dimension vector). The native `POST /engine/embed` takes
+`inputs` and returns `vectors`, `fingerprint` and `dims` at the top level.
 
 Examples: [`python/rag.py`](../examples/python/rag.py) (explains the choice of
 route), [`javascript/embed.mjs`](../examples/javascript/embed.mjs),
@@ -396,13 +420,17 @@ Mark bulk work, such as indexing or summarising a backlog, as `background`, so
 a person waiting on a chat reply goes first:
 
 ```python
-client.embeddings.create(model="embed", input=batch, extra_body={"task": "document", "priority": "background"})
+client.embeddings.create(model="embed", input=batch, encoding_format="float",
+                        extra_body={"task": "document", "priority": "background"})
 ```
 
 `GET /engine/stats` (`models:read`) shows how many generation calls wait at
-each priority. In Rust, `Priority::default()` is `Background`, and
-`GenHandle::generate` uses it; pass `Priority::Interactive` for calls a person
-waits on.
+each priority, and for each loaded model the runner's pid and the memory it
+holds (`memory_bytes`). Use that figure, not `ps`: an MLX runner keeps its
+weights in Metal buffers, which the resident size in `ps` and `top` leaves
+out, so `ps` can show 100 MB for a model that holds 3.8 GB. In Rust,
+`Priority::default()` is `Background`, and `GenHandle::generate` uses it; pass
+`Priority::Interactive` for calls a person waits on.
 
 ## Limits
 
@@ -411,6 +439,7 @@ waits on.
 | `max_tokens` | default 1024, at most 8192 | Lowered to 8192 without an error |
 | `temperature` | default 0.2 | |
 | Inputs per embedding request | 256 | 400 |
+| Request body | 32 MiB, unless the operator changed it (`estia serve --max-body-bytes`, `ESTIA_MAX_BODY_BYTES`) | 413, with the limit in the message |
 | `max_attempts` on `/engine/generate` | 1 to 3 | Held to that range |
 | Pending pairing requests | 24, and 4 per client address | 429 `rate_limit_error` |
 | Time to send request headers | 10 s | Connection closed |
@@ -432,13 +461,15 @@ Errors use OpenAI's shape:
 | 400 | Bad request: empty messages, over 256 inputs, bad pairing name | Fix the request |
 | 401 | Missing, unknown or revoked token | Ask for a new token or pair again |
 | 403 | Token lacks the scope, or the Host/Origin check refused the request | Mint a token with the scope; see below for Host and Origin |
-| 404 | Unknown role or model, model not downloaded, expired pairing | Use a role; ask the operator to `estia pull` |
+| 404 | Unknown role or model (``unknown model or role `…` ``), model not installed, expired pairing | Use a role; ask the operator to run the `estia pull` the message names |
+| 413 | Request body over the limit (32 MiB by default) | Send less per request: fewer embedding inputs, a shorter history |
 | 422 | Structured output invalid after the retry; fingerprint mismatch | See the sections above |
 | 429 | Too many pending pairing requests | Wait, then pair again |
 | 500 | Runner failure | Retry once; report it with the request id |
 
 A body that is not JSON, or a missing `Content-Type: application/json`, gets a
-plain-text 400, 415 or 422 from the HTTP framework instead.
+400, 415 or 422 from the HTTP framework, in the same JSON shape (type
+`invalid_request_error`).
 
 Every response carries an `X-Request-Id` header, and error bodies repeat it as
 `error.request_id`. Log it next to any error you show or report, so the
@@ -450,7 +481,7 @@ You can also send your own id, for example your app's turn or job id, so your
 log and the engine's line up:
 
 ```bash
-curl -s http://127.0.0.1:27200/v1/chat/completions -H "Authorization: Bearer $TOKEN" \
+curl -s http://127.0.0.1:27200/v1/chat/completions -H "Authorization: Bearer $ESTIA_TOKEN" \
   -H 'Content-Type: application/json' -H 'X-Request-Id: myapp-turn-42' \
   -d '{"model": "fast", "messages": [{"role": "user", "content": "Name one sea."}]}'
 ```
@@ -549,9 +580,23 @@ let (text, meta) = engine.chat_stream("fast", &messages, None, Some("conv-1"), S
 ```
 
 HTTP failures come back as `SessionError::Runner` with text such as
-`remote engine 401 Unauthorized: unknown token`. `RemoteEngine::embed_batch`
-sends `task: none`, so add the model's prefix yourself
-(`EMBEDDING_GEMMA_300M_4BIT.prefix(EmbedTask::Query)`), as the example does.
+`remote engine 401 Unauthorized: unknown token`.
+
+For embeddings, ask for the role `embed`, as in any other client. The first
+response reports the fingerprint, which names the model and the backend, so
+the same code runs against an MLX or a llama.cpp engine. Store it with your
+vectors and hand it to `RemoteEmbed`, which sends it as `expect_fingerprint`
+on every call. `RemoteEngine::embed_batch` sends `task: none`, so add the
+model's prefix yourself; `find_embed_model` turns the fingerprint into the
+built-in model and its prefixes:
+
+```rust
+let (_, fingerprint) = engine.embed_batch("embed", &[first_text], None, Priority::Background)?;
+let spec = find_embed_model(&fingerprint);    // None for a model imported on the engine
+let query_prefix = spec.map(|s| s.prefix(EmbedTask::Query)).unwrap_or("");
+let emb = EmbedHandle::Remote(RemoteEmbed::new(Arc::clone(&engine), "embed", fingerprint));
+```
+
 `GenHandle` and `EmbedHandle` wrap a local session or a remote one behind the
 same methods, so the rest of your code does not care where the model runs.
 
@@ -593,6 +638,10 @@ what order.
   fingerprints, and your app works on either backend unchanged.
 - Image parts in messages are replaced by a text marker.
 - A non-streaming request is not cancelled when its client disconnects.
-- `tool_choice`, `n`, `top_p` and `stop` are accepted and ignored. Role
-  sampling settings (`temperature`, `max_tokens`) are stored but not applied.
+- `tool_choice`, `n`, `stop` and `top_p` are accepted and ignored, on both
+  backends. Plan for it: leave `tools` out rather than sending
+  `tool_choice: "none"`; expect one choice whatever `n` says; and cut the text
+  at your stop sequence yourself, since generation runs on to the end of the
+  model's turn or to `max_tokens`. Role sampling settings (`temperature`,
+  `max_tokens`) are stored but not applied.
 - No TLS.

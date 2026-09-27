@@ -256,6 +256,11 @@ enum Cmd {
         /// accepted.
         #[arg(long = "allow-host", value_name = "NAME", value_delimiter = ',')]
         allow_host: Vec<String>,
+        /// Largest request body to accept, in bytes; a larger one gets a JSON
+        /// 413. Default: `ESTIA_MAX_BODY_BYTES`, else 33554432 (32 MiB, a
+        /// full embed batch of 256 inputs of ~100 KB).
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        max_body_bytes: Option<u64>,
         /// What to log: a level (`debug`) or comma-separated filter directives
         /// (`estia_server=debug,mdns_sd=info`), on top of the default `info`
         /// for Estia and `warn` for libraries. See docs/logging.md.
@@ -320,6 +325,10 @@ enum ServiceAction {
         /// Passed to `serve --log-format`: `text` (default) or `json`.
         #[arg(long, value_enum)]
         log_format: Option<LogFormat>,
+        /// Passed to `serve --max-body-bytes`: the largest request body the
+        /// service accepts, in bytes (default 32 MiB).
+        #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
+        max_body_bytes: Option<u64>,
         // `--backend` (global) is passed to `serve` too when given.
     },
     Uninstall,
@@ -341,16 +350,23 @@ enum ServiceAction {
 enum PairAction {
     /// Pending and recent pairing requests (locally, or on a remote engine with --engine/--token).
     List {
-        #[arg(long)]
+        /// Ask a running engine (`http://host:port`) instead of reading this
+        /// machine's data directory. Needs --token.
+        #[arg(long, value_name = "URL")]
         engine: Option<String>,
+        /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
     },
     /// Approve a request: mints a token with the requested scopes for the client to collect.
     Approve {
+        /// The pairing id, as the client and `estia pair list` show it.
         id: String,
-        #[arg(long)]
+        /// Decide on a running engine (`http://host:port`) instead of in this
+        /// machine's data directory. Needs --token.
+        #[arg(long, value_name = "URL")]
         engine: Option<String>,
+        /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
         /// Approve a request that asks for the `admin` scope (full control of
@@ -358,10 +374,16 @@ enum PairAction {
         #[arg(long)]
         allow_admin: bool,
     },
+    /// Deny a pending request, or take back an approved one: its token is
+    /// revoked, whether or not the client has collected it yet.
     Deny {
+        /// The pairing id, as the client and `estia pair list` show it.
         id: String,
-        #[arg(long)]
+        /// Decide on a running engine (`http://host:port`) instead of in this
+        /// machine's data directory. Needs --token.
+        #[arg(long, value_name = "URL")]
         engine: Option<String>,
+        /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
     },
@@ -370,14 +392,26 @@ enum PairAction {
         /// `http://host:port` of the engine.
         #[arg(long)]
         engine: String,
+        /// How the operator sees this device: up to 64 letters, digits, single
+        /// spaces and `. _ - ' ( )`.
         #[arg(long, default_value = "estia-cli")]
         name: String,
+        /// Scopes to ask for, comma-separated. Ask for the least you need.
         #[arg(long, value_delimiter = ',', default_value = "generate,embed,models:read")]
         scopes: Vec<String>,
-        #[arg(long, default_value_t = 300)]
+        /// How long to wait for the operator. The engine drops an undecided
+        /// request 300 s after it was made, so waiting longer gains nothing;
+        /// the default stops just before that.
+        #[arg(long, default_value_t = PAIR_WAIT_DEFAULT_S)]
         wait_seconds: u64,
     },
 }
+
+/// How long an engine keeps an undecided pairing request.
+const PAIR_EXPIRY_S: u64 = estia_server::pairing::PAIRING_TTL_SECS;
+/// `estia pair request` stops waiting a little before the engine drops the
+/// request, so it ends with its own message rather than a 404.
+const PAIR_WAIT_DEFAULT_S: u64 = PAIR_EXPIRY_S - 10;
 
 #[derive(Subcommand)]
 enum TokenAction {
@@ -431,11 +465,13 @@ struct FileConfig {
 /// The backend for this invocation and where the choice came from: the
 /// flag or `ESTIA_BACKEND`, then `config.json`, then the machine's default
 /// (MLX on Apple Silicon, llama.cpp elsewhere).
+const BACKEND_SOURCE_DEFAULT: &str = "default for this machine";
+
 fn choose_backend(flag: Option<Backend>, file: Option<Backend>) -> (Backend, &'static str) {
     match (flag, file) {
         (Some(b), _) => (b, "--backend / ESTIA_BACKEND"),
         (None, Some(b)) => (b, "config.json"),
-        (None, None) => (Backend::platform_default(), "default for this machine"),
+        (None, None) => (Backend::platform_default(), BACKEND_SOURCE_DEFAULT),
     }
 }
 
@@ -1359,6 +1395,7 @@ async fn serve(
     no_auth: bool,
     idle_unload_minutes: u64,
     allow_host: Vec<String>,
+    max_body_bytes: Option<u64>,
 ) -> Result<()> {
     use estia_server::{tokens::TokenStore, AppState, ServeOptions};
     // An explicit --bind always wins; only the default follows --lan.
@@ -1395,7 +1432,14 @@ async fn serve(
     estia_server::serve(
         state,
         ctx.data_dir.clone(),
-        ServeOptions { lan, advertise: lan && !no_advertise, name, idle_unload, allowed_hosts: allow_host },
+        ServeOptions {
+            lan,
+            advertise: lan && !no_advertise,
+            name,
+            idle_unload,
+            allowed_hosts: allow_host,
+            max_body_bytes: max_body_bytes.map(|n| usize::try_from(n).unwrap_or(usize::MAX)),
+        },
     )
     .await
 }
@@ -1552,7 +1596,11 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
 
     // 3. config.json (roles and the backend) and the first token.
     let had_config = ctx.data_dir.join("config.json").exists();
-    ctx.save_config(Some(ctx.backend))?;
+    // Pin the backend only when it was chosen (flag, env or an existing pin);
+    // a machine default stays a default, so re-running setup changes nothing
+    // and a later default change still applies.
+    let pin = if ctx.backend_source == BACKEND_SOURCE_DEFAULT { None } else { Some(ctx.backend) };
+    ctx.save_config(pin)?;
     println!("✓ config   : {} config.json (backend {})", if had_config { "updated" } else { "wrote" }, ctx.backend);
     let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
     if tokens.is_empty() {
@@ -1673,10 +1721,13 @@ fn stage_install(data_dir: &Path, runner: &Path) -> Result<(PathBuf, PathBuf)> {
 fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
     let logs = ctx.data_dir.join("logs");
     match action {
-        ServiceAction::Install { port, local, allow_host, log_level, log_format } => {
+        ServiceAction::Install { port, local, allow_host, log_level, log_format, max_body_bytes } => {
             // Checked before anything is staged: every path below lives under it.
             service_path(&ctx.data_dir)?;
-            let args = service_args(port, local, &allow_host, log_level.as_deref(), log_format, ctx.backend_flag)?;
+            let mut args = service_args(port, local, &allow_host, log_level.as_deref(), log_format, ctx.backend_flag)?;
+            if let Some(n) = max_body_bytes {
+                args.extend(["--max-body-bytes".to_string(), n.to_string()]);
+            }
             std::fs::create_dir_all(&logs)?;
             let runner = ctx
                 .runner()
@@ -2002,7 +2053,7 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
         match &stats {
             Some(s) => println!(
                 "loaded   : {} · queue interactive {} / background {} · jobs {}",
-                jlist(&s["loaded"]).join(", "),
+                Some(jlist(&s["loaded"]).join(", ")).filter(|l| !l.is_empty()).unwrap_or_else(|| "none".into()),
                 jtext(&s["queue"]["interactive"]),
                 jtext(&s["queue"]["background"]),
                 jtext(&s["jobs"])
@@ -2294,6 +2345,12 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                         eprintln!("the engine answered {} while polling; retrying", r.status());
                         None
                     }
+                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+                        return Err(anyhow!(
+                            "pairing request `{id}` has expired: the engine drops a request {PAIR_EXPIRY_S} s after it was made; \
+                             run `estia pair request` again"
+                        ));
+                    }
                     Ok(r) => Some(r.error_for_status()?.json()?),
                     Err(e) if e.is_connect() || e.is_timeout() => {
                         eprintln!("could not reach the engine while polling ({}); retrying", safe(&e.to_string()));
@@ -2312,7 +2369,10 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                     _ => {}
                 }
                 if Instant::now() >= deadline {
-                    return Err(anyhow!("timed out waiting for approval"));
+                    return Err(anyhow!(
+                        "no decision on pairing request `{id}` within {wait_seconds} s; the engine drops a request \
+                         {PAIR_EXPIRY_S} s after it was made, so run `estia pair request` again"
+                    ));
                 }
             }
         }
@@ -2739,9 +2799,19 @@ async fn run_cli() -> Result<()> {
         Cmd::Setup { roles, no_models, variant } => setup(&ctx, &roles, no_models, variant.as_deref()).await,
         Cmd::Service { action } => service(&ctx, action),
         Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
-        Cmd::Serve { port, bind, lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host, log_level: _, log_format: _ } => {
-            serve(&ctx, port, bind.as_deref(), lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host).await
-        }
+        Cmd::Serve {
+            port,
+            bind,
+            lan,
+            no_advertise,
+            name,
+            no_auth,
+            idle_unload_minutes,
+            allow_host,
+            max_body_bytes,
+            log_level: _,
+            log_format: _,
+        } => serve(&ctx, port, bind.as_deref(), lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host, max_body_bytes).await,
         Cmd::Token { action } => token(&ctx, action),
         Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),
@@ -3117,6 +3187,15 @@ mod tests {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             assert_eq!(choose_backend(None, None).0, Backend::MlxPython, "Apple Silicon keeps MLX");
         }
+    }
+
+    #[test]
+    fn pair_request_stops_waiting_before_the_engine_drops_the_request() {
+        let cli = Cli::try_parse_from(["estia", "pair", "request", "--engine", "http://127.0.0.1:1"]).unwrap();
+        let Cmd::Pair { action: PairAction::Request { wait_seconds, .. } } = cli.cmd else { panic!("pair request") };
+        assert_eq!(wait_seconds, 290);
+        assert!(wait_seconds < PAIR_EXPIRY_S);
+        assert_eq!(PAIR_EXPIRY_S, 300);
     }
 
     #[test]

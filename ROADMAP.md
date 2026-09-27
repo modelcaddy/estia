@@ -5,7 +5,7 @@ item gives the reason for it and an exit check: something anyone can run to
 see that the item is done. Plans change; [CHANGELOG.md](CHANGELOG.md) records
 what actually shipped.
 
-Last reviewed 2026-09-27, against version 0.4.0 (not yet tagged).
+Last reviewed 2026-09-27, against version 0.4.0.
 
 ## Where Estia is today
 

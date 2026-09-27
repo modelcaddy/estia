@@ -14,7 +14,7 @@ use estia_engine::Engine;
 /// Why a pull could not be planned.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PullError {
-    #[error("unknown model `{0}`")]
+    #[error("unknown model or role `{0}`")]
     Unknown(String),
     #[error("`{0}` is an imported model: it is already on disk and has nothing to download")]
     Imported(String),

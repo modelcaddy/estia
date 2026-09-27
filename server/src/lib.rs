@@ -82,7 +82,126 @@ pub struct AppState {
     pub data_dir: std::path::PathBuf,
     gen: Mutex<HashMap<String, Arc<GenSession>>>,
     embed: Mutex<HashMap<String, Arc<EmbedSession>>>,
+    /// Loads in progress, by artifact id: callers for a model that is still
+    /// loading wait for that load instead of starting a second runner.
+    gen_loads: Mutex<HashMap<String, Arc<Flight<GenSession>>>>,
+    embed_loads: Mutex<HashMap<String, Arc<Flight<EmbedSession>>>>,
     hosts: RwLock<HostPolicy>,
+    /// Largest request body accepted, in bytes (see [`DEFAULT_MAX_BODY_BYTES`]).
+    max_body: std::sync::atomic::AtomicUsize,
+}
+
+/// Default cap on a request body: 32 MiB, room for a full embed batch
+/// ([`engine_api::MAX_EMBED_INPUTS`] inputs of ~100 KB each) with JSON
+/// escaping to spare. Change it with [`ServeOptions::max_body_bytes`], the
+/// CLI's `--max-body-bytes` or [`MAX_BODY_ENV`].
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Environment variable overriding [`DEFAULT_MAX_BODY_BYTES`], in bytes.
+pub const MAX_BODY_ENV: &str = "ESTIA_MAX_BODY_BYTES";
+
+/// `ESTIA_MAX_BODY_BYTES`, when it holds a positive byte count; anything else
+/// is logged and ignored.
+fn max_body_from_env() -> Option<usize> {
+    let raw = std::env::var(MAX_BODY_ENV).ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            tracing::warn!(value = %raw, "{MAX_BODY_ENV} is not a positive number of bytes; using the default");
+            None
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One model load that other callers can wait on.
+struct Flight<T> {
+    result: Mutex<Option<Result<Arc<T>, ApiError>>>,
+    done: std::sync::Condvar,
+}
+
+impl<T> Default for Flight<T> {
+    fn default() -> Self {
+        Flight { result: Mutex::new(None), done: std::sync::Condvar::new() }
+    }
+}
+
+/// Settles a [`Flight`] when the loading caller leaves, however it leaves:
+/// a load that panicked still wakes its waiters, with an error.
+struct Leader<'a, T> {
+    loads: &'a Mutex<HashMap<String, Arc<Flight<T>>>>,
+    key: &'a str,
+    flight: Arc<Flight<T>>,
+}
+
+impl<T> Leader<'_, T> {
+    fn settle(&self, result: Result<Arc<T>, ApiError>) {
+        lock(self.loads).remove(self.key);
+        *lock(&self.flight.result) = Some(result);
+        self.flight.done.notify_all();
+    }
+}
+
+impl<T> Drop for Leader<'_, T> {
+    fn drop(&mut self) {
+        if lock(&self.flight.result).is_none() {
+            self.settle(Err(ApiError::internal("loading the model failed; see the engine's log")));
+        }
+    }
+}
+
+/// The resident session under `key`, starting it with `start` when there is
+/// none. Single-flight: while one caller starts it, others asking for the same
+/// key wait for that result (the session, or the same error) rather than
+/// spawning a runner and loading the weights a second time.
+///
+/// The time is how long this caller waited for a load: the load it ran, or
+/// the part of someone else's it waited through. `None` when the session
+/// was already resident.
+fn resident<T>(
+    live: &Mutex<HashMap<String, Arc<T>>>,
+    loads: &Mutex<HashMap<String, Arc<Flight<T>>>>,
+    key: &str,
+    start: impl FnOnce() -> Result<T, ApiError>,
+) -> Result<(Arc<T>, Option<u64>), ApiError> {
+    if let Some(s) = lock(live).get(key) {
+        return Ok((Arc::clone(s), None));
+    }
+    let t0 = Instant::now();
+    let (flight, leading) = {
+        let mut pending = lock(loads);
+        // Checked again under `loads`: a leader publishes the session before
+        // it drops its flight, so no caller can miss both.
+        if let Some(s) = lock(live).get(key) {
+            return Ok((Arc::clone(s), None));
+        }
+        match pending.get(key) {
+            Some(f) => (Arc::clone(f), false),
+            None => {
+                let f = Arc::new(Flight::default());
+                pending.insert(key.to_string(), Arc::clone(&f));
+                (f, true)
+            }
+        }
+    };
+    if !leading {
+        let mut result = lock(&flight.result);
+        while result.is_none() {
+            result = flight.done.wait(result).unwrap_or_else(|e| e.into_inner());
+        }
+        let result = result.clone().expect("settled");
+        return result.map(|s| (s, Some(t0.elapsed().as_millis() as u64)));
+    }
+    let leader = Leader { loads, key, flight };
+    let result = start().map(Arc::new);
+    if let Ok(s) = &result {
+        lock(live).insert(key.to_string(), Arc::clone(s));
+    }
+    leader.settle(result.clone());
+    result.map(|s| (s, Some(t0.elapsed().as_millis() as u64)))
 }
 
 impl AppState {
@@ -107,8 +226,24 @@ impl AppState {
             bind,
             gen: Mutex::new(HashMap::new()),
             embed: Mutex::new(HashMap::new()),
+            gen_loads: Mutex::new(HashMap::new()),
+            embed_loads: Mutex::new(HashMap::new()),
             hosts: RwLock::new(hosts),
+            max_body: std::sync::atomic::AtomicUsize::new(max_body_from_env().unwrap_or(DEFAULT_MAX_BODY_BYTES)),
         }
+    }
+
+    /// The largest request body [`router`] accepts, in bytes: [`MAX_BODY_ENV`]
+    /// when set, else [`DEFAULT_MAX_BODY_BYTES`], unless
+    /// [`AppState::set_max_body_bytes`] changed it.
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Change the body limit. Takes effect for routers built afterwards
+    /// ([`serve`] builds its router after applying [`ServeOptions`]).
+    pub fn set_max_body_bytes(&self, bytes: usize) {
+        self.max_body.store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Also answer to these `Host` names (see [`ServeOptions::allowed_hosts`]).
@@ -164,47 +299,60 @@ impl AppState {
         self.gen_session_timed(artifact).map(|(s, _)| s)
     }
 
-    /// [`AppState::gen_session`], plus how long starting it took (runner,
-    /// handshake, model load) when this call started it.
+    /// [`AppState::gen_session`], plus how long this call waited for the
+    /// model to load (runner start, handshake, weights) when it was not
+    /// resident. Concurrent first requests share one load.
     pub(crate) fn gen_session_timed(&self, artifact: &Artifact) -> Result<(Arc<GenSession>, Option<u64>), ApiError> {
-        if let Some(s) = self.gen.lock().unwrap().get(artifact.id) {
-            return Ok((Arc::clone(s), None));
-        }
-        let t0 = Instant::now();
-        let s = self.engine.spawn_gen_session(artifact.id)?;
-        // Load now rather than inside the first generation, so the log can say
-        // how long the load took. The first request waits the same either way.
-        s.load()?;
-        let ms = t0.elapsed().as_millis() as u64;
-        tracing::info!(model = %artifact.id, family = %artifact.family, ready_ms = ms, "generation model ready");
-        let s = Arc::new(s);
-        self.gen.lock().unwrap().insert(artifact.id.to_string(), Arc::clone(&s));
-        Ok((s, Some(ms)))
+        resident(&self.gen, &self.gen_loads, artifact.id, || {
+            let t0 = Instant::now();
+            let s = self.engine.spawn_gen_session(artifact.id)?;
+            // Load now rather than inside the first generation, so the log can say
+            // how long the load took. The first request waits the same either way.
+            s.load()?;
+            let ms = t0.elapsed().as_millis() as u64;
+            tracing::info!(model = %artifact.id, family = %artifact.family, ready_ms = ms, "generation model ready");
+            Ok(s)
+        })
     }
 
     pub fn embed_session(&self, model: &EmbedModel) -> Result<Arc<EmbedSession>, ApiError> {
         self.embed_session_timed(model).map(|(s, _)| s)
     }
 
-    /// [`AppState::embed_session`], plus how long starting it took. Sessions
-    /// are keyed by the artifact this backend loads, so `loaded` names the
-    /// weights actually resident.
+    /// [`AppState::embed_session`], plus how long this call waited for the
+    /// model to load. Sessions are keyed by the artifact this backend loads,
+    /// so `loaded` names the weights actually resident; concurrent first
+    /// requests share one load.
     pub(crate) fn embed_session_timed(&self, model: &EmbedModel) -> Result<(Arc<EmbedSession>, Option<u64>), ApiError> {
         let backend = self.backend();
         let artifact = model
             .artifact_for(backend)
             .ok_or_else(|| resolve_error(ResolveError::NoArtifactForBackend { family: model.id.to_string(), backend }))?;
-        if let Some(s) = self.embed.lock().unwrap().get(artifact.id) {
-            return Ok((Arc::clone(s), None));
-        }
-        let t0 = Instant::now();
-        let s = self.engine.spawn_embed_model(model)?;
-        s.load()?;
-        let ms = t0.elapsed().as_millis() as u64;
-        tracing::info!(model = %model.id, artifact = %artifact.id, dims = model.dims, ready_ms = ms, "embedding model ready");
-        let s = Arc::new(s);
-        self.embed.lock().unwrap().insert(artifact.id.to_string(), Arc::clone(&s));
-        Ok((s, Some(ms)))
+        resident(&self.embed, &self.embed_loads, artifact.id, || {
+            let t0 = Instant::now();
+            let s = self.engine.spawn_embed_model(model)?;
+            s.load()?;
+            let ms = t0.elapsed().as_millis() as u64;
+            tracing::info!(model = %model.id, artifact = %artifact.id, dims = model.dims, ready_ms = ms, "embedding model ready");
+            Ok(s)
+        })
+    }
+
+    /// Each live session: its artifact id, `generation` or `embedding`, its
+    /// runner's pid and the physical memory that runner and every process it
+    /// started hold ([`estia_engine::procmem::tree_footprint`]: an MLX runner
+    /// holds its weights itself, the llama.cpp adapter's `llama-server` holds
+    /// them for it). Pid and memory are `None` when they cannot be told.
+    /// Sorted by id. Blocking (reads process tables); never waits for a
+    /// generation in progress.
+    pub fn runners(&self) -> Vec<RunnerInfo> {
+        let mut out: Vec<(String, &'static str, Option<u32>)> =
+            lock(&self.gen).iter().map(|(k, s)| (k.clone(), "generation", s.pid())).collect();
+        out.extend(lock(&self.embed).iter().map(|(k, s)| (k.clone(), "embedding", s.pid())));
+        out.sort();
+        out.into_iter()
+            .map(|(id, kind, pid)| RunnerInfo { memory_bytes: pid.and_then(estia_engine::procmem::tree_footprint), id, kind, pid })
+            .collect()
     }
 
     /// Artifact ids with a live session.
@@ -250,8 +398,17 @@ impl AppState {
     }
 }
 
+/// A resident model in `/engine/stats`: see [`AppState::runners`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RunnerInfo {
+    pub id: String,
+    pub kind: &'static str,
+    pub pid: Option<u32>,
+    pub memory_bytes: Option<u64>,
+}
+
 /// OpenAI-shaped error body with a status.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: StatusCode,
     pub kind: &'static str,
@@ -277,6 +434,9 @@ impl ApiError {
     pub fn internal(m: impl Into<String>) -> Self {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, kind: "server_error", message: m.into() }
     }
+    pub fn payload_too_large(m: impl Into<String>) -> Self {
+        Self { status: StatusCode::PAYLOAD_TOO_LARGE, kind: "invalid_request_error", message: m.into() }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -297,10 +457,26 @@ impl From<estia_engine::SessionError> for ApiError {
         ApiError::internal(format!("runner: {e}"))
     }
 }
+/// Engine failures as HTTP. Clients may be on another machine, so messages
+/// name no paths on this one; those go to the log.
 impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         match e {
-            EngineError::ModelMissing { .. } => ApiError::not_found(e.to_string()),
+            EngineError::ModelMissing { id, path } => {
+                tracing::warn!(model = %id, path = %path.display(), "a request named a model that is not installed");
+                ApiError::not_found(format!(
+                    "model `{id}` is not installed on this engine; run `estia pull {id}` on the engine's machine \
+                     (or POST /engine/models/pull with a models:write token)"
+                ))
+            }
+            EngineError::NoRunner(path) => {
+                tracing::error!(path = %path.display(), "resident runner script not found");
+                ApiError::internal("this engine's runner script is missing; see the engine's log")
+            }
+            EngineError::NoLlamaAdapterBinary(path) => {
+                tracing::error!(path = %path.display(), "llama adapter not found");
+                ApiError::internal("this engine's llama adapter is missing; see the engine's log")
+            }
             EngineError::Resolve(r) => resolve_error(r),
             EngineError::FingerprintMismatch { .. } => ApiError::unprocessable(e.to_string()),
             other => ApiError::internal(other.to_string()),
@@ -313,7 +489,7 @@ impl From<EngineError> for ApiError {
 /// artifact for this backend is 404.
 pub fn resolve_error(e: ResolveError) -> ApiError {
     match e {
-        ResolveError::Unknown(name) => ApiError::not_found(format!("unknown model `{name}`")),
+        ResolveError::Unknown(name) => ApiError::not_found(format!("unknown model or role `{name}`")),
         e @ ResolveError::WrongFormat { .. } => ApiError::bad_request(e.to_string()),
         e @ ResolveError::NoArtifactForBackend { .. } => ApiError::not_found(e.to_string()),
     }
@@ -687,7 +863,35 @@ async fn no_route(method: Method, uri: axum::http::Uri) -> ApiError {
     ApiError::not_found(format!("no route for {method} {}", uri.path()))
 }
 
+/// Axum answers a request its extractors refuse (a body over the limit,
+/// malformed JSON, a missing `Content-Type`) in `text/plain`; clients of an
+/// OpenAI-shaped API parse errors as JSON. Re-wrap those answers in the error
+/// envelope every other error uses, `request_id` included. A body over the
+/// limit says what the limit is and how to raise it.
+async fn json_rejections(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+    let res = next.run(req).await;
+    let status = res.status();
+    let plain = res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/plain"));
+    if !status.is_client_error() || !plain {
+        return res;
+    }
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        let limit = state.max_body_bytes();
+        return ApiError::payload_too_large(format!(
+            "request body is larger than this engine accepts ({limit} bytes, {:.1} MiB); send less per request \
+             (for embeddings, fewer inputs per call) or raise the limit with `estia serve --max-body-bytes` or {MAX_BODY_ENV}",
+            limit as f64 / (1024.0 * 1024.0)
+        ))
+        .into_response();
+    }
+    let body = axum::body::to_bytes(res.into_body(), 16 * 1024).await.unwrap_or_default();
+    let message = String::from_utf8_lossy(&body).trim().to_string();
+    let message = if message.is_empty() { status.canonical_reason().unwrap_or("bad request").to_string() } else { message };
+    ApiError { status, kind: "invalid_request_error", message }.into_response()
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
+    let max_body = state.max_body_bytes();
     Router::new()
         // OpenAI-compatible
         .route("/v1/chat/completions", post(openai::chat_completions))
@@ -719,6 +923,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // every one of them.
         .route_layer(middleware::from_fn_with_state(Arc::clone(&state), auth))
         .fallback(no_route)
+        .layer(axum::extract::DefaultBodyLimit::max(max_body))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), json_rejections))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), host_guard))
         // Outermost: request ids and the access log see every request,
         // including the ones the guards refuse and unknown paths.
@@ -781,6 +987,10 @@ pub struct ServeOptions {
     /// `studio.lan`. An entry may be a comma-separated list; `*.example.com`
     /// allows the subdomains; `*` switches the DNS-rebinding guard off.
     pub allowed_hosts: Vec<String>,
+    /// Largest request body to accept, in bytes (the CLI's
+    /// `--max-body-bytes`). `None` keeps [`MAX_BODY_ENV`] or
+    /// [`DEFAULT_MAX_BODY_BYTES`]. A larger body is refused with a JSON 413.
+    pub max_body_bytes: Option<usize>,
 }
 
 pub const MDNS_SERVICE_TYPE: &str = "_estia._tcp.local.";
@@ -1119,7 +1329,62 @@ fn client_csp() -> &'static str {
     })
 }
 
-fn base64_std(bytes: &[u8]) -> String {
+/// Cancel a streamed generation as soon as its client stops listening.
+///
+/// A stream's tokens travel from the blocking generation to the SSE body over
+/// `tx`. When the client disconnects, the server drops the body and with it
+/// the receiver; the generation used to notice only when its next token
+/// failed to send, and a long prompt sends nothing while it is prefilled, so
+/// a client that gave up during a long prefill kept the model busy until the
+/// first token. This watches the channel instead and flips `cancel` the
+/// moment the receiver goes; the session passes the cancel to the runner
+/// within a poll tick (250 ms).
+///
+/// Hold the returned guard for as long as the generation runs and drop it
+/// after: the watcher then lets go of its sender, so the stream can end.
+pub(crate) fn cancel_on_disconnect<T: Send + 'static>(
+    tx: &tokio::sync::mpsc::UnboundedSender<T>,
+    cancel: estia_engine::CancelToken,
+) -> DisconnectWatch {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tx.closed() => cancel.cancel(),
+            _ = stopped => {}
+        }
+    });
+    DisconnectWatch { _stop: stop }
+}
+
+/// Ends the watch [`cancel_on_disconnect`] started when dropped.
+pub(crate) struct DisconnectWatch {
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+/// `prefix` and 24 random hex digits: completion ids (`chatcmpl-…`) and
+/// tool-call ids (`call_…`), unique across responses and restarts.
+pub(crate) fn unique_id(prefix: &str) -> String {
+    let mut bytes = [0u8; 12];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // No OS randomness: the clock, the pid and a counter still never repeat
+        // within this process, and are unlikely to across processes.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
+        bytes[..8].copy_from_slice(&(t ^ n.rotate_left(40)).to_be_bytes());
+        bytes[8..].copy_from_slice(&std::process::id().to_be_bytes());
+    }
+    let mut id = String::with_capacity(prefix.len() + 24);
+    id.push_str(prefix);
+    for b in bytes {
+        id.push_str(&format!("{b:02x}"));
+    }
+    id
+}
+
+/// Standard base64 (RFC 4648, with padding).
+pub(crate) fn base64_std(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for c in bytes.chunks(3) {
@@ -1153,6 +1418,9 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         );
     }
     state.allow_hosts(&opts.allowed_hosts);
+    if let Some(n) = opts.max_body_bytes {
+        state.set_max_body_bytes(n);
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let record = EngineRecord {
@@ -1176,6 +1444,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         advertise = opts.advertise && !bound.ip().is_loopback(),
         idle_unload_s = opts.idle_unload.map(|d| d.as_secs()),
         allowed_hosts = %if opts.allowed_hosts.is_empty() { "-".to_string() } else { opts.allowed_hosts.join(",") },
+        max_body_bytes = state.max_body_bytes(),
         data_dir = %data_dir.display(),
         backend = %state.engine.backend(),
         runner = %runner_description(&state.engine),
@@ -1975,5 +2244,81 @@ mod client_page_tests {
         assert!(csp.contains("script-src 'sha256-"), "{csp}");
         assert!(!csp.split(';').any(|d| d.trim().starts_with("script-src") && d.contains("unsafe-inline")), "{csp}");
         assert_eq!(super::CLIENT_PAGE.matches("<script").count(), 1, "one inline script, allowed by hash");
+    }
+}
+
+#[cfg(test)]
+mod single_flight_tests {
+    use super::{resident, ApiError, Flight};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    type Live = Mutex<HashMap<String, Arc<u32>>>;
+    type Loads = Mutex<HashMap<String, Arc<Flight<u32>>>>;
+
+    /// Eight callers at once start one load; all get its session.
+    #[test]
+    fn one_load_for_concurrent_callers() {
+        let (live, loads, starts) = (Arc::new(Live::default()), Arc::new(Loads::default()), Arc::new(AtomicUsize::new(0)));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (live, loads, starts) = (Arc::clone(&live), Arc::clone(&loads), Arc::clone(&starts));
+                std::thread::spawn(move || {
+                    resident(&live, &loads, "m", || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(200));
+                        Ok(7)
+                    })
+                    .map(|(s, waited)| (*s, waited))
+                })
+            })
+            .collect();
+        for t in threads {
+            let (v, waited) = t.join().unwrap().unwrap();
+            assert_eq!(v, 7);
+            assert!(waited.is_some(), "every one of them waited for the load");
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(loads.lock().unwrap().is_empty(), "no load left pending");
+        // Resident now: no start, no wait.
+        let (_, waited) = resident(&live, &loads, "m", || -> Result<u32, ApiError> { unreachable!() }).unwrap();
+        assert_eq!(waited, None);
+    }
+
+    /// A load that fails hands its error to the callers waiting on it; one
+    /// that panics wakes them with an error instead of leaving them hanging.
+    /// The next caller tries again.
+    #[test]
+    fn failures_reach_the_waiters_and_are_retried() {
+        for panics in [false, true] {
+            let (live, loads) = (Arc::new(Live::default()), Arc::new(Loads::default()));
+            let leader = {
+                let (live, loads) = (Arc::clone(&live), Arc::clone(&loads));
+                std::thread::spawn(move || {
+                    resident(&live, &loads, "m", || {
+                        std::thread::sleep(Duration::from_millis(300));
+                        if panics {
+                            panic!("load blew up");
+                        }
+                        Err(ApiError::not_found("not installed"))
+                    })
+                    .map(|_| ())
+                })
+            };
+            std::thread::sleep(Duration::from_millis(100));
+            let err =
+                resident(&live, &loads, "m", || -> Result<u32, ApiError> { unreachable!("the waiter must not start a load") }).unwrap_err();
+            if panics {
+                assert!(leader.join().is_err());
+                assert_eq!(err.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{err:?}");
+            } else {
+                assert_eq!(leader.join().unwrap().unwrap_err().message, "not installed");
+                assert_eq!(err.message, "not installed");
+            }
+            let (s, _) = resident(&live, &loads, "m", || Ok(1)).unwrap();
+            assert_eq!(*s, 1, "retried after the failure");
+        }
     }
 }

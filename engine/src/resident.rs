@@ -183,6 +183,13 @@ impl EmbedSession {
         self.session.waiting(prio)
     }
 
+    /// The runner process's pid, read without waiting for a call in
+    /// progress; see [`Session::current_pid`]. With
+    /// [`crate::procmem::tree_footprint`] it gives the memory the model holds.
+    pub fn pid(&self) -> Option<u32> {
+        self.session.current_pid()
+    }
+
     pub fn is_idle(&self, timeout: Duration) -> bool {
         self.session.is_idle(timeout)
     }
@@ -374,6 +381,13 @@ impl GenSession {
     /// Callers queued at `prio` on this session (not counting the one running).
     pub fn waiting(&self, prio: Priority) -> usize {
         self.session.waiting(prio)
+    }
+
+    /// The runner process's pid, read without waiting for a call in
+    /// progress; see [`Session::current_pid`]. With
+    /// [`crate::procmem::tree_footprint`] it gives the memory the model holds.
+    pub fn pid(&self) -> Option<u32> {
+        self.session.current_pid()
     }
 
     pub fn is_idle(&self, timeout: Duration) -> bool {

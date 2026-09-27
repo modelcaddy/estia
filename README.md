@@ -10,9 +10,8 @@ Estia is developed by ModelCaddy and runs inside its apps.
 
 ## Status
 
-Estia is early software. This tree is version 0.4.0, which has not been
-tagged or published yet; the earlier versions were never released on their
-own. [CHANGELOG.md](CHANGELOG.md) says what each version holds, and
+Estia is early software. Version 0.4.0 is its first tagged release; the
+earlier versions were never released on their own. [CHANGELOG.md](CHANGELOG.md) says what each version holds, and
 [docs/versioning.md](docs/versioning.md) what the numbers mean. Expect
 breaking changes before 1.0.
 
@@ -126,15 +125,15 @@ a static page served by the engine and uses only the public API. Its source is
 From the command line:
 
 ```bash
-TOKEN=estia_...                # the token setup printed
+export ESTIA_TOKEN=estia_...   # the token setup printed
 
 curl -s http://127.0.0.1:27200/v1/chat/completions \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $ESTIA_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model": "fast", "messages": [{"role": "user", "content": "Name one sea."}]}'
 
 curl -s http://127.0.0.1:27200/v1/embeddings \
-  -H "Authorization: Bearer $TOKEN" \
+  -H "Authorization: Bearer $ESTIA_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"model": "embed", "input": ["the sea at dawn", "quarterly tax filing"]}'
 ```
@@ -368,7 +367,8 @@ From a terminal on the device:
 estia pair request --engine http://192.168.1.20:27200 --name laptop --scopes generate,embed,models:read
 ```
 
-It prints the pairing id, waits up to 5 minutes (`--wait-seconds`), and prints
+It prints the pairing id, waits up to 290 s (`--wait-seconds`; the engine
+drops an undecided request after 5 minutes), and prints
 the token when the request is approved.
 
 With curl only:
@@ -489,7 +489,7 @@ model family, so clients do not hard-code model names.
 |---|---|---|---|
 | `text` | text | `gemma4-e4b` | error |
 | `fast` | text | `gemma4-e2b` | falls back to `text` |
-| `vision` | vision | `gemma4-e4b` | falls back to `text` |
+| `vision` | text (vision once a model advertises it) | `gemma4-e4b` | falls back to `text` |
 | `code` | text | none | falls back to `text` |
 | `embed` | embedding | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`) |
 
@@ -504,9 +504,11 @@ estia roles set embed nomic-embed-text-v1.5
 estia roles rm code                      # back to the fallback
 ```
 
-A binding is checked against the family's capabilities: `vision` needs a
-vision-capable family, `embed` an embedding model (built-in or imported), and
-every other name needs text. Bindings are stored in
+A binding is checked against the family's capabilities: `embed` needs an
+embedding model (built-in or imported), and every other name needs text.
+`vision` needs text for now: image input is not passed through the API yet,
+so no model advertises `vision`, and the role will require it once one
+does. Bindings are stored in
 `config.json`. A running server reads that file when it starts, so restart it
 after `estia roles set`, or change roles live with `PUT /engine/defaults`
 (admin scope) or the Setup tab of `/client`.
@@ -581,9 +583,17 @@ prompt; the output is validated, repaired where possible and retried once).
 token: two tokens never share a cache entry, even with the same `user`.
 
 Limits per request: `max_tokens` above 8192 is lowered to 8192, `max_attempts`
-on `/engine/generate` is held between 1 and 3, and an embedding request may
-carry at most 256 inputs (more is a 400). A path that matches no route gets a
-JSON 404.
+on `/engine/generate` is held between 1 and 3, an embedding request may
+carry at most 256 inputs (more is a 400), and a request body may be at most
+32 MiB (more is a 413; `serve --max-body-bytes`, `service install
+--max-body-bytes` or `ESTIA_MAX_BODY_BYTES` changes it). A path that matches
+no route gets a JSON 404, and a body the server cannot read gets a JSON 400,
+413, 415 or 422: every error has the same shape.
+
+Some OpenAI fields are accepted and ignored: `tool_choice` (`"none"` does not
+stop tool calls; leave `tools` out instead), `stop` (stop sequences are not
+applied), `n` (one choice comes back) and `top_p`. `finish_reason` is
+`length` when an answer was cut off at `max_tokens`.
 
 Every response has an `X-Request-Id` header. A client may send its own (1 to
 64 ASCII letters, digits, `.`, `_`, `:`, `-`); otherwise the server makes one.
@@ -597,8 +607,9 @@ Estia adds a few fields that standard clients can ignore:
   unless the vectors would match) on embeddings.
 - Responses: an `x_estia` object. Chat completions carry `family`, `backend`
   (`mlx-python` or `llama-cpp`), `cached_tokens`, `template`,
-  `generation_tps`, `repaired`, `repairs` and `ms`. Embeddings carry
-  `fingerprint`, `dims` and `task`. `/v1/models` entries carry `role`,
+  `generation_tps`, `repaired`, `repairs`, `ms` and `load_ms` (the wait for
+  the model to load). Embeddings carry `fingerprint`, `dims`, `task` and
+  `load_ms`. `/v1/models` entries carry `role`,
   `family`, `format`, `backend`, `runnable`, `imported`, `installed`, `dims`
   and similar facts.
 
@@ -612,10 +623,10 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | Command | What it does |
 |---|---|
 | `setup` | Install the runtime, pull models for the roles (`--roles`, default `text,fast,embed`), write `config.json`, mint the first admin token |
-| `service install [--local] [--port] [--allow-host] [--log-level] [--log-format]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
+| `service install [--local] [--port] [--allow-host] [--log-level] [--log-format] [--max-body-bytes]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
 | `service uninstall`, `start`, `stop`, `restart`, `status` | Manage that service |
 | `service logs [-n N] [-f]` | Print the last lines of the service log (40 by default); `-f` keeps following it |
-| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--no-auth`, `--log-level`, `--log-format`) |
+| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--no-auth`, `--max-body-bytes`, `--log-level`, `--log-format`) |
 | `status` | Data directory, runtime, runner, installed models, roles, running server, pending pairings, service |
 | `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--once` for one snapshot) |
 | `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one |
@@ -678,6 +689,7 @@ directory answers.
 | `ESTIA_LLAMA_ARGS` | Extra `llama-server` arguments, split on spaces (`-ngl 0`) |
 | `ESTIA_LLAMA_VARIANT` | The llama.cpp build `runtime install` picks: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`, `rocm` |
 | `ESTIA_ALLOWED_HOSTS` | Extra `Host` names the server answers to, comma-separated (same syntax as `serve --allow-host`) |
+| `ESTIA_MAX_BODY_BYTES` | Largest request body the server accepts, in bytes (default 33554432, 32 MiB; `serve --max-body-bytes` wins over it). A larger body gets a 413. For the service, use `service install --max-body-bytes`: the service does not see your shell's environment. |
 | `ESTIA_MDNS_REFRESH_SECS` | How often the built-in Bonjour advertiser re-registers, in seconds (default 300). A testing aid; not used when macOS `dns-sd` does the advertising. |
 | `ESTIA_LOG` | What to log (same as `--log-level`): a level such as `debug`, or filter directives such as `estia_server=debug,mdns_sd=info`. Default: `info` for Estia, `warn` for libraries. See [docs/logging.md](docs/logging.md). |
 | `ESTIA_LOG_FORMAT` | `text` (default) or `json`, one object per line (same as `--log-format`) |
@@ -830,9 +842,9 @@ needed.
 **Structured output.** The llama.cpp adapter constrains decoding to the JSON
 Schema with a grammar. The MLX runner cannot, so the engine puts the schema in
 the system prompt instead. On both, the engine then checks the output: parse,
-repair common defects (code fences, preambles, bad escapes, unescaped quotes),
-validate against the JSON Schema, and retry once with the validator's
-complaint.
+repair common defects (code fences, preambles, text after the closing brace,
+bad escapes, unescaped quotes), validate against the JSON Schema, and retry
+once with the validator's complaint.
 
 ## Benchmarks
 

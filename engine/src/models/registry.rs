@@ -129,11 +129,13 @@ impl Artifact {
     }
 }
 
-const GEMMA4_CAPS: &[Capability] = &[Capability::Text, Capability::Vision];
-/// The GGUF artifacts load text only until the API passes images (their
-/// `mmproj` projector is not fetched yet). Their chat template carries Gemma
-/// 4's `<|tool_call>` syntax, which llama-server parses.
-const GEMMA4_GGUF_CAPS: &[Capability] = &[Capability::Text, Capability::Tools];
+/// Gemma 4, on either backend: text, and tool calls in its chat template's
+/// native `<|tool_call>` syntax (the MLX runner renders and parses it;
+/// llama-server parses it for the GGUF artifacts). The models are multimodal,
+/// but no image reaches them yet: the MLX runner loads them text-only and the
+/// GGUF artifacts do not fetch their `mmproj` projector. So none advertises
+/// `Vision` until the API passes images to the model (ROADMAP L9).
+const GEMMA4_CAPS: &[Capability] = &[Capability::Text, Capability::Tools];
 
 /// Every generation artifact the engine ships knowledge of, in the order a
 /// picker should list them. Per family, the first artifact of a format is
@@ -205,7 +207,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         repo_id: "google/gemma-4-E4B-it-qat-q4_0-gguf",
         revision: "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
         required_disk_bytes: 5_154_941_280,
-        capabilities: GEMMA4_GGUF_CAPS,
+        capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
         files: &[ArtifactFile {
@@ -224,7 +226,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         repo_id: "google/gemma-4-12B-it-qat-q4_0-gguf",
         revision: "29d097773436b69ff9feafd636ab4cf873786537",
         required_disk_bytes: 6_975_879_296,
-        capabilities: GEMMA4_GGUF_CAPS,
+        capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
         files: &[ArtifactFile {
@@ -243,7 +245,7 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         repo_id: "google/gemma-4-E2B-it-qat-q4_0-gguf",
         revision: "675cff42a74c774d6cb76f76d8eacb49b48c9b93",
         required_disk_bytes: 3_349_516_256,
-        capabilities: GEMMA4_GGUF_CAPS,
+        capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
         files: &[ArtifactFile {
@@ -394,6 +396,23 @@ mod tests {
         assert!(find_artifact(DEFAULT_GENERATION_MODEL_ID).is_some());
         assert_eq!(find_family_default("gemma4-e2b", Format::Mlx).map(|a| a.id), Some("gemma4-e2b-it-4bit-mlx"));
         assert!(GENERATION_MODELS.iter().all(|m| m.has(Capability::Text)));
+    }
+
+    #[test]
+    fn gemma4_advertises_what_reaches_the_model() {
+        // Tools work on both backends; images reach neither yet, so no
+        // artifact claims vision, and a family's formats agree.
+        for a in GENERATION_MODELS {
+            assert!(a.has(Capability::Text) && a.has(Capability::Tools), "{}", a.id);
+            assert!(!a.has(Capability::Vision), "{} must not claim vision before images reach the model", a.id);
+            for other in GENERATION_MODELS.iter().filter(|o| o.family == a.family) {
+                assert_eq!(a.capabilities, other.capabilities, "{} vs {}", a.id, other.id);
+            }
+        }
+        assert!(!family_has("gemma4-e4b", Capability::Vision));
+        assert!(family_has("gemma4-e2b", Capability::Tools));
+        let json = serde_json::to_value(find_artifact("gemma4-e4b-it-4bit-mlx").unwrap().capabilities).unwrap();
+        assert_eq!(json, serde_json::json!(["text", "tools"]));
     }
 
     #[test]

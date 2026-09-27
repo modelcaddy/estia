@@ -54,7 +54,7 @@ use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -399,6 +399,10 @@ pub struct Session {
     gate: Gate,
     in_flight: AtomicUsize,
     last_used: Mutex<Instant>,
+    /// The running child's pid, 0 while the session has stopped it (idle)
+    /// and not started another. Kept apart from the process lock so a stats
+    /// reader never waits behind a generation.
+    live_pid: AtomicU32,
 }
 
 impl Session {
@@ -409,6 +413,7 @@ impl Session {
     pub fn spawn(launch: Launch, cfg: SessionConfig, observer: Arc<dyn SessionObserver>) -> Result<Self> {
         let proc = Self::spawn_proc(&launch, observer.as_ref())?;
         let stdin = Arc::clone(&proc.stdin);
+        let live_pid = AtomicU32::new(proc.child.id());
         Ok(Self {
             launch,
             cfg,
@@ -418,6 +423,7 @@ impl Session {
             gate: Gate::new(),
             in_flight: AtomicUsize::new(0),
             last_used: Mutex::new(Instant::now()),
+            live_pid,
         })
     }
 
@@ -435,9 +441,20 @@ impl Session {
         self.cfg.call_timeout = timeout;
     }
 
-    /// Pid of the current child (it changes on respawn).
+    /// Pid of the current child (it changes on respawn). Waits for the
+    /// process lock, so it blocks while a call runs; [`Session::current_pid`]
+    /// does not.
     pub fn pid(&self) -> u32 {
         self.lock_proc().child.id()
+    }
+
+    /// Pid of the running child without waiting for the call in progress:
+    /// for a stats reader. `None` after the session stopped its child for
+    /// being idle ([`Session::maybe_shutdown`]) and before the next call
+    /// starts another. A child that died on its own keeps its pid here until
+    /// the next call replaces it; its memory then reads as nothing.
+    pub fn current_pid(&self) -> Option<u32> {
+        Some(self.live_pid.load(Ordering::SeqCst)).filter(|p| *p != 0)
     }
 
     /// Callers queued at `prio` right now (not counting the one running).
@@ -514,6 +531,7 @@ impl Session {
         let fresh = Self::spawn_proc(&self.launch, self.observer.as_ref())
             .map_err(|e| SessionError::Respawn { cause: cause.to_string(), source: Box::new(e) })?;
         *self.stdin.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh.stdin);
+        self.live_pid.store(fresh.child.id(), Ordering::SeqCst);
         *p = fresh;
         Ok(())
     }
@@ -779,6 +797,7 @@ impl Session {
         }
         tracing::info!(model = %p.label, pid = p.child.id(), idle_s = timeout.as_secs(), "runner stopped after idle");
         stop_child(&mut p.child);
+        self.live_pid.store(0, Ordering::SeqCst);
         true
     }
 }

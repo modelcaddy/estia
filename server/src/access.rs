@@ -151,7 +151,8 @@ impl Access {
         });
     }
 
-    /// This request started the runner and loaded the model.
+    /// This request waited this long for the model to load: it started the
+    /// runner and loaded the model, or joined a load already under way.
     pub fn loaded(&self, ms: u64) {
         self.with(|f| f.load_ms = Some(ms));
     }
@@ -186,7 +187,7 @@ impl Access {
         });
     }
 
-    /// How the generation ended: `stop`, `tool_calls`, `cancelled` or `error`.
+    /// How the generation ended: `stop`, `length`, `tool_calls`, `cancelled` or `error`.
     pub fn finish(&self, finish: &'static str) {
         self.with(|f| {
             if f.call_started.is_some() && f.call_ended.is_none() {

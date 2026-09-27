@@ -13,12 +13,15 @@ took the name Estia in 0.3.0).
 
 ## Unreleased
 
-This will be 0.4.0, the version the workspace already carries, and the first
-public release. When it is tagged, this heading becomes `## 0.4.0 — <date>`
-(step 2 of the release checklist in [docs/versioning.md](docs/versioning.md)).
+Nothing yet.
 
-The llama.cpp backend, version numbers that say which build is running, and
-a guide to running and testing Estia.
+## 0.4.0 — 2026-09-27
+
+The first tagged release.
+
+The llama.cpp backend, version numbers that say which build is running, a
+guide to running and testing Estia, and the fixes from an acceptance run
+against a live engine.
 
 ### llama.cpp backend
 
@@ -147,6 +150,109 @@ See [docs/versioning.md](docs/versioning.md).
   which was wrong: engines with different data directories can run side by
   side on one machine.
 
+### Fixes from the acceptance run
+
+An acceptance run on 2026-09-27 drove a live MLX engine on an M1 Pro (32 GB)
+through its API, its examples and its performance. What it found, fixed and
+re-tested live on a scratch engine; the ids are the run's finding ids.
+
+- **One load per model** (perf-F1). Requests that arrive together for a
+  model that is not loaded share one load: the first starts the runner and
+  loads the weights, the others wait for it and then use the same session.
+  Before, each started a runner of its own and loaded the weights again. A
+  load that fails hands its error to everyone waiting on it; the next
+  request tries again.
+- **`finish_reason: "length"`** (api-F2) when the answer used up
+  `max_tokens`, on `/v1/chat/completions` (streamed and not) and on
+  `/engine/generate`, which gains `finish_reason` (`null` for a raw
+  `prompt`). Runners report it in the new `meta.finish_reason`; the MLX
+  runner (2.3.0) and the llama.cpp adapter both send it, and for a runner
+  that does not, the server infers `length` from the token count. Before,
+  a cut-off answer said `stop`. The access log's `finish` can say `length`.
+- **Cancel during prefill** (api-F3). A client that closes a stream while a
+  long prompt is still being read now frees the model within about a
+  quarter of a second: the MLX runner prefills in chunks of about 0.25 s
+  and checks for a cancel between them, and the server cancels as soon as
+  the client goes instead of when the first token fails to send. With an
+  8.5K-token prompt closed after 1 s, the next short request on the same
+  model answered in 0.3 s on `gemma4-e2b` and `gemma4-e4b`; before, it
+  waited for the whole prefill (about 5 s on e2b, 21 s on e4b). Chunking
+  costs the 12B about 10% on a cold prefill; e2b loses nothing.
+- **Request bodies up to 32 MiB** (api-F4), room for a full embed batch;
+  axum's default refused 2 MB. `estia serve --max-body-bytes`, `estia
+  service install --max-body-bytes` or `ESTIA_MAX_BODY_BYTES` change it (the
+  flag wins). A larger body gets a JSON 413 that says the limit and how to
+  raise it, with `request_id`; malformed JSON (400), a wrong content type
+  (415) and missing fields (422) are JSON errors too, not `text/plain`.
+- **`/engine/embed` with `inputs: []`** is a 400 (api-F5), as on
+  `/v1/embeddings`, and loads no model.
+- **Unique ids** (api-F6): `chatcmpl-` and 24 random hex digits for
+  completions, `call_` and 24 for tool calls, set once per response. Before,
+  completion ids repeated within a second and tool calls were numbered
+  `call_0`, `call_1` in every response. An id a runner supplies is kept.
+- **The prompt cache survives what used to reset it** (api-F7, perf-F2). The
+  MLX runner keeps each conversation's cache itself: it records the tokens
+  the cache holds and snapshots the sliding-window layers at the end of the
+  history. On `gemma4-12b`, whose prompt ends in an empty thought channel
+  the template drops from history, the second turn of a 1.7K-token
+  conversation reused 1665 of 1707 tokens and took 1.9 s instead of 20 s.
+  Sending the same messages again (a regenerate) reuses all but the last
+  few tokens (1700 of 1707 on the 12B) and gives the same answer at
+  temperature 0. A turn after a cancel reuses what was prefilled before the
+  cancel. The snapshot costs about 330 MB per 12B conversation.
+- **Trailing text after JSON** (api-F1). Structured output that closes its
+  object or array and then goes on (`Hope this helps!`, a stray `}`, a
+  second object) is used, with `strip_trailing_text` in `repairs`, instead
+  of failing with 422. A code fence after a preamble is honoured. A lone
+  number or string must still be the whole output, and truncated JSON is
+  not repaired. A fallback tool call written as JSON and followed by a
+  sign-off is still a call. `estia_engine::structured::first_json_value` is
+  public.
+- **Capabilities say what reaches the model** (api-F8). Image parts are not
+  passed to the model, so no Gemma 4 artifact advertises `vision` any more:
+  they list `text` and `tools`, on `/engine/models` and, new,
+  `/v1/models` (`x_estia.capabilities`). The `vision` role needs only text
+  until a model advertises vision, so the default role table, which binds
+  `vision` to `gemma4-e4b`, still passes its own check.
+- **Load time and error messages** (api-F9). `x_estia.load_ms` (and
+  `load_ms` on `/engine/generate` and `/engine/embed`) is how long a request
+  waited for its model to load, `null` when it was loaded; `ms` is the work
+  itself (`/engine/embed`'s used to include the load). The 404 for a model
+  that is not installed names no path on the engine's machine and says to
+  run `estia pull <id>`; the path goes to the log. Unknown names get
+  ``unknown model or role `…` ``. The 500s for a missing runner script or
+  llama adapter name no paths either.
+- **`encoding_format: "base64"`** on `/v1/embeddings` (examples-1): each
+  vector as its little-endian f32 bytes in standard base64, what OpenAI's
+  JavaScript SDK asks for by default. `float` stays the default; anything
+  else is a 400. Before, the SDK decoded the engine's arrays as base64 and
+  got 192 wrong numbers instead of 768.
+- **Memory per model in `/engine/stats`**: `models` lists each loaded model
+  with its runner's `pid` and `memory_bytes`, the physical footprint of the
+  runner and every process it started (so a llama.cpp model's
+  `llama-server` is counted). It includes the Metal buffers an MLX runner
+  keeps its weights in, which `ps` leaves out: 4.0 GB for `gemma4-e2b`
+  where `ps` shows about 100 MB. `loaded` is unchanged. For hosts:
+  `estia_engine::procmem` (`phys_footprint`, `tree_footprint`,
+  `children_of`), `GenSession::pid` and `EmbedSession::pid`, and
+  `Session::current_pid`, which never waits for a call in progress.
+- **Examples and docs** (examples-2 to 6). `remote_client.rs` reads the
+  engine's embedding fingerprint instead of assuming the MLX one, so it runs
+  against a llama.cpp engine. The curl snippets use `$ESTIA_TOKEN`. Every
+  `estia pair` subcommand, argument and option has help text. `pair.py` and
+  `estia pair request` stop waiting at 290 s, before the engine drops an
+  undecided request at 300 s, and say so, instead of ending on a 404. The
+  API reference documents the fields MLX ignores (`tool_choice`, `stop`,
+  `n`), `/engine/stats`, and the new fields and limits above.
+- **MLX runner 2.3.0** carries the runner side of these: chunked prefill,
+  `meta.finish_reason`, the conversation cache, and a cancelled stream that
+  records exactly what its cache holds.
+
+- `estia setup` no longer writes a `backend` key into `config.json` when the
+  backend is only this machine's default; running it again changes nothing.
+  An explicit `--backend` (or `ESTIA_BACKEND`) is still saved.
+- `estia dashboard` shows `loaded : none` instead of a blank list.
+
 ### Known limits
 
 [ROADMAP.md](ROADMAP.md) says which of these are planned to change.
@@ -155,7 +261,12 @@ See [docs/versioning.md](docs/versioning.md).
   small test models. The Gemma 4 GGUF files, Linux (outside CI) and NVIDIA
   GPUs are untested, and Estia does not build for Windows.
 - No TLS: LAN traffic, tokens included, is plain HTTP.
-- Image input is not passed through the API.
+- Image input is not passed through the API: image parts in a message are
+  dropped, and no model advertises `vision`.
+- A small model can stray into another script. Asked in Greek, `gemma4-e2b`
+  wrote one syllable in Hebrew letters (`Ολύבותρος` for Olympus); the model
+  chose that token (probability 0.30), and Estia passes tokens through
+  unchanged (perf-F10).
 - Role sampling settings (`temperature`, `max_tokens`, `pin`) are stored but
   not applied.
 - A non-streaming request is not cancelled when its client disconnects, and

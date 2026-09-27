@@ -29,7 +29,7 @@ protocol : v2 (runners)
 backends : mlx-python (default on this machine), llama-cpp
 features : python-mlx, llama-runtime
 llama.cpp: b11146 (pinned for `estia runtime install --backend llama`)
-runner   : mlx-python 2.2.0 (compiled in)
+runner   : mlx-python 2.3.0 (compiled in)
 ```
 
 - `commit`: the first 9 hex digits of the git commit. `+dirty` means files
@@ -80,7 +80,7 @@ $ estia version --json
     "llama-runtime"
   ],
   "llama_cpp_build": "b11146",
-  "mlx_runner_version": "2.2.0",
+  "mlx_runner_version": "2.3.0",
   "protocol_version": 2,
   "version": "0.4.0"
 }
@@ -136,7 +136,7 @@ Estia carries several version numbers. They change independently.
 | Estia version | `version` in the root `Cargo.toml`, shared by every crate | 0.4.0 | every release |
 | API version | `estia_server::API_VERSION`, `api_version` in `/engine/health` and the Bonjour record | 1 | an incompatible change to `/engine/*` |
 | Protocol version | `estia_proto::PROTOCOL_VERSION`, `protocol_version` in `/engine/health` | 2 | an incompatible change between the engine and its runners |
-| MLX runner version | `RUNNER_VERSION` in `runners/mlx-python/estia-runner.py`, sent in the runner's `hello` | 2.2.0 | a change to the runner's behaviour |
+| MLX runner version | `RUNNER_VERSION` in `runners/mlx-python/estia-runner.py`, sent in the runner's `hello` | 2.3.0 | a change to the runner's behaviour |
 | llama.cpp adapter version | the `estia-llama` crate version, sent in its `hello` | 0.4.0 | with Estia |
 | llama.cpp build | `LLAMA_BUILD` in `engine/src/runtime/llama_pins.rs` | b11146 | when the pin is bumped |
 

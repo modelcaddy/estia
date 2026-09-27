@@ -181,6 +181,12 @@ pub struct GenerationMeta {
     /// Decode rate the runner measured (tokens/s, generation only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_tps: Option<f64>,
+    /// Why decoding stopped, in OpenAI's words: `stop` (end of turn or a stop
+    /// sequence), `length` (the `max_tokens` budget ran out) or `tool_calls`.
+    /// Optional: without it the server infers `length` from
+    /// `generation_tokens` reaching `max_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

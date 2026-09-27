@@ -221,12 +221,12 @@ does not apply to the request is left out.
 | `asked` | The `model` the client sent: a role, family or model id |
 | `model` | The model that served it |
 | `stream` | Whether the generation streamed |
-| `load_ms` | This request started the runner and loaded the model; how long that took |
+| `load_ms` | The model was not loaded when this request arrived: how long the request waited for it, whether it started the load itself or arrived while another request's load was running (requests share one load) |
 | `max_tokens` | The token limit in force, after capping |
 | `prompt_tokens`, `cached_tokens`, `completion_tokens` | From the runner. `cached_tokens` came from the prompt cache. Absent for raw `prompt` generations on `/engine/generate` and for cancelled streams. |
 | `time_to_first_token_ms` | Streams only: from the request's arrival to the first text the runner streamed back. The runner holds back its last 24 characters to filter control markers, so this is later than the model's first token. For prose it is when the client sees text; when tools are declared, the server holds text back itself until it can tell prose from a tool call. |
 | `tokens_per_s` | `completion_tokens` divided by the time the runner call took, prompt processing included |
-| `finish` | `stop`, `tool_calls`, `cancelled` (the client went away mid-stream) or `error` |
+| `finish` | `stop`, `length` (cut off at `max_tokens`), `tool_calls`, `cancelled` (the client went away mid-stream) or `error` |
 | `attempts` | Structured-output runner calls, when more than one |
 | `inputs`, `dims` | Embeddings: number of inputs, vector size |
 | `job_id` | Pulls and runtime installs: the job the request started or found running |

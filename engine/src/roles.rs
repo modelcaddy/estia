@@ -19,13 +19,22 @@ pub const VISION: &str = "vision";
 pub const EMBED: &str = "embed";
 pub const CODE: &str = "code";
 
-/// What a role needs from the family bound to it.
+/// What a role needs from the family bound to it. `vision` needs only
+/// `Text` while no model advertises `Vision` (none does until images reach
+/// the model, ROADMAP L9): the role keeps its name and its default binding
+/// and serves text, and a role table read back from `GET /engine/defaults`
+/// still passes [`Roles::bind`]. It needs `Vision` again once an artifact
+/// has it.
 pub fn required_capability(role: &str) -> Capability {
     match role {
         EMBED => Capability::Embed,
-        VISION => Capability::Vision,
+        VISION if any_vision_model() => Capability::Vision,
         _ => Capability::Text,
     }
+}
+
+fn any_vision_model() -> bool {
+    registry::generation_artifacts().iter().any(|a| a.has(Capability::Vision))
 }
 
 /// Where an unset role looks next. `None` means the role is terminal.
@@ -186,6 +195,25 @@ mod tests {
         );
         assert!(r.unbind("writer").is_some());
         assert!(r.unbind("writer").is_none());
+    }
+
+    #[test]
+    fn the_default_table_passes_its_own_checks() {
+        // What GET /engine/defaults returns must be accepted by PUT, which
+        // re-binds every entry through `bind`.
+        let defaults = Roles::defaults();
+        let mut checked = Roles::default();
+        for (role, b) in defaults.iter() {
+            checked.bind(role, b.clone()).unwrap_or_else(|e| panic!("default `{role}`: {e}"));
+        }
+        assert_eq!(checked, defaults);
+        // No model takes images yet, so `vision` binds like a text role; it
+        // still refuses what cannot generate at all.
+        assert_eq!(required_capability(VISION), Capability::Text);
+        let mut r = Roles::default();
+        r.bind(VISION, RoleBinding::family("gemma4-e2b")).unwrap();
+        assert!(matches!(r.bind(VISION, RoleBinding::family("nomic-embed-text-v1.5")), Err(RoleError::Incapable { .. })));
+        assert_eq!(r.resolve(VISION).unwrap().binding.family, "gemma4-e2b");
     }
 
     #[test]

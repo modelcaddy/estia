@@ -22,6 +22,8 @@
 //! - [`Roles`]: stable names a client asks for (`text`, `fast`, `embed`, …),
 //!   bound to model families.
 //! - [`structured`]: JSON output repair and JSON Schema validation.
+//! - [`procmem`]: a process's physical memory by pid ([`phys_footprint`]),
+//!   for per-runner memory figures.
 //! - [`Engine`]: one value owning the store, the runtime, the resident
 //!   sessions and the role table.
 //! - [`RemoteEngine`], [`GenHandle`] / [`EmbedHandle`]: the same shapes over
@@ -36,6 +38,7 @@ pub mod handles;
 pub mod location;
 pub mod models;
 pub mod oneshot;
+pub mod procmem;
 pub mod remote;
 pub mod resident;
 pub mod roles;
@@ -50,6 +53,7 @@ pub use estia_proto as proto;
 pub use handles::{EmbedHandle, GenHandle};
 pub use location::EngineLocation;
 pub use oneshot::{OneShot, OneShotConfig};
+pub use procmem::phys_footprint;
 pub use remote::{RemoteEmbed, RemoteEngine, RemoteGen};
 pub use resident::{ChatOutcome, EmbedSession, GenSession};
 pub use roles::{RoleBinding, RoleError, Roles};

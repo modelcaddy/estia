@@ -33,6 +33,10 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# procmem: proc_pid_rusage for a runner's physical footprint.
+libc = "0.2"
+
 [features]
 default = []
 # The downloaded-Python + mlx runtime installer.

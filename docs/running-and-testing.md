@@ -191,8 +191,8 @@ curl -s http://127.0.0.1:27200/v1/chat/completions \
             }
         }
     ],
-    "created": 1790459110,
-    "id": "chatcmpl-81009-1790459110",
+    "created": 1790463803,
+    "id": "chatcmpl-f968156af98da95039e913a0",
     "model": "gemma4-e2b-it-4bit-mlx",
     "object": "chat.completion",
     "usage": {
@@ -207,8 +207,9 @@ curl -s http://127.0.0.1:27200/v1/chat/completions \
         "backend": "mlx-python",
         "cached_tokens": 0,
         "family": "gemma4-e2b",
-        "generation_tps": 85.30209430733623,
-        "ms": 359,
+        "generation_tps": 86.91659075404218,
+        "load_ms": null,
+        "ms": 318,
         "repaired": null,
         "repairs": null,
         "template": "native"
@@ -217,9 +218,11 @@ curl -s http://127.0.0.1:27200/v1/chat/completions \
 ```
 
 `model` is a role: `fast` answered from `gemma4-e2b-it-4bit-mlx`. The first
-request to a model starts a runner and loads the weights, which took 6.2
-seconds in this run. The request shown was the second, and took 0.36 seconds. The server
-releases a model after 15 idle minutes (`serve --idle-unload-minutes`).
+request to a model starts a runner and loads the weights, which took 4.6
+seconds in this run; that request's `x_estia.load_ms` says so. The request
+shown came later, so `load_ms` is `null` and it took 0.32 seconds (`ms`).
+Requests that arrive while a model is loading wait for that one load. The
+server releases a model after 15 idle minutes (`serve --idle-unload-minutes`).
 
 ### 5. Run the smoke test
 
@@ -313,9 +316,10 @@ estia service uninstall
 - `install` copies the binary and the runner scripts into
   `<data dir>/engine/`, so the service keeps working if the checkout or
   download moves. Run `install` again after you upgrade or rebuild.
-- `install` takes `--port`, `--allow-host`, `--log-level`, `--log-format` and
-  the global `--backend`, and passes them to `estia serve`. `ESTIA_LOG` in your
-  shell is not passed on.
+- `install` takes `--port`, `--allow-host`, `--log-level`, `--log-format`,
+  `--max-body-bytes` and the global `--backend`, and passes them to
+  `estia serve`. `ESTIA_LOG` and `ESTIA_MAX_BODY_BYTES` in your shell are not
+  passed on.
 - To use a data directory other than the default, set `ESTIA_DATA_DIR`
   before `install`; the service definition records it.
 - There is one Estia service per user account. The definition is
@@ -667,8 +671,9 @@ shows each request and response in full.
 | `403` with ``token lacks the `generate` scope`` | The token was minted without that scope | Mint one with the scopes it needs: `estia token new app --scopes generate,embed`, or rotate it with `estia token new app --replace --scopes …`. |
 | `403` with `cross-origin POST from Origin …` | A web page on another origin posted to the engine | Serve the page from the engine's own origin or through a proxy; see [Web front-ends and CORS](building-clients.md#web-front-ends-and-cors). |
 | `no Python interpreter for the resident runner: the runtime is not installed`, or `no llama-server: the llama.cpp runtime is not installed under …` | The backend's runtime is missing | `estia runtime install` (MLX) or `estia runtime install --backend llama`, or `estia setup`. `estia runtime status` shows what is there. |
-| `404` with ``model `gemma4-e2b-it-4bit-mlx` is not downloaded at …`` | The role points to a model that is not installed | `estia pull fast` (a role, family or model id). `estia models` marks what is installed; `estia roles` shows the bindings. |
-| `404` with ``unknown model `…` `` | The `model` field names no role, family or model | Ask for a role (`fast`, `text`, `embed`). `GET /v1/models` lists the names. |
+| `404` with ``model `gemma4-e2b-it-4bit-mlx` is not installed on this engine; run `estia pull …` `` | The role points to a model that is not installed | Run the `estia pull` the message names, or `estia pull fast` (a role, family or model id). `estia models` marks what is installed; `estia roles` shows the bindings. The engine's log has the path it looked in. |
+| `404` with ``unknown model or role `…` `` | The `model` field names no role, family or model | Ask for a role (`fast`, `text`, `embed`). `GET /v1/models` lists the names. |
+| `413` with `request body is larger than this engine accepts (… bytes, 32.0 MiB)` | A request over the body limit, 32 MiB by default: usually a large embedding batch, or a chat history with long documents pasted in | Send less per request (fewer embedding inputs per call). If the engine should take more, raise the limit: `estia serve --max-body-bytes <bytes>` (for the service, `estia service install --max-body-bytes <bytes>`), or `ESTIA_MAX_BODY_BYTES=<bytes>` in the engine's environment. |
 | `400` with ``… is a gguf artifact and this engine runs mlx-python`` (or the reverse) | A model id for the other backend | Ask by role or family instead of the artifact id. |
 | The first requests after installing llama.cpp on a Mac take about 25 s each | macOS checks the unsigned `llama-server` the first few times it starts (Gatekeeper). Later starts take a fraction of a second. | Wait for it. It happens only after an install. |
 | `Error: an engine is already running for this data directory (pid …)` | Another `estia serve`, or the service, is using the same data directory | Use that engine, or stop it (`estia service stop`, or Ctrl-C), or give this one its own `--data-dir`. |
@@ -676,6 +681,7 @@ shows each request and response in full.
 | `estia discover` finds nothing | The engine serves loopback only (`serve` without `--lan`, or `service install --local`), advertising is off (`--no-advertise`), or the network does not pass multicast between devices (guest networks and some routers isolate clients) | Connect by address: `estia status` on the engine's machine prints the URL. |
 | On an iPhone, `/client` zooms in when you type and stays zoomed | Safari zooms into text fields smaller than 16 px. The page was fixed before 0.4.0, the first published version. | Update the engine (the page is built into it) and reload the page. |
 | A request you gave up on still holds the model, and the next one waits | A known limit: a non-streaming request is not cancelled when its client disconnects; the generation runs to the end | Use `"stream": true` for anything a user may cancel; closing a stream cancels the generation. Keep `max_tokens` modest. |
+| `ps` or `top` shows an MLX runner using about 100 MB while the Mac is short of memory | On macOS, a process's resident size (RSS) leaves out the Metal buffers MLX keeps the weights and KV cache in. In one run, `ps` showed 102 MB for a `gemma4-e2b` runner whose footprint was 3.8 GB, 3.4 GB of it Metal buffers. | Read the runner's physical footprint instead: `GET /engine/stats` reports it per loaded model, as does the Memory column in Activity Monitor (`footprint <pid>` in a terminal). To free memory, let idle models unload (`--idle-unload-minutes`) or stop the engine. |
 | `estia serve` says it minted an admin token but did not print it | stderr was not a terminal, so the token would have gone to a log file | `estia token new local --replace` prints a new one. |
 
 When you report a problem, include `estia version`, the smoke test's output,

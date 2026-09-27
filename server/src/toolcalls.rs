@@ -20,13 +20,22 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    pub fn to_openai(&self, index: usize) -> Value {
+    /// This call in OpenAI's shape, with a fresh `call_<random>` id. Build a
+    /// response's calls once and reuse them: clients match a `tool` message
+    /// to its call by this id, so it must not change within a response and
+    /// must not repeat across responses (a conversation holds many).
+    pub fn to_openai(&self) -> Value {
         json!({
-            "id": format!("call_{index}"),
+            "id": call_id(),
             "type": "function",
             "function": {"name": self.name, "arguments": self.arguments}
         })
     }
+}
+
+/// A new tool-call id: `call_` and 24 random hex digits.
+pub fn call_id() -> String {
+    crate::unique_id("call_")
 }
 
 /// Gemma's `{key:<|"|>value<|"|>,n:3,list:[…]}` → JSON text.
@@ -99,9 +108,10 @@ pub fn parse(text: &str) -> Vec<ToolCall> {
     if !calls.is_empty() {
         return calls;
     }
-    // Manual-fallback JSON: {"tool_call": {...}} or {"name": …, "arguments": …}.
+    // Manual-fallback JSON: {"tool_call": {...}} or {"name": …, "arguments": …},
+    // possibly followed by a sign-off the model added after closing it.
     let cleaned = estia_engine::structured::clean_json(text);
-    if let Ok(v) = serde_json::from_str::<Value>(&cleaned) {
+    if let Ok((v, _trailing)) = estia_engine::structured::first_json_value(&cleaned) {
         let candidates: Vec<&Value> = match &v {
             Value::Array(items) => items.iter().collect(),
             other => vec![other],
@@ -126,15 +136,17 @@ pub fn parse(text: &str) -> Vec<ToolCall> {
 /// is the runner's `parses_tool_calls` capability: its `meta.tool_calls` are
 /// used as they came (with an `id`, `type` and string `arguments` filled in
 /// where missing), and the text is not parsed. Otherwise the text is parsed.
+/// Every call gets its id here, once: `call_<random>` unless the runner
+/// named it.
 pub fn from_output(runner_parses: bool, text: &str, meta_calls: Option<&[Value]>) -> Vec<Value> {
     if runner_parses {
-        return meta_calls.unwrap_or_default().iter().enumerate().filter_map(|(i, c)| normalize(c, i)).collect();
+        return meta_calls.unwrap_or_default().iter().filter_map(normalize).collect();
     }
-    parse(text).iter().enumerate().map(|(i, c)| c.to_openai(i)).collect()
+    parse(text).iter().map(ToolCall::to_openai).collect()
 }
 
 /// One runner-parsed call in OpenAI's shape; `None` when it has no name.
-fn normalize(c: &Value, i: usize) -> Option<Value> {
+fn normalize(c: &Value) -> Option<Value> {
     let f = c.get("function")?;
     let name = f.get("name").and_then(Value::as_str).filter(|n| !n.is_empty())?;
     let arguments = match f.get("arguments") {
@@ -142,7 +154,7 @@ fn normalize(c: &Value, i: usize) -> Option<Value> {
         None | Some(Value::Null) | Some(Value::String(_)) => "{}".to_string(),
         Some(other) => other.to_string(),
     };
-    let id = c.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("call_{i}"));
+    let id = c.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(call_id);
     Some(json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}))
 }
 
@@ -181,7 +193,10 @@ mod tests {
             calls[0],
             json!({"id": "c9", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Athens\"}"}})
         );
-        assert_eq!(calls[1]["id"], "call_1");
+        let id1 = calls[1]["id"].as_str().unwrap();
+        let id2 = calls[2]["id"].as_str().unwrap();
+        assert!(id1.starts_with("call_") && id1.len() == "call_".len() + 24, "{id1}");
+        assert_ne!(id1, id2, "calls in one response have distinct ids");
         assert_eq!(calls[1]["function"]["arguments"], "{\"tz\":\"UTC\"}");
         assert_eq!(calls[2]["function"]["arguments"], "{}");
         assert!(from_output(true, gemma, None).is_empty(), "a parsing runner's text is content");
@@ -204,9 +219,42 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(serde_json::from_str::<Value>(&calls[0].arguments).unwrap(), json!({"n": 3, "flag": true, "list": ["x", 2]}));
         assert_eq!(calls[1].arguments, "{}");
-        let oai = calls[0].to_openai(0);
+        let oai = calls[0].to_openai();
         assert_eq!(oai["function"]["name"], "a");
         assert_eq!(oai["type"], "function");
+    }
+
+    /// Ids never repeat: not between the calls of one response, not between
+    /// responses (a conversation sends many `tool` results back, matched by id).
+    #[test]
+    fn call_ids_are_unique() {
+        let text = r#"<|tool_call>call:a{}<tool_call|><|tool_call>call:b{}<tool_call|>"#;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            for c in from_output(false, text, None) {
+                let id = c["id"].as_str().unwrap().to_string();
+                assert!(id.starts_with("call_"), "{id}");
+                assert!(seen.insert(id.clone()), "{id} repeated");
+            }
+        }
+        // A parsing runner's own ids are kept; a missing one is filled in fresh.
+        let meta = vec![json!({"id": "srv-1", "function": {"name": "x"}}), json!({"function": {"name": "y"}})];
+        let calls = from_output(true, "", Some(&meta));
+        assert_eq!(calls[0]["id"], "srv-1");
+        assert!(calls[1]["id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    /// A fallback call the model closed and then signed off after still
+    /// counts, as structured output does (api-F1); prose is still prose.
+    #[test]
+    fn a_json_call_followed_by_text_is_a_call() {
+        let calls =
+            parse("{\"tool_call\": {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Athens\"}}}\nLet me know if you need more.");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].arguments).unwrap(), json!({"city": "Athens"}));
+        assert!(parse("The weather in Athens is sunny.").is_empty());
+        assert!(parse("{\"city\": \"Athens\"} is what I found.").is_empty(), "JSON without a name is not a call");
     }
 
     #[test]

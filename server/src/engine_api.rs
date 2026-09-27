@@ -2,7 +2,9 @@
 
 use crate::access::{spawn_blocking_in_span, Access};
 use crate::jobs::JobStatus;
-use crate::openai::{apply_prefix, embed_task, inputs_of, parse_response_format, runner_format, task_name, to_messages, OaiMessage};
+use crate::openai::{
+    apply_prefix, embed_task, finish_reason, inputs_of, parse_response_format, runner_format, task_name, to_messages, OaiMessage,
+};
 use crate::pairing::PairingError;
 use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION, BUILD_COMMIT, BUILD_DATE};
 use axum::{
@@ -482,19 +484,19 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     if let Some(a) = &access {
         a.generation(&name, artifact.id, streaming, max_tokens);
     }
+    // Either a raw prompt (the resident runner's `generate_stream`) or messages
+    // (protocol v2 `chat_stream` through the template). Checked before a
+    // model is loaded for the request.
+    let mut messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m));
+    let mut prompt = req.prompt.clone();
+    if messages.is_none() && prompt.is_none() {
+        return Err(ApiError::bad_request("prompt or messages is required"));
+    }
     let backend = state.embed_backend();
     let st = Arc::clone(&state);
     let (session, load_ms) = spawn_blocking_in_span(move || st.gen_session_timed(artifact)).await??;
     if let (Some(a), Some(ms)) = (&access, load_ms) {
         a.loaded(ms);
-    }
-
-    // Either a raw prompt (the resident runner's `generate_stream`) or messages
-    // (protocol v2 `chat_stream` through the template).
-    let mut messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m));
-    let mut prompt = req.prompt.clone();
-    if messages.is_none() && prompt.is_none() {
-        return Err(ApiError::bad_request("prompt or messages is required"));
     }
     let tools = req.tools.clone().filter(|t| !t.is_empty());
     let caps = session.capabilities();
@@ -526,11 +528,14 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
 
     if streaming {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+        // A client that leaves cancels the generation, mid-prefill included.
+        let cancel = CancelToken::new();
+        let watch = crate::cancel_on_disconnect(&tx, cancel.clone());
         let s = Arc::clone(&session);
         let acc = access.clone();
         let request_id = access.as_ref().map(|a| a.id().to_string());
         spawn_blocking_in_span(move || {
-            let cancel = CancelToken::new();
+            let _watch = watch;
             let flip = cancel.clone();
             let send = |v: Value| tx.send(Ok(Event::default().data(v.to_string()))).is_ok();
             let t0 = Instant::now();
@@ -570,13 +575,15 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
             // Let go of the access record before the stream ends (see chat_completions).
             match result {
                 Ok((text, meta)) => {
+                    let finish = finish_reason(false, meta.as_ref(), max_tokens);
                     if let Some(a) = acc {
                         a.call_end(meta.as_ref());
-                        a.finish("stop");
+                        a.finish(finish.unwrap_or("stop"));
                     }
-                    let _ = send(
-                        json!({"done": true, "text": text, "meta": meta, "model": artifact.id, "family": artifact.family, "backend": backend, "ms": t0.elapsed().as_millis()}),
-                    );
+                    let _ = send(json!({
+                        "done": true, "text": text, "finish_reason": finish, "meta": meta, "model": artifact.id,
+                        "family": artifact.family, "backend": backend, "ms": t0.elapsed().as_millis(), "load_ms": load_ms,
+                    }));
                 }
                 Err(estia_engine::SessionError::Cancelled { .. }) => {
                     if let Some(a) = acc {
@@ -660,11 +667,13 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
         } else {
             Vec::new()
         };
+        let finish = finish_reason(!tool_calls.is_empty(), meta.as_ref(), max_tokens);
         if let Some(a) = &acc {
-            a.finish(if tool_calls.is_empty() { "stop" } else { "tool_calls" });
+            a.finish(finish.unwrap_or("stop"));
         }
         Ok(json!({
             "text": text,
+            "finish_reason": finish,
             "json": structured.as_ref().map(|s| s.value.clone()),
             "repaired": structured.as_ref().map(|s| s.repaired).unwrap_or(false),
             "repairs": structured.as_ref().map(|s| s.repairs.clone()).unwrap_or_default(),
@@ -672,7 +681,8 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
             "tool_calls": tool_calls,
             "meta": meta,
             "model": artifact.id, "family": artifact.family, "backend": backend,
-            "ms": t0.elapsed().as_millis(),
+            // Generation time; `load_ms` is the wait for the model to load.
+            "ms": t0.elapsed().as_millis(), "load_ms": load_ms,
         }))
     })
     .await??;
@@ -699,6 +709,9 @@ pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequ
     if let Some(a) = &access {
         a.embedding(req.model.as_deref().unwrap_or("embed"), model.id, inputs.len(), model.dims);
     }
+    if inputs.is_empty() {
+        return Err(ApiError::bad_request("inputs must not be empty"));
+    }
     check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
     let fingerprint = state.embed_fingerprint(model)?;
@@ -710,18 +723,20 @@ pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequ
     let prio = if req.priority.as_deref() == Some("background") { Priority::Background } else { Priority::Interactive };
     let prefixed = apply_prefix(model, task, &inputs);
     let st = Arc::clone(&state);
-    let t0 = Instant::now();
-    let (vectors, load_ms) = spawn_blocking_in_span(move || -> Result<(Vec<Vec<f32>>, Option<u64>), ApiError> {
+    let (vectors, load_ms, ms) = spawn_blocking_in_span(move || {
         let (session, load_ms) = st.embed_session_timed(model)?;
-        Ok((session.embed_batch_with(&prefixed, prio)?, load_ms))
+        let t0 = Instant::now();
+        let vectors = session.embed_batch_with(&prefixed, prio)?;
+        Ok::<_, ApiError>((vectors, load_ms, t0.elapsed().as_millis()))
     })
     .await??;
     if let (Some(a), Some(ms)) = (&access, load_ms) {
         a.loaded(ms);
     }
+    // `ms` is the embedding itself; `load_ms` the wait for the model to load.
     Ok(Json(json!({
         "vectors": vectors, "fingerprint": fingerprint, "model": model.id, "dims": model.dims,
-        "task": task_name(task), "backend": state.embed_backend(), "ms": t0.elapsed().as_millis()
+        "task": task_name(task), "backend": state.embed_backend(), "ms": ms, "load_ms": load_ms,
     })))
 }
 
@@ -809,14 +824,21 @@ pub async fn deny_pairing(State(state): State<Arc<AppState>>, Path(id): Path<Str
     Ok(Json(json!({"id": p.id, "name": p.name, "status": p.status, "revoked": p.revoked, "token_name": p.token_name})))
 }
 
-pub async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
+/// Uptime, what is loaded, queue depths, jobs. `models` has one entry per
+/// resident model: `id`, `kind`, the runner's `pid` and `memory_bytes`, the
+/// physical memory that runner holds (with any process it started); either
+/// is null when it cannot be told.
+pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let (interactive, background) = state.queue_depths();
-    Json(json!({
+    let st = Arc::clone(&state);
+    let models = spawn_blocking_in_span(move || st.runners()).await?;
+    Ok(Json(json!({
         "uptime_s": state.started.elapsed().as_secs(),
         "loaded": state.loaded(),
+        "models": models,
         "queue": {"interactive": interactive, "background": background},
         "jobs": state.jobs.list().len(),
-    }))
+    })))
 }
 
 #[cfg(test)]

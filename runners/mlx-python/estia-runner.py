@@ -15,17 +15,21 @@ Requests:
    "tools":[...OpenAI tool schemas...], "cache_key":"conv-1", "format":{...},
    "max_tokens":256,"temperature":0.2}
       -> {"text":"...","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,
-                                "generation_tps":X}}
+                                "generation_tps":X,"finish_reason":"stop"|"length"|"tool_calls"}}
       messages are rendered through the model's own chat template (system, user,
       assistant, tool roles; tools declared natively where the template supports
       it). An assistant turn's tool_calls (OpenAI shape, arguments as a JSON
       string) and the tool results that answer them (role "tool" with
       tool_call_id) go through the template too, so the model sees its own calls
       and their results. cache_key keeps the KV cache across turns of one
-      conversation so only the new suffix is prefilled. format is accepted and
-      ignored: this runner cannot constrain decoding (capabilities.structured is
-      empty). Tool calls stay in the text for the client to parse
-      (capabilities.parses_tool_calls is false).
+      conversation so only the new suffix is prefilled (see _Conversation for
+      how that survives sliding-window layers and an exact repeat). format is
+      accepted and ignored: this runner cannot constrain decoding
+      (capabilities.structured is empty). Tool calls stay in the text for the
+      client to parse (capabilities.parses_tool_calls is false); finish_reason
+      is "tool_calls" when the text holds a call (as server/src/toolcalls.rs
+      recognises one), "length" when generation stopped at max_tokens, "stop"
+      otherwise. A cancelled stream sends no meta.
   {"type":"chat_stream", ...same...}
       -> token lines, then {"type":"meta",...}, then {"done": true}
   {"type":"count_tokens","model_path":"...","text":"..."} -> {"tokens":N}
@@ -41,7 +45,11 @@ Requests:
          chat_stream); that stream ends with {"done": true, "cancelled": true}.
          Never answered on its own, so a cancel that arrives between requests
          is simply dropped. stdin is read on a thread for exactly this: the
-         main thread is deep in MLX compute while a stream runs.
+         main thread is deep in MLX compute while a stream runs. The prompt is
+         prefilled in chunks sized to take about a quarter of a second, and
+         the cancel is checked between them, so a cancel during a long
+         prefill lands within one chunk. Streams send keepalive lines while
+         a long prefill runs.
 On error: {"error":"message"}
 
 Embedding uses mlx-embeddings, the same API as oneshot-runner.py:
@@ -56,6 +64,7 @@ import math
 import queue
 import re
 import threading
+import time
 
 # Protect the line protocol: any chatter MLX/loaders print must never land on
 # the stdout we use for JSON responses. Redirect the global stdout to stderr and
@@ -75,7 +84,7 @@ _GEN_CACHE = {}
 # Protocol v2 identity. Bump RUNNER_VERSION on any behaviour change a client
 # could care about; PROTOCOL is the dialect number from the engine's proto crate.
 RUNNER_NAME = "mlx-python"
-RUNNER_VERSION = "2.2.0"
+RUNNER_VERSION = "2.3.0"
 PROTOCOL = 2
 CAPABILITIES = {
     "generate": True,
@@ -95,17 +104,36 @@ CAPABILITIES = {
     "backend": "mlx-python",
 }
 
-# Prompt (KV) caches by (model_path, cache_key). mlx-vlm's PromptCacheState
-# remembers the token ids the cache covers, finds the common prefix with the
-# next prompt, trims and reuses — so a conversation that grows turn by turn
-# only prefills its new suffix. Bounded: each entry is real memory.
+# Prompt (KV) caches by (model_path, cache_key): one _Conversation each. The
+# runner finds the common prefix with the next prompt, trims or restores, and
+# prefills only the new suffix. Bounded: each entry is real memory.
 _PROMPT_CACHES = collections.OrderedDict()
 _PROMPT_CACHE_MAX = 8
 
-# Set by the stdin reader thread when a {"type":"cancel"} arrives; checked by
-# the streaming decode loop between chunks; cleared when the next request
-# starts, so a late cancel never leaks into the following generation.
+# Set by the stdin reader thread when a {"type":"cancel"} arrives; checked
+# between prefill chunks and by the streaming decode loop between tokens;
+# cleared when the next request starts, so a late cancel never leaks into the
+# following generation.
 _CANCEL = threading.Event()
+
+# Prefill runs in chunks so a cancel can land between them. A chunk is sized
+# to take about _PREFILL_TARGET_S on the model at hand (measured chunk by
+# chunk, remembered per model): 0.25 s keeps a cancel well inside half a
+# second. Sizes are multiples of 32: on the 4-bit 12B (M1 Pro, 2026-09-27) a
+# 48- or 80-token chunk prefilled at 64-75 tok/s against 85-93 for 32, 64,
+# 96 or 128, and 16 halved it. 32 is the floor (the 12B lands there, about
+# 0.35 s a chunk, some 5-8% slower than 2048-token chunks; E2B loses
+# nothing), 2048 the ceiling (mlx-vlm's own step). A model's first chunk is
+# the floor, so even the first request on the 12B cancels inside half a
+# second; the size grows from the next chunk on.
+_PREFILL_TARGET_S = 0.25
+_PREFILL_ALIGN = 32
+_PREFILL_MIN = 32
+_PREFILL_MAX = 2048
+_PREFILL_FIRST = 32
+_PREFILL_STEP = {}
+# A stream sends a keepalive at least this often while it prefills.
+_PREFILL_KEEPALIVE_S = 2.0
 
 # Resolve the embeddings API once (same fallback chain as oneshot-runner.py).
 try:
@@ -308,19 +336,334 @@ def _stream_generate_fn():
             return None
 
 
-def _cache_state(model_path, cache_key):
+class _Cancelled(Exception):
+    """A cancel arrived while the prompt was being prefilled."""
+
+
+class _Conversation:
+    """One conversation's KV cache, the token ids it holds, and a snapshot.
+
+    Invariant: every layer cache in `cache` holds exactly `ids` (their common
+    offset is len(ids)). Kept up to date after every generation, including a
+    cancelled one, so a retry reuses whatever was already prefilled.
+
+    Why not mlx-vlm's PromptCacheState: it can only trim a cache back to the
+    shared prefix while every layer still holds the whole sequence, and
+    Gemma 4's sliding-window layers (RotatingKVCache, 512 tokens on E2B/E4B,
+    1024 on the 12B) stop doing so once the conversation passes the window.
+    A chat's next prompt rarely extends the cached tokens exactly: the 12B's
+    generation prompt ends in an empty thought channel that the chat template
+    drops from history, so turn 2 diverges a few tokens before turn 1's prompt
+    ended. Past the window that meant no reuse at all (0 cached tokens on the
+    12B once a conversation passed ~1K tokens). It also refuses a prefix as
+    long as the whole prompt, so an exact repeat got 0 cached tokens.
+
+    So the runner keeps the ids itself and takes a snapshot of the
+    sliding-window layers at the end of the conversation's history (the
+    prompt without its generation prompt): the point every later turn, and a
+    regenerate, shares. Full-attention layers are trimmed back to it; the
+    sliding ones are put back from the snapshot. A snapshot holds at most one
+    window per sliding layer (about 330 MB on the 12B, a few MB on E2B).
+    `snap` is (token ids it covers, per-layer states) or None.
+    """
+
+    __slots__ = ("cache", "ids", "snap")
+
+    def __init__(self):
+        self.cache = None
+        self.ids = []
+        self.snap = None
+
+    def reset(self):
+        self.cache = None
+        self.ids = []
+
+
+def _conversation(model_path, cache_key):
     if not cache_key:
         return None
-    try:
-        from mlx_vlm.generate.common import PromptCacheState
-    except Exception:  # noqa: BLE001
-        return None
     key = (model_path, str(cache_key))
-    state = _PROMPT_CACHES.pop(key, None) or PromptCacheState()
-    _PROMPT_CACHES[key] = state
+    conv = _PROMPT_CACHES.pop(key, None) or _Conversation()
+    _PROMPT_CACHES[key] = conv
     while len(_PROMPT_CACHES) > _PROMPT_CACHE_MAX:
         _PROMPT_CACHES.popitem(last=False)
-    return state
+    return conv
+
+
+def _rotating_cls():
+    try:
+        from mlx_vlm.models.cache import RotatingKVCache
+        return RotatingKVCache
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cache_len(cache):
+    """The number of tokens every layer holds, or None when they disagree."""
+    offsets = {int(getattr(c, "offset", -1)) for c in cache}
+    if len(offsets) != 1:
+        return None
+    n = offsets.pop()
+    return n if n >= 0 else None
+
+
+def _trimmable(cache, n):
+    """Can every layer drop its last n tokens and still be exact?"""
+    if n == 0:
+        return True
+    for c in cache:
+        # RotatingKVCache answers False once it has wrapped; KVCache always True.
+        if not getattr(c, "is_trimmable", lambda: False)():
+            return False
+        if int(getattr(c, "start_position", 0) or 0) != 0:
+            return False
+    return True
+
+
+def _snapshot(cache):
+    """Per-layer state to rebuild `cache` at its current length, or None.
+
+    Sliding-window layers keep their last window (the only part attention at
+    later positions can see), as fresh array objects: MLX copies a buffer on
+    write when another array still refers to it, so later in-place updates of
+    the live cache never reach the snapshot. Full-attention layers need
+    nothing: they are trimmed back on restore."""
+    Rot = _rotating_cls()
+    states = []
+    rotating = False
+    for c in cache:
+        if Rot is not None and isinstance(c, Rot):
+            rotating = True
+            if c.keys is None:
+                states.append((None, None, int(c.offset), int(c._idx)))
+                continue
+            k, v, idx = c.keys, c.values, int(c._idx)
+            if c.keep == 0 and idx == k.shape[2] and k.shape[2] > c.max_size:
+                # Temporal order (a chunked prefill leaves it so): keep the
+                # last max_size tokens, a full ring with its write index at
+                # the end, exactly what an in-place update expects.
+                k, v, idx = k[..., -c.max_size:, :], v[..., -c.max_size:, :], c.max_size
+            else:
+                k, v = k[...], v[...]
+            states.append((k, v, int(c.offset), idx))
+        elif getattr(c, "is_trimmable", lambda: False)() and hasattr(c, "trim"):
+            states.append(None)
+        else:
+            return None
+    return states if rotating else None
+
+
+def _restore(cache, n, states):
+    for c, s in zip(cache, states):
+        if s is None:
+            c.trim(int(c.offset) - n)
+        else:
+            k, v, off, idx = s
+            c.keys = None if k is None else k[...]
+            c.values = None if v is None else v[...]
+            c.offset = off
+            c._idx = idx
+
+
+def _reuse(conv, ids, limit):
+    """Bring conv.cache back to the longest prefix of `ids` it can serve, up
+    to `limit` tokens (the start of the prompt's tail, always < len(ids), so
+    an exact repeat reuses everything before its tail).
+
+    Returns that length (0 = start cold)."""
+    cache = conv.cache
+    if cache is None:
+        return 0
+    held = _cache_len(cache)
+    if held is None or held != len(conv.ids):
+        conv.reset()
+        return 0
+    p = 0
+    for a, b in zip(conv.ids, ids[:limit]):
+        if a != b:
+            break
+        p += 1
+    if p > 0 and _trimmable(cache, held - p):
+        if held - p:
+            for c in cache:
+                c.trim(held - p)
+        return p
+    if conv.snap is not None:
+        snap_ids, states = conv.snap
+        n = len(snap_ids)
+        # The full-attention layers must hold the snapshot's tokens too, which
+        # they do when the cached ids share them (p >= n).
+        if 0 < n <= p and ids[:n] == snap_ids and len(states) == len(cache):
+            _restore(cache, n, states)
+            return n
+    return 0
+
+
+def _settle(conv, cache, seq):
+    """Record what `cache` holds after a generation, finished or not."""
+    held = _cache_len(cache)
+    if held is None or held > len(seq):
+        conv.reset()
+        return
+    conv.cache = cache
+    conv.ids = list(seq[:held])
+
+
+def _encode(model, processor, prompt):
+    """Token ids exactly as mlx-vlm's stream_generate would compute them."""
+    from mlx_vlm.generate import dispatch as D
+    add = D.should_add_special_tokens(model.config.model_type, processor)
+    inputs = D.prepare_inputs(
+        processor, prompts=prompt, add_special_tokens=add,
+        image_token_index=getattr(model.config, "image_token_index", None))
+    return inputs["input_ids"].flatten().tolist()
+
+
+def _prefill(model, model_path, cache, ids, start, stop, snap_at=None, on_snapshot=None):
+    """Feed ids[start:stop] into `cache` in chunks, checking for a cancel
+    between them (raises _Cancelled). The same calls mlx-vlm's own chunked
+    prefill makes (generate_step): embeddings, the language model over the
+    chunk with the cache, then evaluate only the caches — which also skips
+    the KV-shared layers of E2B/E4B, whose outputs no cache needs. A chunk
+    boundary falls on `snap_at`, where `on_snapshot` is called."""
+    import mlx.core as mx
+    from mlx_vlm.generate import generation_stream, wired_limit
+
+    lm = model.language_model
+    extra_kw = {"logits_to_keep": 1} if getattr(lm, "supports_logits_to_keep", False) else {}
+    step = _PREFILL_STEP.get(model_path, _PREFILL_FIRST)
+    pos = start
+    last_line = time.monotonic()
+    with wired_limit(model, [generation_stream]):
+        while pos < stop:
+            if _CANCEL.is_set():
+                raise _Cancelled()
+            end = min(stop, pos + step)
+            if snap_at is not None and pos < snap_at < end:
+                end = snap_at
+            chunk = mx.array([ids[pos:end]])
+            started = time.perf_counter()
+            with mx.stream(generation_stream):
+                emb = model.get_input_embeddings(chunk, None, mask=None)
+                kw = {k: v for k, v in emb.to_dict().items() if k != "inputs_embeds" and v is not None}
+                kw.update(extra_kw)
+                lm(inputs=chunk, inputs_embeds=emb.inputs_embeds, cache=cache, n_to_process=end - pos, **kw)
+                mx.eval([c.state for c in cache])
+            took = time.perf_counter() - started
+            done = end - pos
+            pos = end
+            if pos == snap_at and on_snapshot is not None:
+                on_snapshot(pos)
+            if done == step and took > 0:
+                # Resize from full chunks only: a short one (cut at the
+                # snapshot point or the end) says little about the rate.
+                step = int(done * _PREFILL_TARGET_S / took) // _PREFILL_ALIGN * _PREFILL_ALIGN
+                step = max(_PREFILL_MIN, min(_PREFILL_MAX, step))
+            mx.clear_cache()
+            if time.monotonic() - last_line >= _PREFILL_KEEPALIVE_S:
+                emit({"type": "keepalive"})
+                last_line = time.monotonic()
+    _PREFILL_STEP[model_path] = step
+
+
+def _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv=None, history=None):
+    """Yield mlx-vlm GenerationResults for `prompt`, with prefix reuse from
+    `conv` and an interruptible prefill. Fills `info` with prompt_tokens and
+    cached_tokens (the whole prompt and its reused part). `history` is the
+    prompt without its generation prompt: where the conversation's snapshot
+    is taken. Raises _Cancelled for a cancel during prefill. Close the
+    generator when stopping early: that records what the cache holds."""
+    import mlx.core as mx
+    from mlx_vlm.models import cache as cache_mod
+
+    stream_fn = _stream_generate_fn()
+    if stream_fn is None:
+        raise RuntimeError("no streaming API in this mlx-vlm")
+    try:
+        ids = _encode(model, processor, prompt)
+        if not ids:
+            raise ValueError("empty prompt")
+    except Exception as exc:  # noqa: BLE001
+        # Tokenising our own way failed: hand the whole prompt to mlx-vlm as
+        # before (no reuse, prefill not interruptible).
+        print(f"estia-runner: own prefill unavailable ({exc}); plain stream", file=sys.stderr, flush=True)
+        if conv is not None:
+            conv.reset()
+        yield from stream_fn(model, processor, prompt, image=None, max_tokens=max_tokens, temperature=temperature)
+        return
+    info["prompt_tokens"] = len(ids)
+
+    # The tail: the part of the prompt the final call feeds, which decodes
+    # from it. For a chat it is the generation prompt (everything after the
+    # history), otherwise the last token. It starts at a point fixed by the
+    # prompt alone, where the conversation also keeps its snapshot, so a
+    # regenerate rebuilds exactly the cache its first run had there and
+    # feeds the same tail: at temperature 0 it reproduces the first answer.
+    tail = len(ids) - 1
+    if history:
+        try:
+            hist_ids = _encode(model, processor, history)
+            if 0 < len(hist_ids) < len(ids) and ids[:len(hist_ids)] == hist_ids:
+                tail = len(hist_ids)
+        except Exception:  # noqa: BLE001
+            pass
+
+    reuse = _reuse(conv, ids, tail) if conv is not None else 0
+    cache = conv.cache if (conv is not None and reuse) else None
+    if cache is None:
+        reuse = 0
+        if conv is not None:
+            # Nothing to reuse: free the old cache and snapshot before
+            # building the new one, rather than holding both.
+            conv.reset()
+            conv.snap = None
+        cache = cache_mod.make_prompt_cache(model.language_model)
+    info["cached_tokens"] = reuse
+    snap_at = tail if (conv is not None and reuse < tail) else None
+
+    def take_snapshot(n):
+        states = _snapshot(cache)
+        if states is not None:
+            conv.snap = (list(ids[:n]), states)
+
+    generated = []
+    stream = None
+    try:
+        try:
+            _prefill(model, model_path, cache, ids, reuse, tail, snap_at,
+                     take_snapshot if snap_at is not None else None)
+        except _Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # This model does not take the chunked calls: prefill the whole
+            # prompt through mlx-vlm on a fresh cache, as before.
+            print(f"estia-runner: chunked prefill failed ({exc}); plain stream", file=sys.stderr, flush=True)
+            if conv is not None:
+                conv.reset()
+                conv.snap = None
+            conv = None
+            info["cached_tokens"] = 0
+            yield from stream_fn(model, processor, prompt, image=None, max_tokens=max_tokens, temperature=temperature)
+            return
+        if _CANCEL.is_set():
+            raise _Cancelled()
+        stream = stream_fn(model, processor, prompt, image=None, input_ids=mx.array([ids[tail:]]),
+                           prompt_cache=cache, max_tokens=max_tokens, temperature=temperature)
+        for r in stream:
+            # Every token handed out has already been fed to the model (mlx-vlm
+            # computes the next step before yielding), and so has a stop
+            # token, which only the final result carries. A "length" final
+            # result repeats the last token.
+            reason = getattr(r, "finish_reason", None)
+            token = getattr(r, "token", None)
+            if token is not None and (reason is None or reason == "stop"):
+                generated.append(int(token))
+            yield r
+    finally:
+        if stream is not None:
+            stream.close()
+        if conv is not None:
+            _settle(conv, cache, ids + generated)
 
 
 def _tokenizer_of(processor):
@@ -381,9 +724,12 @@ def _call_names(messages):
 def _render_messages(processor, messages, tools):
     """Render an OpenAI-style message list with the model's own chat template.
 
-    Returns (prompt, native): native=True when the tokenizer template did the
-    work (and declared tools in the model's own format); False for the manual
-    Gemma-turn fallback used when a bundle has no usable template.
+    Returns (prompt, native, history): native=True when the tokenizer template
+    did the work (and declared tools in the model's own format); False for the
+    manual Gemma-turn fallback used when a bundle has no usable template.
+    history is the same messages without the generation prompt (None when it
+    cannot be rendered): the prefix every later turn of the conversation
+    shares, where the prompt cache takes its snapshot.
     """
     tok = _tokenizer_of(processor)
     messages = _template_messages(messages)
@@ -393,7 +739,13 @@ def _render_messages(processor, messages, tools):
     try:
         rendered = tok.apply_chat_template(messages, **kwargs)
         if isinstance(rendered, str) and rendered.strip():
-            return rendered, True
+            try:
+                history = tok.apply_chat_template(messages, **{**kwargs, "add_generation_prompt": False})
+                if not isinstance(history, str):
+                    history = None
+            except Exception:  # noqa: BLE001
+                history = None
+            return rendered, True, history
     except Exception:  # noqa: BLE001
         pass
     parts = []
@@ -426,30 +778,55 @@ def _render_messages(processor, messages, tools):
         parts.append(f"<|turn>{role}\n{content}<turn|>\n")
     if system:
         parts.insert(0, f"<|turn>user\n{system}<turn|>\n")
-    return "".join(parts) + "<|turn>model\n", False
+    history = "".join(parts)
+    return history + "<|turn>model\n", False, history
 
 
-def _stream_core(model, processor, prompt, raw_prompt, max_tokens, temperature, cache_state):
+# A tool call in the raw model text, as server/src/toolcalls.rs recognises
+# one: Gemma 4's native `<|tool_call>call:name{…}<tool_call|>` (like the
+# server, a missing closing marker still counts), or the manual fallback's
+# `{"tool_call": {"name": …, "arguments": {…}}}`.
+_NATIVE_CALL = re.compile(r"<\|tool_call\>\s*call:\s*[^\s{<]")
+_MANUAL_CALL = re.compile(r"\{\s*\"tool_call\"\s*:")
+
+
+def _has_tool_call(text):
+    if not text:
+        return False
+    if _NATIVE_CALL.search(text):
+        return True
+    decoder = json.JSONDecoder()
+    for m in _MANUAL_CALL.finditer(text):
+        try:
+            obj, _ = decoder.raw_decode(text, m.start())
+        except ValueError:
+            continue
+        call = obj.get("tool_call") if isinstance(obj, dict) else None
+        if isinstance(call, dict) and call.get("name"):
+            return True
+    return False
+
+
+def _finish_reason(last, raw_text):
+    """OpenAI's finish_reason for a finished generation: "tool_calls" when the
+    raw text holds a call, "length" when decoding stopped at max_tokens,
+    otherwise "stop" (a stop token)."""
+    if _has_tool_call(raw_text):
+        return "tool_calls"
+    return "length" if getattr(last, "finish_reason", None) == "length" else "stop"
+
+
+def _stream_core(model, model_path, processor, prompt, raw_prompt, max_tokens, temperature, conv, history=None):
     """Stream a rendered prompt. Emits token lines and returns (any_emitted,
     cancelled, meta, error). Anti-leak strategy: re-clean the WHOLE accumulated
     buffer each step and emit only the newly revealed cleaned suffix, holding
     back a 24-char tail so a channel marker forming at the end cannot leak.
     Keepalives keep the caller's silence deadline alive while tokens are
-    filtered or the prompt is being prefilled.
+    filtered or the prompt is being prefilled. `conv` is the conversation's
+    prompt cache (or None); see _generate.
     """
-    stream_fn = _stream_generate_fn()
-    if stream_fn is None:
+    if _stream_generate_fn() is None:
         return False, False, None, "no streaming API in this mlx-vlm"
-
-    def open_stream():
-        kwargs = {"max_tokens": max_tokens, "temperature": temperature}
-        if cache_state is not None:
-            kwargs["prompt_cache_state"] = cache_state
-        try:
-            return stream_fn(model, processor, prompt, image=None, **kwargs)
-        except TypeError:
-            kwargs.pop("prompt_cache_state", None)
-            return stream_fn(model, processor, prompt, max_tokens=max_tokens, temperature=temperature)
 
     holdback = 24
     raw_accum = ""
@@ -458,8 +835,10 @@ def _stream_core(model, processor, prompt, raw_prompt, max_tokens, temperature, 
     quiet_chunks = 0
     cancelled = False
     last = None
+    info = {}
+    gen = _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv, history)
     try:
-        for chunk in open_stream():
+        for chunk in gen:
             if _CANCEL.is_set():
                 cancelled = True
                 break
@@ -484,8 +863,13 @@ def _stream_core(model, processor, prompt, raw_prompt, max_tokens, temperature, 
                 quiet_chunks += 1
                 if quiet_chunks % 25 == 0:
                     emit({"type": "keepalive"})
+    except _Cancelled:
+        return any_emitted, True, None, None
     except Exception as exc:  # noqa: BLE001
         return any_emitted, _CANCEL.is_set(), None, f"stream failed: {exc}"
+    finally:
+        # Records what the prompt cache holds, also after a cancel.
+        gen.close()
 
     final_cleaned = _clean_gen(raw_accum, raw_prompt)
     if not _looks_bad(final_cleaned):
@@ -496,15 +880,18 @@ def _stream_core(model, processor, prompt, raw_prompt, max_tokens, temperature, 
             any_emitted = True
     meta = None
     if last is not None and not isinstance(last, str):
+        prompt_tokens = info.get("prompt_tokens")
         meta = {
-            "prompt_tokens": getattr(last, "prompt_tokens", None),
-            "cached_tokens": getattr(last, "cached_tokens", None),
+            "prompt_tokens": prompt_tokens if prompt_tokens is not None else getattr(last, "prompt_tokens", None),
+            "cached_tokens": info.get("cached_tokens", getattr(last, "cached_tokens", None)),
             "generation_tokens": getattr(last, "generation_tokens", None),
         }
         # mlx-vlm's GenerationResult carries the decode rate it measured.
         tps = getattr(last, "generation_tps", None)
         if isinstance(tps, (int, float)) and not isinstance(tps, bool) and math.isfinite(tps) and tps > 0:
             meta["generation_tps"] = float(tps)
+        if not cancelled:
+            meta["finish_reason"] = _finish_reason(last, raw_accum)
     return any_emitted, cancelled, meta, None
 
 
@@ -518,24 +905,27 @@ _OPEN_TOOL_TURN = "<tool_response|>"
 _REOPEN_MODEL_TURN = "<turn|>\n<|turn>model\n"
 
 
-def _chat_core(model, processor, prompt, native, max_tokens, temperature, state):
+def _chat_core(model, model_path, processor, prompt, native, history, max_tokens, temperature, conv):
     """_stream_core, asked once more in a new model turn when the answer after
     a tool result came back empty."""
-    result = _stream_core(model, processor, prompt, "", max_tokens, temperature, state)
+    result = _stream_core(model, model_path, processor, prompt, "", max_tokens, temperature, conv, history)
     any_emitted, cancelled, _meta, error = result
     if native and not (any_emitted or cancelled or error) and prompt.rstrip().endswith(_OPEN_TOOL_TURN):
         print("estia-runner: empty answer after a tool result; asking again in a new model turn", file=sys.stderr, flush=True)
-        result = _stream_core(model, processor, prompt + _REOPEN_MODEL_TURN, "", max_tokens, temperature, state)
+        result = _stream_core(model, model_path, processor, prompt + _REOPEN_MODEL_TURN, "", max_tokens,
+                              temperature, conv, history)
     return result
 
 
 def chat_stream_lines(req):
-    model, processor = load_gen(req["model_path"])
-    prompt, native = _render_messages(processor, req.get("messages") or [], req.get("tools"))
+    model_path = req["model_path"]
+    model, processor = load_gen(model_path)
+    prompt, native, history = _render_messages(processor, req.get("messages") or [], req.get("tools"))
     max_tokens = int(req.get("max_tokens") or 256)
     temperature = float(req.get("temperature") or 0.0)
-    state = _cache_state(req["model_path"], req.get("cache_key"))
-    any_emitted, cancelled, meta, error = _chat_core(model, processor, prompt, native, max_tokens, temperature, state)
+    conv = _conversation(model_path, req.get("cache_key"))
+    any_emitted, cancelled, meta, error = _chat_core(
+        model, model_path, processor, prompt, native, history, max_tokens, temperature, conv)
     if cancelled:
         emit({"done": True, "cancelled": True})
         return
@@ -566,12 +956,13 @@ def chat_text(req):
 
     globals()["emit"] = capture
     try:
-        model, processor = load_gen(req["model_path"])
-        prompt, native = _render_messages(processor, req.get("messages") or [], req.get("tools"))
-        state = _cache_state(req["model_path"], req.get("cache_key"))
+        model_path = req["model_path"]
+        model, processor = load_gen(model_path)
+        prompt, native, history = _render_messages(processor, req.get("messages") or [], req.get("tools"))
+        conv = _conversation(model_path, req.get("cache_key"))
         any_emitted, cancelled, meta, error = _chat_core(
-            model, processor, prompt, native, int(req.get("max_tokens") or 256),
-            float(req.get("temperature") or 0.0), state)
+            model, model_path, processor, prompt, native, history, int(req.get("max_tokens") or 256),
+            float(req.get("temperature") or 0.0), conv)
     finally:
         globals()["emit"] = real_emit
     if error and not collected:
@@ -626,15 +1017,9 @@ def generate_stream_lines(req):
     if not prompt:
         prompt = raw_prompt
 
-    def open_stream():
-        # Signature has drifted across mlx-vlm releases — modern keyword form
-        # first, then the leaner one.
-        try:
-            return stream_fn(model, processor, prompt, image=None,
-                             max_tokens=max_tokens, temperature=temperature)
-        except TypeError:
-            return stream_fn(model, processor, prompt,
-                             max_tokens=max_tokens, temperature=temperature)
+    # No cache_key here: a fresh cache each time, but the prefill still runs in
+    # cancellable chunks (see _generate).
+    gen = _generate(model, req["model_path"], processor, prompt, max_tokens, temperature, {})
 
     # Hold back the last few chars while streaming: a channel marker forming at
     # the buffer tail ("…<|chan") isn't strippable until complete, and emitting
@@ -662,7 +1047,7 @@ def generate_stream_lines(req):
     quiet_chunks = 0
     cancelled = False
     try:
-        for chunk in open_stream():
+        for chunk in gen:
             if _CANCEL.is_set():
                 # Leaving the loop stops the lazy decode; the tail below is
                 # flushed so nothing already decoded is lost.
@@ -688,6 +1073,10 @@ def generate_stream_lines(req):
                 quiet_chunks += 1
                 if quiet_chunks % 25 == 0:
                     emit({"type": "keepalive"})
+    except _Cancelled:
+        # A cancel during prefill: nothing was decoded, so nothing to flush.
+        emit({"done": True, "cancelled": True})
+        return
     except Exception as exc:  # noqa: BLE001
         if not any_emitted:
             # Nothing shown yet → safe to fall back without duplicating output.
@@ -699,6 +1088,8 @@ def generate_stream_lines(req):
             return
         emit({"error": f"stream failed mid-output: {exc}"})
         return
+    finally:
+        gen.close()
 
     # Flush the held-back tail from the final cleaned text.
     final_cleaned = _clean_gen(raw_accum, raw_prompt)
@@ -736,7 +1127,11 @@ def _unload(path):
         if path in cache:
             del cache[path]
             dropped = True
-    if dropped:
+    # The model's conversation KV caches go with it: they are GPU memory too.
+    convs = [k for k in _PROMPT_CACHES if k[0] == path]
+    for key in convs:
+        del _PROMPT_CACHES[key]
+    if dropped or convs:
         import gc
         gc.collect()
         try:

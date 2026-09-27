@@ -27,10 +27,10 @@ until `unload` or until the process exits. A failed request answers
 
 | Request | Answer |
 |---|---|
-| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.2.0","protocol":2,"capabilities":{…}}` |
+| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.3.0","protocol":2,"capabilities":{…}}` |
 | `{"type":"load","model_path":…,"kind":"generation"\|"embedding"}` | `{"ok":true,"loaded":true,"ms":N}` |
 | `{"type":"unload","model_path":…}` | `{"ok":true,"unloaded":true\|false}` |
-| `{"type":"chat","model_path":…,"messages":[…],"tools":[…],"cache_key":…,"format":…,"max_tokens":…,"temperature":…}` | `{"text":"…","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,"template":…}}` |
+| `{"type":"chat","model_path":…,"messages":[…],"tools":[…],"cache_key":…,"format":…,"max_tokens":…,"temperature":…}` | `{"text":"…","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,"template":…,"generation_tps":…,"finish_reason":…}}` |
 | `{"type":"chat_stream", …same fields…}` | token lines, then `{"type":"meta",…}`, then `{"done":true}` |
 | `{"type":"cancel"}` | no answer of its own; the stream in flight ends with `{"done":true,"cancelled":true}` |
 | `{"type":"count_tokens","model_path":…,"text":…}` | `{"tokens":N}` |
@@ -39,7 +39,8 @@ until `unload` or until the process exits. A failed request answers
 (system, user, assistant, tool) and are rendered with the model's own chat
 template; an assistant message's `tool_calls` are structured, so the template
 renders the `tool` results that answer them. `cache_key` keeps the KV cache for one conversation, so the next
-turn only prefills the new suffix.
+turn only prefills the new suffix. `meta.finish_reason` is `length` when
+`max_tokens` ran out, `tool_calls` when the text holds a call, else `stop`.
 
 The v1 requests still work: `ping`, `generate`, `generate_stream`, `embed`
 and `embed_batch`. The docstring at the top of `estia-runner.py` lists every
@@ -47,8 +48,11 @@ request and answer.
 
 Stream lines are `{"type":"token","text":"…"}`, `{"type":"keepalive"}` and
 `{"type":"meta",…}`, and the stream ends with `{"done":true}`. A keepalive
-carries nothing. The runner sends it while output is being filtered, so the
-engine's per-line silence deadline does not kill a healthy process.
+carries nothing. The runner sends it while output is being filtered and at
+least every 2 s while a long prompt is prefilled, so the engine's per-line
+silence deadline does not kill a healthy process. The prompt is prefilled in
+chunks of about a quarter of a second each, so a cancel lands between chunks
+as well as between tokens.
 
 The engine sends `hello` once after it starts the process. A runner that
 answers `hello` with an error is treated as protocol v1 with no capabilities.

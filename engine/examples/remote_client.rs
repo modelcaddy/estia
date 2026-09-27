@@ -7,9 +7,11 @@
 //!   - cancelling a stream with a `CancelToken`
 //!   - `GenHandle` / `EmbedHandle`: code that holds a handle works the same
 //!     whether the model runs in this process or on another machine
-//!   - embeddings: `RemoteEngine` sends inputs as given (`task: none`), so the
-//!     client adds the model's prefix, and every call asks the server to
-//!     refuse a different fingerprint
+//!   - embeddings by role (`embed`), on either backend: the first response
+//!     reports the fingerprint (`<artifact>@<backend>`), which names the
+//!     model and so its task prefixes, and every later call asks the server
+//!     to refuse a different fingerprint. `RemoteEngine` sends inputs as given
+//!     (`task: none`), so the client adds the prefix.
 //!
 //! Scopes: generate, embed
 //!
@@ -21,7 +23,7 @@
 //! `RemoteEngine` uses the native `/engine/*` routes and blocking HTTP. Call it
 //! from a thread or `spawn_blocking`, not from inside an async task.
 
-use estia_engine::models::embed::{EmbedTask, BACKEND_MLX_PYTHON, EMBEDDING_GEMMA_300M_4BIT};
+use estia_engine::models::embed::{find_embed_model, EmbedTask};
 use estia_engine::proto::Message;
 use estia_engine::{CancelToken, EmbedHandle, GenHandle, Priority, RemoteEmbed, RemoteEngine, RemoteGen, SessionError};
 use std::io::Write;
@@ -129,19 +131,34 @@ fn run(url: &str) -> Result<()> {
     let text = gen.generate_with("Complete in three words: The capital of Greece is", Some(12), Some(0.0), Priority::Interactive)?;
     println!("\nraw prompt → {:?}", text.trim());
 
-    // 4. Embeddings. The fingerprint is model@backend. In an app, store it with
-    //    the index and pass the stored value here, so a server that changed
-    //    its model or backend refuses instead of returning vectors that do not
-    //    compare.
-    let spec = EMBEDDING_GEMMA_300M_4BIT;
-    let emb = EmbedHandle::Remote(RemoteEmbed::new(Arc::clone(&engine), spec.id, spec.fingerprint_for(BACKEND_MLX_PYTHON)));
+    // 4. Embeddings, by role like the chat: the operator decides which model
+    //    answers `embed`, and the engine's backend which artifact of it runs.
+    //    The fingerprint, `<artifact id>@<backend>`, names the vector space:
+    //    `embeddinggemma-300m-4bit@mlx-python` on MLX,
+    //    `embeddinggemma-300m-q8_0-gguf@llama-cpp` on llama.cpp. Vectors from
+    //    two fingerprints do not compare.
+    //
+    //    A new index learns the fingerprint from the engine's first response,
+    //    as here. An app stores it with the vectors and passes the stored
+    //    value from then on, so a server that changed its model or backend
+    //    answers 422 instead of returning vectors that do not compare.
+    let (_, fingerprint) = engine.embed_batch("embed", &["which model answers embed?".to_string()], None, Priority::Background)?;
+    // RemoteEngine sends `task: none`, so the prefix is the caller's job, and
+    // it depends on the model. The fingerprint names the model. A model
+    // imported on the engine is not known here: ask its operator for its
+    // prefixes, if it has any.
+    let spec = find_embed_model(&fingerprint);
+    if spec.is_none() {
+        println!("\n{fingerprint} is not a built-in model; embedding without task prefixes");
+    }
+    let prefix = |task: EmbedTask| spec.map(|s| s.prefix(task)).unwrap_or("");
+    let emb = EmbedHandle::Remote(RemoteEmbed::new(Arc::clone(&engine), "embed", fingerprint));
     let passages =
         ["The spare key is in the blue tin in the garage.", "Water the lemon tree twice a week.", "The router is in the hallway cupboard."];
-    // RemoteEngine sends `task: none`: the prefix is the caller's job.
-    let docs: Vec<String> = passages.iter().map(|p| format!("{}{p}", spec.prefix(EmbedTask::Document))).collect();
+    let docs: Vec<String> = passages.iter().map(|p| format!("{}{p}", prefix(EmbedTask::Document))).collect();
     let vectors = emb.embed_batch_with(&docs, Priority::Background)?;
     let question = "where did I put the key?";
-    let q = emb.embed(&format!("{}{question}", spec.prefix(EmbedTask::Query)))?;
+    let q = emb.embed(&format!("{}{question}", prefix(EmbedTask::Query)))?;
     println!("\n{} vectors of {} dims, fingerprint {}", vectors.len(), q.len(), emb.fingerprint());
     let mut ranked: Vec<(f32, &str)> = vectors.iter().zip(passages).map(|(v, p)| (cosine(&q, v), p)).collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -156,7 +173,9 @@ fn run(url: &str) -> Result<()> {
 fn pair(engine: &RemoteEngine, name: &str) -> Result<String> {
     let id = engine.pair_request(name, &["generate", "embed"])?;
     println!("pairing id {id}. Approve it on the engine's machine:\n  estia pair approve {id}");
-    let deadline = Instant::now() + Duration::from_secs(300);
+    // The engine drops an undecided request 300 s after it arrived. Stop
+    // polling a little before that, so the last answer is not a 404.
+    let deadline = Instant::now() + Duration::from_secs(290);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(2));
         match engine.pair_poll(&id)? {
@@ -171,7 +190,7 @@ fn pair(engine: &RemoteEngine, name: &str) -> Result<String> {
             _ => {}
         }
     }
-    Err(SessionError::Runner("no decision within 5 minutes; the request has expired".into()))
+    Err(SessionError::Runner("no decision in time: the request expires 5 minutes after it was made. Pair again.".into()))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

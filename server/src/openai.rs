@@ -143,8 +143,10 @@ fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// `chatcmpl-` and 24 random hex digits: unique across responses, engines
+/// and restarts (clients and proxies key logs and caches on it).
 fn completion_id() -> String {
-    format!("chatcmpl-{}-{}", std::process::id(), now_unix())
+    crate::unique_id("chatcmpl-")
 }
 
 /// Everything a finished completion needs to be rendered, streamed or not.
@@ -155,15 +157,26 @@ struct Finished {
     runner_parsed: bool,
     structured: Option<Structured>,
     meta: estia_engine::proto::GenerationMeta,
+    /// Generation time: the runner calls, retries included, not the load.
     ms: u128,
 }
 
-fn finish_reason(f: &Finished) -> &'static str {
-    if f.tool_calls.is_empty() {
-        "stop"
-    } else {
-        "tool_calls"
+/// Why a generation ended, in OpenAI's words. Parsed tool calls win; then
+/// the runner's own `meta.finish_reason`; a runner that does not say ran out
+/// of budget when it produced `max_tokens` tokens. `None` without meta and
+/// calls (a raw-prompt generation, whose runner call reports no accounting).
+pub(crate) fn finish_reason(has_calls: bool, meta: Option<&estia_engine::proto::GenerationMeta>, max_tokens: u32) -> Option<&'static str> {
+    if has_calls {
+        return Some("tool_calls");
     }
+    let meta = meta?;
+    Some(match meta.finish_reason.as_deref() {
+        Some("length") => "length",
+        // `stop`, or `tool_calls` with no call that parsed.
+        Some(_) => "stop",
+        None if meta.generation_tokens.is_some_and(|n| n >= u64::from(max_tokens)) => "length",
+        None => "stop",
+    })
 }
 
 fn usage(meta: &estia_engine::proto::GenerationMeta) -> Value {
@@ -173,7 +186,10 @@ fn usage(meta: &estia_engine::proto::GenerationMeta) -> Value {
            "prompt_tokens_details": {"cached_tokens": meta.cached_tokens.unwrap_or(0)}})
 }
 
-fn x_estia(artifact: &estia_engine::models::Artifact, f: &Finished, backend: &str) -> Value {
+/// `ms` is generation time; `load_ms` is how long this request waited for the
+/// model to load (null when it was resident already), so the two add up to
+/// the time the engine spent on the request.
+fn x_estia(artifact: &estia_engine::models::Artifact, f: &Finished, backend: &str, load_ms: Option<u64>) -> Value {
     json!({
         "family": artifact.family,
         "backend": backend,
@@ -183,6 +199,7 @@ fn x_estia(artifact: &estia_engine::models::Artifact, f: &Finished, backend: &st
         "repaired": f.structured.as_ref().map(|s| s.repaired),
         "repairs": f.structured.as_ref().map(|s| s.repairs.clone()),
         "ms": f.ms,
+        "load_ms": load_ms,
     })
 }
 
@@ -268,8 +285,9 @@ pub async fn chat_completions(
             })
         })
         .await??;
+        let finish = finish_reason(!finished.tool_calls.is_empty(), Some(&finished.meta), max_tokens).unwrap_or("stop");
         if let Some(a) = &access {
-            a.finish(finish_reason(&finished));
+            a.finish(finish);
         }
 
         // Text next to parsed calls is the call syntax itself, unless the
@@ -288,17 +306,20 @@ pub async fn chat_completions(
             "object": "chat.completion",
             "created": now_unix(),
             "model": artifact.id,
-            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason(&finished)}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
             "usage": usage(&finished.meta),
-            "x_estia": x_estia(artifact, &finished, backend),
+            "x_estia": x_estia(artifact, &finished, backend, load_ms),
         });
         return Ok(Json(body).into_response());
     }
 
     // Streaming. Tokens go over a channel from the blocking generation to the
-    // SSE stream. If the client disconnects, the receiver drops, the next send
-    // fails, and the generation is cancelled in the runner.
+    // SSE stream. If the client disconnects, the receiver drops and the
+    // generation is cancelled in the runner, even mid-prefill, before any
+    // token was sent (see `cancel_on_disconnect`).
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
+    let cancel = CancelToken::new();
+    let watch = crate::cancel_on_disconnect(&tx, cancel.clone());
     let id = completion_id();
     let created = now_unix();
     let model_id = artifact.id.to_string();
@@ -325,9 +346,9 @@ pub async fn chat_completions(
             v
         };
         let send = |v: Value| -> bool { tx.send(Ok(Event::default().data(v.to_string()))).is_ok() };
+        let _watch = watch;
         let _ = send(chunk(json!({"role": "assistant"}), None, None));
 
-        let cancel = CancelToken::new();
         let flip = cancel.clone();
         // Hold the first characters back to decide whether this is a tool
         // call (buffer everything, emit tool_calls at the end) or prose (stream).
@@ -399,7 +420,7 @@ pub async fn chat_completions(
                     a.call_end(Some(&outcome.meta));
                 }
                 let full = outcome.text;
-                let mut finish = "stop";
+                let mut finish = finish_reason(false, Some(&outcome.meta), max_tokens).unwrap_or("stop");
                 let mut final_delta = json!({});
                 // A parsing runner's calls come from its meta line, whether or
                 // not its prose was streamed.
@@ -438,7 +459,7 @@ pub async fn chat_completions(
                 settle(acc, &|a| a.finish(finish));
                 let extra = json!({"usage": usage(&outcome.meta), "x_estia": {
                     "backend": backend, "cached_tokens": outcome.meta.cached_tokens, "template": outcome.meta.template,
-                    "generation_tps": outcome.meta.generation_tps, "ms": ms,
+                    "generation_tps": outcome.meta.generation_tps, "ms": ms, "load_ms": load_ms,
                 }});
                 let _ = send(chunk(final_delta, Some(finish), Some(extra)));
                 let _ = tx.send(Ok(Event::default().data("[DONE]")));
@@ -470,6 +491,48 @@ pub struct EmbeddingsRequest {
     pub expect_fingerprint: Option<String>,
     #[serde(default)]
     pub priority: Option<String>,
+    /// OpenAI's `float` (default) or `base64`. OpenAI's SDKs ask for base64
+    /// unless told otherwise and decode it themselves.
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+}
+
+/// How `/v1/embeddings` writes each vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Encoding {
+    /// A JSON array of numbers.
+    Float,
+    /// The vector's little-endian f32 bytes in standard base64, one string.
+    Base64,
+}
+
+impl Encoding {
+    pub(crate) fn parse(s: Option<&str>) -> Result<Self, ApiError> {
+        match s {
+            None | Some("float") => Ok(Encoding::Float),
+            Some("base64") => Ok(Encoding::Base64),
+            Some(other) => Err(ApiError::bad_request(format!("unsupported encoding_format `{other}` (float|base64)"))),
+        }
+    }
+
+    pub(crate) fn encode(self, v: &[f32]) -> Value {
+        match self {
+            Encoding::Float => json!(v),
+            Encoding::Base64 => Value::String(embedding_base64(v)),
+        }
+    }
+}
+
+/// A vector as `encoding_format: "base64"` carries it: its f32 values as
+/// little-endian bytes, in standard base64 with padding. What OpenAI returns,
+/// and what its SDKs decode (`Float32Array` in JavaScript, `numpy.frombuffer`
+/// with `dtype=float32` in Python).
+pub(crate) fn embedding_base64(v: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for x in v {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    crate::base64_std(&bytes)
 }
 
 /// `None` = the caller already prefixed its inputs (a remote client whose
@@ -518,6 +581,7 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<Embe
     }
     check_embed_inputs(inputs.len())?;
     let task = embed_task(&req.task)?;
+    let encoding = Encoding::parse(req.encoding_format.as_deref())?;
     let fingerprint = state.embed_fingerprint(model)?;
     if let Some(expected) = &req.expect_fingerprint {
         if expected != &fingerprint {
@@ -537,13 +601,14 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<Embe
     if let (Some(a), Some(ms)) = (&access, load_ms) {
         a.loaded(ms);
     }
-    let data: Vec<Value> = vectors.iter().enumerate().map(|(i, v)| json!({"object": "embedding", "index": i, "embedding": v})).collect();
+    let data: Vec<Value> =
+        vectors.iter().enumerate().map(|(i, v)| json!({"object": "embedding", "index": i, "embedding": encoding.encode(v)})).collect();
     Ok(Json(json!({
         "object": "list",
         "data": data,
         "model": model.id,
         "usage": {"prompt_tokens": 0, "total_tokens": 0},
-        "x_estia": {"fingerprint": fingerprint, "dims": model.dims, "task": task_name(task)}
+        "x_estia": {"fingerprint": fingerprint, "dims": model.dims, "task": task_name(task), "load_ms": load_ms}
     }))
     .into_response())
 }
@@ -564,7 +629,7 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
         data.push(json!({"id": a.id, "object": "model", "created": 0, "owned_by": "estia",
             "x_estia": {"family": a.family, "format": a.format.id(), "backend": a.backend().id(), "runnable": a.format == backend.format(),
                         "imported": crate::catalog::is_imported(store, a.id), "installed": store.is_installed(a.id),
-                        "context_length": a.context_length}}));
+                        "context_length": a.context_length, "capabilities": a.capabilities}}));
     }
     for e in estia_engine::models::embed_models() {
         let artifact = e.artifact_for(backend);

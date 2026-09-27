@@ -7,8 +7,9 @@
 //     search with, so the engine adds the embedding model's own prefixes
 //   - the fingerprint in `x_estia`: store it with your vectors and send it
 //     back as `expect_fingerprint`
-//   - `encoding_format: 'float'`: Estia always returns float arrays; saying so
-//     stops the SDK from asking for base64 and trying to decode it
+//   - `encoding_format: 'float'`: plain number arrays on the wire. Without it
+//     the SDK asks for base64 and decodes it, which works on engines that
+//     support base64 but turns an older engine's arrays into wrong numbers
 //
 // Scopes: embed
 //

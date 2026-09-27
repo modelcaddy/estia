@@ -57,7 +57,7 @@ Send `hello` once after spawn.
 ```
 
 ```json
-{"ok": true, "runner": "mlx-python", "version": "2.2.0", "protocol": 2,
+{"ok": true, "runner": "mlx-python", "version": "2.3.0", "protocol": 2,
  "capabilities": {"generate": true, "stream": true, "embed": true, "cancel": true,
                   "load": true, "chat": true, "tools": true, "prompt_cache": true,
                   "count_tokens": true, "structured": [],
@@ -189,6 +189,7 @@ A streaming request (`generate_stream`, `chat_stream`) answers with:
   | `template` | `native` when the model's chat template rendered the messages, `manual` for the runner's fallback rendering. |
   | `tool_calls` | Only from a runner that declares `parses_tool_calls`, and only when the model called tools: the calls, OpenAI-shaped like `Message.tool_calls` above. They come once, here, even in a stream. The `token` lines (or `text`) then carry only what the model wrote outside the calls, often nothing. |
   | `generation_tps` | Decode rate the runner measured, in tokens per second, over generation only (prefill excluded). |
+  | `finish_reason` | Why decoding stopped: `stop` (end of turn), `length` (`max_tokens` ran out) or `tool_calls`. Without it the engine reports `length` when `generation_tokens` reached `max_tokens`, and `stop` otherwise. |
 - The stream ends with `{"done": true}` (one-shot runners: `{"ok": true,
   "done": true}`), or `{"done": true, "cancelled": true}` after a cancel, or an
   error line.
@@ -200,8 +201,12 @@ A streaming request (`generate_stream`, `chat_stream`) answers with:
 While a stream is open the engine may write `{"type":"cancel"}`. A runner that
 honours it stops decoding and ends the stream with
 `{"done": true, "cancelled": true}`. It never answers the cancel line itself.
+A cancel that arrives while the prompt is still being processed (prefill),
+before the first token, counts too: the runner abandons the prompt part-way
+instead of reading it to the end, so the next call does not wait behind it.
 The Python runner reads stdin on a separate thread for this, because the main
-thread is busy in MLX while a stream runs.
+thread is busy in MLX while a stream runs, and checks for a cancel between
+chunks of the prompt as well as between tokens.
 
 A runner that does not understand cancel finishes the generation and then
 answers the cancel line with an error. The engine drains that line so the next
@@ -346,8 +351,8 @@ differences a caller sees:
 - **Meta.** `meta` carries `prompt_tokens` (the whole prompt, cached part
   included), `cached_tokens` and `generation_tokens` as `llama-server`
   reports them, `template: "native"`, `generation_tps`, and
-  `finish_reason` (`stop`, `length` or `tool_calls`), which the engine does
-  not read yet.
+  `finish_reason` (`stop`, `length` or `tool_calls`), which the engine
+  passes on to clients.
 - **Embeddings.** Vectors are L2-normalised. Inputs longer than 512 tokens
   are cut to 512, as the Python runner does. Fingerprints end in
   `@llama-cpp`: vectors do not match the MLX ones for the same model, and the

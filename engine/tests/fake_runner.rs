@@ -277,6 +277,52 @@ fn dead_child_is_respawned_once_and_observer_sees_it() {
     let _ = std::fs::remove_file(&path);
 }
 
+const SLOW_ONE_S: &str = r#"
+            if t == "ping":
+                resp = {"ok": True}
+            elif t == "generate":
+                time.sleep(1)
+                resp = {"text": "slow"}
+            else:
+                resp = {"error": "unknown"}
+            sys.stdout.write(json.dumps(resp) + "\n")
+"#;
+
+/// `current_pid` is for a stats reader: it answers while a call holds the
+/// process (`pid` waits for the call), is `None` once the session stopped its
+/// idle child, and names the new child after the next call starts one.
+#[test]
+fn current_pid_does_not_wait_for_a_call() {
+    if !python3_available() {
+        return;
+    }
+    let path = write_runner("slowpid", SLOW_ONE_S);
+    let s = Arc::new(spawn(&path, None));
+    let pid = s.pid();
+    assert_eq!(s.current_pid(), Some(pid));
+    let req = Request::Generate { model_path: "/m", prompt: "p", max_tokens: None, temperature: None, json: None };
+    let busy = {
+        let s = Arc::clone(&s);
+        std::thread::spawn(move || {
+            s.call(&Request::Generate { model_path: "/m", prompt: "p", max_tokens: None, temperature: None, json: None }).map(|_| ())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(s.in_flight(), 1, "the call is running");
+    let t = Instant::now();
+    assert_eq!(s.current_pid(), Some(pid));
+    assert!(t.elapsed() < Duration::from_millis(200), "read without waiting for the call: {:?}", t.elapsed());
+    busy.join().unwrap().unwrap();
+
+    assert!(s.maybe_shutdown(Duration::ZERO));
+    assert_eq!(s.current_pid(), None, "stopped for being idle: no runner");
+    s.call(&req).unwrap();
+    let fresh = s.current_pid().expect("a new runner");
+    assert_ne!(fresh, pid);
+    assert_eq!(fresh, s.pid());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A runner that answers every line with `{"ok": true}`. On SIGTERM it writes
 /// "stopped" to `marker` and exits, or, with `ignore_term`, carries on.
 #[cfg(unix)]

@@ -6,8 +6,11 @@
 //! `C:\Users`) and unescaped interior quotes (`"port "18018""`). Either one
 //! fails a strict parse of the whole output. The repair ladder here runs
 //! cheapest step first and only ever turns unparseable text into parseable
-//! text: raw → strip fences and preamble → repair escapes → repair quotes. Every step is recorded so a caller can see that the model did not
-//! produce the output clean.
+//! text: raw → strip fences and preamble → repair escapes → repair quotes.
+//! Past the raw parse, each step takes the first complete object or array
+//! and drops any text after it (a sign-off, a stray `}`). Every step is
+//! recorded so a caller can see that the model did not produce the output
+//! clean.
 //!
 //! Where a backend can constrain decoding to a schema (`llama` via a grammar,
 //! `mlx` later via a logits processor) the runner does that and this module
@@ -58,8 +61,8 @@ pub enum StructuredError {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Structured {
     pub value: Value,
-    /// The model did not produce this clean: fences or preamble were
-    /// stripped, or escapes or quotes had to be repaired.
+    /// The model did not produce this clean: fences, preamble or trailing
+    /// text were stripped, or escapes or quotes had to be repaired.
     pub repaired: bool,
     /// Which repair steps were needed, in order, for the curious.
     pub repairs: Vec<&'static str>,
@@ -125,23 +128,76 @@ pub fn prompt_with_hint(prompt: &str, format: &OutputFormat) -> String {
     }
 }
 
-/// Strip code fences and advance to the first `{` or `[` so models that add
-/// preamble or markdown wrappers don't break JSON parsing.
-pub fn clean_json(raw: &str) -> String {
+/// What [`unwrap_json`] took off around the JSON.
+struct Unwrapped<'a> {
+    /// From the first `{` or `[` on (or the whole text when there is none).
+    text: &'a str,
+    /// Code fences, or text before the JSON, were removed.
+    front: bool,
+    /// Non-blank text after a closing code fence was dropped.
+    after_fence: bool,
+}
+
+fn first_bracket(s: &str) -> Option<usize> {
+    s.find(['{', '['])
+}
+
+/// A fenced block's body when a code fence opens before the JSON does, then
+/// advance to the first `{` or `[`. A fence counts only when the rest of its
+/// line is a bare language tag (`json`, or nothing): anything else on that
+/// line means the backticks are not an opener, and the text is read from its
+/// first bracket instead.
+fn unwrap_json(raw: &str) -> Unwrapped<'_> {
     let s = raw.trim();
-    let s = if s.starts_with("```") {
-        s.lines().skip(1).take_while(|l| !l.starts_with("```")).collect::<Vec<_>>().join("\n")
-    } else {
-        s.to_string()
-    };
-    let obj = s.find('{');
-    let arr = s.find('[');
-    match (obj, arr) {
-        (Some(o), Some(a)) => s[o.min(a)..].to_string(),
-        (Some(o), None) => s[o..].to_string(),
-        (None, Some(a)) => s[a..].to_string(),
-        (None, None) => s,
+    let mut fenced = false;
+    let mut after_fence = false;
+    let mut body = s;
+    if let Some(f) = s.find("```") {
+        let opener = &s[f + 3..];
+        let (tag, inner) = opener.split_once('\n').unwrap_or((opener, ""));
+        let is_tag = tag.trim().chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'));
+        if is_tag && first_bracket(s).is_none_or(|b| f < b) {
+            fenced = true;
+            // Valid JSON holds no raw newline inside a string, so a line that
+            // starts with a fence closes the block.
+            let close = if inner.starts_with("```") { Some(0) } else { inner.find("\n```").map(|i| i + 1) };
+            body = match close {
+                Some(c) => {
+                    after_fence = !inner[c + 3..].trim().is_empty();
+                    &inner[..c]
+                }
+                None => inner,
+            };
+            body = body.trim();
+        }
     }
+    let start = first_bracket(body).unwrap_or(0);
+    Unwrapped { text: &body[start..], front: fenced || start > 0, after_fence }
+}
+
+/// Strip code fences and advance to the first `{` or `[` so models that add
+/// preamble or markdown wrappers don't break JSON parsing. A fence is honoured
+/// when it opens before the first bracket, after a preamble or not; text after
+/// its closing fence is dropped. Text after the JSON itself is left in place (see
+/// [`first_json_value`]).
+pub fn clean_json(raw: &str) -> String {
+    unwrap_json(raw).text.to_string()
+}
+
+/// The first complete JSON value in `text` (leading whitespace allowed), and
+/// whether non-blank text follows it. Only an object or an array may be
+/// followed by text: both end unambiguously, so a model that closed its
+/// object and then added a sign-off (`Hope this helps!`) or a stray `}` still
+/// answered. A scalar must be the whole text. The error is the strict parse's.
+pub fn first_json_value(text: &str) -> Result<(Value, bool), serde_json::Error> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    if let Some(Ok(value)) = values.next() {
+        let trailing = !text[values.byte_offset()..].trim().is_empty();
+        if !trailing || value.is_object() || value.is_array() {
+            return Ok((value, trailing));
+        }
+    }
+    serde_json::from_str::<Value>(text).map(|value| (value, false))
 }
 
 /// Escape every backslash that does NOT start a valid JSON escape sequence
@@ -249,31 +305,36 @@ fn raw_head(text: &str) -> String {
     text.chars().take(240).collect()
 }
 
-/// Parse model output as JSON through the repair ladder.
+/// Parse model output as JSON through the repair ladder. Each step after the
+/// strict parse takes the first complete object or array and drops what
+/// follows it (`strip_trailing_text`); a value cut off before it closes is
+/// still an error.
 pub fn parse_lenient(text: &str) -> Result<Structured, StructuredError> {
-    let mut repairs = Vec::new();
     if let Ok(value) = serde_json::from_str::<Value>(text) {
-        return Ok(Structured { value, repaired: false, repairs });
+        return Ok(Structured { value, repaired: false, repairs: Vec::new() });
     }
-    let cleaned = clean_json(text);
-    if cleaned != text.trim() {
-        repairs.push("strip_fences_or_preamble");
+    let unwrapped = unwrap_json(text);
+    let done = |(value, trailing): (Value, bool), fixes: &[&'static str]| {
+        let mut repairs = Vec::new();
+        if unwrapped.front {
+            repairs.push("strip_fences_or_preamble");
+        }
+        if unwrapped.after_fence || trailing {
+            repairs.push("strip_trailing_text");
+        }
+        repairs.extend_from_slice(fixes);
+        Structured { value, repaired: !repairs.is_empty(), repairs }
+    };
+    if let Ok(parsed) = first_json_value(unwrapped.text) {
+        return Ok(done(parsed, &[]));
     }
-    if let Ok(value) = serde_json::from_str::<Value>(&cleaned) {
-        return Ok(Structured { value, repaired: !repairs.is_empty(), repairs });
-    }
-    let escaped = repair_json_escapes(&cleaned);
-    if let Ok(value) = serde_json::from_str::<Value>(&escaped) {
-        repairs.push("repair_escapes");
-        return Ok(Structured { value, repaired: true, repairs });
+    let escaped = repair_json_escapes(unwrapped.text);
+    if let Ok(parsed) = first_json_value(&escaped) {
+        return Ok(done(parsed, &["repair_escapes"]));
     }
     let quoted = repair_json_quotes(&escaped);
-    match serde_json::from_str::<Value>(&quoted) {
-        Ok(value) => {
-            repairs.push("repair_escapes");
-            repairs.push("repair_quotes");
-            Ok(Structured { value, repaired: true, repairs })
-        }
+    match first_json_value(&quoted) {
+        Ok(parsed) => Ok(done(parsed, &["repair_escapes", "repair_quotes"])),
         Err(e) => Err(StructuredError::NotJson { reason: e.to_string(), raw_head: raw_head(text) }),
     }
 }
@@ -349,6 +410,13 @@ mod tests {
         assert_eq!(clean_json("Sure! Here you go: {\"a\":1}"), "{\"a\":1}");
         assert_eq!(clean_json("list: [1,2]"), "[1,2]");
         assert_eq!(clean_json("no json here"), "no json here");
+        // A fence after a preamble is honoured, and prose after it dropped.
+        assert_eq!(clean_json("Here:\n```json\n{\"a\":1}\n```\nHope this helps!"), "{\"a\":1}");
+        assert_eq!(clean_json("Here you go ```\n[2]\n```"), "[2]");
+        // A fence that opens after the JSON (inside a string) is content.
+        assert_eq!(clean_json("x {\"md\": \"```js\"}"), "{\"md\": \"```js\"}");
+        // An unclosed fence: the rest is the block.
+        assert_eq!(clean_json("```json\n{\"a\":1}"), "{\"a\":1}");
     }
 
     #[test]
@@ -402,6 +470,78 @@ mod tests {
         assert!(matches!(err, StructuredError::NotJson { ref raw_head, .. } if raw_head.starts_with("Sure!")));
         let err = parse_lenient(r#"{"title": "Cut off mid-"#).unwrap_err();
         assert!(matches!(err, StructuredError::NotJson { .. }));
+    }
+
+    #[test]
+    fn text_after_a_complete_object_is_dropped_and_recorded() {
+        // api-F1: a stray closing brace after a complete object.
+        let s = parse_lenient(r#"{"a":1}}"#).unwrap();
+        assert_eq!((s.value.clone(), s.repaired, s.repairs.clone()), (json!({"a": 1}), true, vec!["strip_trailing_text"]));
+        // A sign-off after the object.
+        let s = parse_lenient("{\"a\":1}\nHope this helps!").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!({"a": 1}), vec!["strip_trailing_text"]));
+        // Fenced JSON followed by prose, with and without a preamble.
+        let s = parse_lenient("```json\n{\"a\":1}\n```\nHope this helps!").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!({"a": 1}), vec!["strip_fences_or_preamble", "strip_trailing_text"]));
+        let s = parse_lenient("Here it is:\n```json\n{\"a\":1}\n```\nLet me know if you need more.").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!({"a": 1}), vec!["strip_fences_or_preamble", "strip_trailing_text"]));
+        // Backticks that do not open a block (a one-line fence, or prose
+        // after them) leave the text to be read from its first bracket.
+        let s = parse_lenient("```{\"a\":1}```").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!({"a": 1}), vec!["strip_fences_or_preamble", "strip_trailing_text"]));
+        let s = parse_lenient("Use ```json blocks? Anyway: {\"a\":1}").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!({"a": 1}), vec!["strip_fences_or_preamble"]));
+        // Arrays too; and the repairs still combine with the other steps.
+        let s = parse_lenient("[1, 2] and that is all").unwrap();
+        assert_eq!((s.value.clone(), s.repairs.clone()), (json!([1, 2]), vec!["strip_trailing_text"]));
+        let s = parse_lenient("Sure: {\"a\": \"C:\\Users\"} done").unwrap();
+        assert_eq!(s.value, json!({"a": "C:\\Users"}));
+        assert_eq!(s.repairs, vec!["strip_fences_or_preamble", "strip_trailing_text", "repair_escapes"]);
+        // A second object after the first: the first one wins (the
+        // acceptance run's `ops-f1-echo-two` output).
+        assert_eq!(parse_lenient("{\"a\":1} {\"b\":2}").unwrap().value, json!({"a": 1}));
+        assert_eq!(parse_lenient("{\"a\":1}\n{\"b\":2}").unwrap().value, json!({"a": 1}));
+        // Trailing whitespace alone is not a repair.
+        assert!(!parse_lenient("{\"a\":1}\n\n  ").unwrap().repaired);
+    }
+
+    #[test]
+    fn a_truncated_or_scalar_answer_still_fails() {
+        // Cut off before the object closes: no complete value to take.
+        for raw in [r#"{"a": 1, "b": "cut"#, "{\"a\":1", "{\"a\": {\"b\": 2}", "```json\n{\"a\":1\n```\nsorry", "Sure: [1, 2"] {
+            let err = parse_lenient(raw).unwrap_err();
+            assert!(matches!(err, StructuredError::NotJson { .. }), "{raw:?}: {err:?}");
+        }
+        // A scalar must be the whole answer: "42 is the answer" is prose.
+        assert!(matches!(parse_lenient("42 is the answer"), Err(StructuredError::NotJson { .. })));
+        assert!(matches!(parse_lenient("true, I think"), Err(StructuredError::NotJson { .. })));
+        assert_eq!(parse_lenient(" 42 ").unwrap().value, json!(42));
+    }
+
+    #[test]
+    fn trailing_text_is_dropped_before_schema_validation() {
+        let schema = json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"title": {"type": "string", "maxLength": 8}}, "required": ["title"]
+        });
+        let format = OutputFormat::JsonSchema { schema };
+        let ok = enforce("{\"title\": \"Standup\"}\nHope this helps!", &format).unwrap();
+        assert_eq!((ok.value["title"].as_str(), ok.repairs), (Some("Standup"), vec!["strip_trailing_text"]));
+        // Validation still runs on what was kept.
+        let err = enforce("{\"title\": \"Quarterly budget review\"}}", &format).unwrap_err();
+        assert!(matches!(err, StructuredError::SchemaMismatch { .. }), "{err:?}");
+        let err = enforce("{\"title\": \"Standup\", \"extra\": 1} thanks", &format).unwrap_err();
+        assert!(matches!(err, StructuredError::SchemaMismatch { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn first_json_value_reports_what_follows() {
+        assert_eq!(first_json_value(" {\"a\":1} ").unwrap(), (json!({"a": 1}), false));
+        assert_eq!(first_json_value("{\"a\":1}}").unwrap(), (json!({"a": 1}), true));
+        assert_eq!(first_json_value("\"s\"").unwrap(), (json!("s"), false));
+        assert!(first_json_value("\"s\" and more").is_err());
+        assert!(first_json_value("").is_err());
+        assert!(first_json_value("{\"a\":").is_err());
     }
 
     #[test]

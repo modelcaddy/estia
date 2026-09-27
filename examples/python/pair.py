@@ -4,7 +4,8 @@
 What it shows:
   - checking the engine with GET /engine/health (no token needed)
   - asking for a token with POST /engine/pair: a name and the scopes you need
-  - polling GET /engine/pair/<id> until the operator approves or denies
+  - polling GET /engine/pair/<id> until the operator approves or denies, and
+    giving up before the engine drops the request (5 minutes after it was made)
   - saving the token to a file only you can read (mode 0600)
 
 Scopes: none to run it. The token it receives has the scopes you ask for.
@@ -13,6 +14,12 @@ Standard library only.
     ESTIA_URL=http://192.168.1.20:27200 python pair.py --name "kitchen tablet"
     # on the engine's machine: estia pair approve <id>
     export ESTIA_TOKEN=$(cat estia-token)
+
+It waits 290 s by default (`--wait`), just under the 5 minutes the engine
+keeps a request, and then prints:
+
+    no decision within 290 s. The engine drops a pairing request 5 minutes
+    after it was made; run pair.py again to ask anew.
 
 The operator sees the name and the scopes before approving. Ask for the least
 your app needs: `generate` to chat, `embed` for embeddings, `models:read` to
@@ -28,6 +35,13 @@ import urllib.error
 import urllib.request
 
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
+
+# The engine drops an undecided request 300 s after it was made. Stop polling
+# a little before that: the last poll then still finds the request, and the
+# user hears why we stopped rather than a bare 404.
+EXPIRES_S = 300
+DEFAULT_WAIT_S = 290
+EXPIRY = "The engine drops a pairing request 5 minutes after it was made; run pair.py again to ask anew."
 
 
 class EngineError(Exception):
@@ -71,7 +85,12 @@ def main() -> int:
     p.add_argument("--name", default="my-app", help="how the operator sees this device (letters, digits, spaces, . _ - ' ( ))")
     p.add_argument("--scopes", default="generate,embed,models:read", help="comma-separated scopes to ask for")
     p.add_argument("--out", default="estia-token", help="file to save the token in (created with mode 0600)")
-    p.add_argument("--wait", type=int, default=300, help="seconds to wait for approval (requests expire after 300)")
+    p.add_argument(
+        "--wait",
+        type=int,
+        default=DEFAULT_WAIT_S,
+        help=f"seconds to wait for approval (default {DEFAULT_WAIT_S}; the engine drops a request after {EXPIRES_S})",
+    )
     args = p.parse_args()
 
     try:
@@ -108,7 +127,8 @@ def main() -> int:
             state = call("GET", f"/engine/pair/{pid}")
         except EngineError as e:
             if e.status == 404:
-                print(f"\nthe request expired or is unknown: {e.message}", file=sys.stderr)
+                # Expired: the wait was longer than the engine keeps requests.
+                print(f"\nthe request has expired ({e.message}). {EXPIRY}", file=sys.stderr)
                 return 1
             # 500 means the engine could not read or write its pairing file.
             # The token is only handed out once its collection is saved, so
@@ -137,7 +157,7 @@ def main() -> int:
             print(f"\napproved. Token saved to {args.out} (mode 0600).")
             print(f"  export ESTIA_TOKEN=$(cat {args.out})")
             return 0
-    print("\ngave up waiting; the request expires on its own", file=sys.stderr)
+    print(f"\nno decision within {args.wait} s. {EXPIRY}", file=sys.stderr)
     return 1
 
 
