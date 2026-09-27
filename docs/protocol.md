@@ -57,11 +57,11 @@ Send `hello` once after spawn.
 ```
 
 ```json
-{"ok": true, "runner": "mlx-python", "version": "2.3.0", "protocol": 2,
+{"ok": true, "runner": "mlx-python", "version": "2.4.0", "protocol": 2,
  "capabilities": {"generate": true, "stream": true, "embed": true, "cancel": true,
                   "load": true, "chat": true, "tools": true, "prompt_cache": true,
                   "count_tokens": true, "structured": [],
-                  "parses_tool_calls": false, "backend": "mlx-python"}}
+                  "parses_tool_calls": false, "images": true, "backend": "mlx-python"}}
 ```
 
 A v1 runner answers `hello` with an unknown-type error. The engine reads that as
@@ -78,6 +78,9 @@ Two more fields say how to read what the runner returns:
   A runner without it returns the model's raw text, calls included, and the
   caller parses them out of that, as Estia's server does in
   `server/src/toolcalls.rs`.
+- `images` (default `false`): the runner accepts `Message.images` and passes
+  them to the model (see [Chat](#chat)). The engine never sends images to a
+  runner without it; it refuses the request instead.
 - `backend`: the backend id the runner's outputs belong to, `mlx-python` or
   `llama-cpp` (`estia_engine::Backend`). It is the part after `@` in an
   embedding fingerprint such as `embeddinggemma-300m-4bit@mlx-python`,
@@ -123,7 +126,7 @@ paths; runners never download anything.
 it. `unload` frees the memory.
 
 `messages` are OpenAI-shaped:
-`{"role", "content", "name"?, "tool_call_id"?, "tool_calls"?}` with roles
+`{"role", "content", "name"?, "tool_call_id"?, "tool_calls"?, "images"?}` with roles
 `system`, `user`, `assistant` and `tool`. The runner renders them with the
 model's own chat template. `tools` are OpenAI tool schemas, declared through
 the template where the model supports them. `tools`, `cache_key` and `format`
@@ -142,6 +145,19 @@ OpenAI's shape, with `arguments` as a JSON string:
 Chat templates render a `tool` result only after the assistant turn whose
 call it answers, so a runner passes `tool_calls` to the template with the rest
 of the message. Dropping them drops the results too.
+
+A `user` turn may carry images, each the encoded file (PNG, JPEG, WebP or GIF)
+in base64 with its MIME type:
+
+```json
+{"role": "user", "content": "What is the total?",
+ "images": [{"mime": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAA..."}]}
+```
+
+The runner places a turn's images before its text, as Gemma's template does
+(`{"type": "image"}` parts, rendered as `<|image|>`), and passes them to the
+model's vision encoder. Only runners that declare `images` receive this
+field. A turn with images is not served from the prompt cache.
 
 `cache_key` names a conversation. The runner keeps that conversation's KV
 cache and, on the next call with the same key, prefills only the part of the
@@ -321,7 +337,7 @@ request with the tail of its log, and the runner stays up.
  "capabilities": {"generate": true, "stream": true, "embed": true, "cancel": true,
                   "load": true, "chat": true, "tools": true, "prompt_cache": true,
                   "count_tokens": true, "structured": ["json", "json_schema"],
-                  "parses_tool_calls": true, "backend": "llama-cpp"}}
+                  "parses_tool_calls": true, "images": true, "backend": "llama-cpp"}}
 ```
 
 `version` is the crate's version. Against the MLX Python runner, the

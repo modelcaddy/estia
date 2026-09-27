@@ -3,7 +3,8 @@
 use crate::access::{spawn_blocking_in_span, Access};
 use crate::jobs::JobStatus;
 use crate::openai::{
-    apply_prefix, embed_task, finish_reason, inputs_of, parse_response_format, runner_format, task_name, to_messages, OaiMessage,
+    apply_prefix, check_images, embed_task, finish_reason, inputs_of, parse_response_format, runner_format, task_name, to_messages,
+    OaiMessage,
 };
 use crate::pairing::PairingError;
 use crate::{derive_cache_key, toolcalls, ApiError, AppState, API_VERSION, BUILD_COMMIT, BUILD_DATE};
@@ -487,10 +488,13 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     // Either a raw prompt (the resident runner's `generate_stream`) or messages
     // (protocol v2 `chat_stream` through the template). Checked before a
     // model is loaded for the request.
-    let mut messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m));
+    let mut messages: Option<Vec<Message>> = req.messages.as_ref().map(|m| to_messages(m)).transpose()?;
     let mut prompt = req.prompt.clone();
     if messages.is_none() && prompt.is_none() {
         return Err(ApiError::bad_request("prompt or messages is required"));
+    }
+    if let Some(m) = &messages {
+        check_images(m, artifact, None)?;
     }
     let backend = state.embed_backend();
     let st = Arc::clone(&state);
@@ -500,6 +504,9 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
     }
     let tools = req.tools.clone().filter(|t| !t.is_empty());
     let caps = session.capabilities();
+    if let Some(m) = &messages {
+        check_images(m, artifact, Some(&caps))?;
+    }
     let parses_calls = caps.parses_tool_calls;
     // Only the collected (non-streamed) path returns structured output.
     let constrain = if streaming { None } else { runner_format(&caps, &format, tools.is_some()) };

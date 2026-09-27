@@ -88,6 +88,9 @@ jobs:
       CHAT_MODEL_SHA256: 7566ae7219c93ea2ecc692a931ee122d30c55261d0e2c3347acb8b939d2e9abd
       EMBED_MODEL_URL: https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-Q8_0.gguf
       EMBED_MODEL_SHA256: 263215c3cadd6e16740741a7624ab4cbb6c8e777688bd5331ecfbf5681c2f8ed
+      # tinygemma3's image projector (1 MB), for the image test.
+      MMPROJ_URL: https://huggingface.co/ggml-org/tinygemma3-GGUF/resolve/c287502cd9e278dac8eed805c112cce5d0081e0b/mmproj-tinygemma3.gguf
+      MMPROJ_SHA256: 93c2ba8c34574dd8f2dfda64931fc20943de2f941bfe03e6e9eca68951b80604
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -132,7 +135,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.LLAMA_ASSETS }}
-          key: llama-${{ runner.os }}-${{ steps.pin.outputs.file }}-${{ steps.pin.outputs.sha256 }}-${{ env.CHAT_MODEL_SHA256 }}-${{ env.EMBED_MODEL_SHA256 }}
+          key: llama-${{ runner.os }}-${{ steps.pin.outputs.file }}-${{ steps.pin.outputs.sha256 }}-${{ env.CHAT_MODEL_SHA256 }}-${{ env.EMBED_MODEL_SHA256 }}-${{ env.MMPROJ_SHA256 }}
 
       - name: Download and verify
         # Every file is hashed on every run, cached or not.
@@ -166,6 +169,7 @@ jobs:
           fetch "$LLAMA_URL" "$LLAMA_SHA256"
           fetch "$CHAT_MODEL_URL" "$CHAT_MODEL_SHA256"
           fetch "$EMBED_MODEL_URL" "$EMBED_MODEL_SHA256"
+          fetch "$MMPROJ_URL" "$MMPROJ_SHA256"
           ls -l "$LLAMA_ASSETS"
 
       - name: Save the llama.cpp build and test models
@@ -195,6 +199,7 @@ jobs:
             echo "ESTIA_LLAMA_SERVER=$server"
             echo "ESTIA_LLAMA_TEST_MODEL=$LLAMA_ASSETS/${CHAT_MODEL_URL##*/}"
             echo "ESTIA_LLAMA_TEST_EMBED_MODEL=$LLAMA_ASSETS/${EMBED_MODEL_URL##*/}"
+            echo "ESTIA_LLAMA_TEST_MMPROJ=$LLAMA_ASSETS/${MMPROJ_URL##*/}"
           } >> "$GITHUB_ENV"
 
       - name: Shared libraries (Linux)

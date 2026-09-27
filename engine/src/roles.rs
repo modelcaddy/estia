@@ -19,12 +19,10 @@ pub const VISION: &str = "vision";
 pub const EMBED: &str = "embed";
 pub const CODE: &str = "code";
 
-/// What a role needs from the family bound to it. `vision` needs only
-/// `Text` while no model advertises `Vision` (none does until images reach
-/// the model, ROADMAP L9): the role keeps its name and its default binding
-/// and serves text, and a role table read back from `GET /engine/defaults`
-/// still passes [`Roles::bind`]. It needs `Vision` again once an artifact
-/// has it.
+/// What a role needs from the family bound to it. `vision` needs `Vision`
+/// whenever some artifact has it (the Gemma 4 families do). A registry with
+/// no vision model at all would make it a text role, so a role table read
+/// back from `GET /engine/defaults` always passes [`Roles::bind`].
 pub fn required_capability(role: &str) -> Capability {
     match role {
         EMBED => Capability::Embed,
@@ -207,9 +205,9 @@ mod tests {
             checked.bind(role, b.clone()).unwrap_or_else(|e| panic!("default `{role}`: {e}"));
         }
         assert_eq!(checked, defaults);
-        // No model takes images yet, so `vision` binds like a text role; it
-        // still refuses what cannot generate at all.
-        assert_eq!(required_capability(VISION), Capability::Text);
+        // Gemma 4 reads images, so `vision` needs Vision; it refuses what
+        // cannot generate at all.
+        assert_eq!(required_capability(VISION), Capability::Vision);
         let mut r = Roles::default();
         r.bind(VISION, RoleBinding::family("gemma4-e2b")).unwrap();
         assert!(matches!(r.bind(VISION, RoleBinding::family("nomic-embed-text-v1.5")), Err(RoleError::Incapable { .. })));

@@ -17,7 +17,7 @@ depending on it. Each limit below was checked against the code or a live run.
 | Platforms | Models run on Apple Silicon Macs (MLX, or llama.cpp with Metal). The llama.cpp backend should also run on Linux, but has run there only in CI: the adapter's integration tests pass against the pinned `llama-server` on GitHub's Ubuntu 24.04 x64 runners. Estia does not build for Windows. Releases ship one tarball, `aarch64-apple-darwin`. |
 | Backend | Two. MLX, through a Python runner (`runners/mlx-python/estia-runner.py`) and a Python runtime of about 700 MB that Estia installs; `mlx-vlm` is held below 0.7 because the runner has not been run on 0.7. And llama.cpp, new: upstream `llama-server` behind the `estia-llama` adapter, with a pinned build (b11146) that Estia downloads and checks. |
 | Models | A registry of three Gemma 4 families and four embedding models, with MLX and GGUF artifacts. On llama.cpp, `estia import` adds a GGUF file without a code change. |
-| Input | Text only. Image parts become a marker such as `[image_url omitted]`. The `vision` role exists, but the runner loads Gemma with no image input. |
+| Input | Text and images (PNG, JPEG, WebP, GIF as `data:` URLs) on both backends; no audio or video. |
 | Tools | Tool calls are parsed from Gemma's own syntax on MLX and by `llama-server` on llama.cpp. `{"role": "tool"}` results reach the model through its chat template. Gemma 4's tool calls on llama.cpp are untested. |
 | Structured output | llama.cpp constrains decoding to the JSON Schema. On MLX the engine puts the schema in the system prompt. Both then validate, repair and retry. |
 | Roles | `temperature`, `max_tokens` and `pin` are stored with a role and not applied. `embed` can be bound to any embedding model; unbound it means EmbeddingGemma 300M. |
@@ -175,8 +175,15 @@ backend loads the model's projector (slice L9).
 
 **Exit check.** `/v1/chat/completions` with `"model": "vision"` and a base64
 PNG describes the image, on MLX and on llama.cpp. A remote `image_url` gets
-400. An image over the size limit gets 400. The marker is gone from
+400. An image over the size limit gets 413. The marker is gone from
 [docs/api.md](docs/api.md).
+
+**Status (2026-09-27): built, for 0.5.0.** On MLX, `"model": "vision"` (Gemma
+4 E4B) read a generated invoice's total ("318 EUR") through `/v1`, and E2B its
+number, total and a red circle, in one pass through the runner. On llama.cpp
+the mechanics are checked with tinygemma3 and its 1 MB projector: the image
+adds tokens, streams work, and a model without a projector is refused. Gemma
+4's GGUF projectors (about 1 GB for E2B and E4B) have not been run yet.
 
 ### 6. Role options and `embed` rebinding
 

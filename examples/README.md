@@ -15,6 +15,7 @@ The concepts behind them are explained in
 | [python/rag.py](python/rag.py) | Questions over a folder of notes with citations: `task` prefixes, fingerprints, batching, cosine ranking | Python, OpenAI SDK | `embed`, `generate` |
 | [python/structured.py](python/structured.py) | JSON Schema extraction and the 422 when the output does not fit | Python, OpenAI SDK | `generate` |
 | [python/tools.py](python/tools.py) | A tool-calling loop around one local Python function | Python, OpenAI SDK | `generate` |
+| [python/vision.py](python/vision.py) | Ask the `vision` role about an image on disk | Python, OpenAI SDK | `generate` |
 | [python/pair.py](python/pair.py) | How a device app gets a token: request, wait for approval, save it with mode 0600 | Python, stdlib | none (the token gets what you ask for) |
 | [javascript/chat.mjs](javascript/chat.mjs) | Streaming chat, two turns sharing the prompt cache, Ctrl-C to cancel | JavaScript, OpenAI SDK | `generate` |
 | [javascript/embed.mjs](javascript/embed.mjs) | Embeddings with `task` and `expect_fingerprint`, ranked by cosine | JavaScript, OpenAI SDK | `embed` |
@@ -93,6 +94,7 @@ python chat.py
 python rag.py index sample-notes && python rag.py ask "When do I repot the olive tree?"
 python structured.py
 python tools.py "What time is it in Tokyo?"
+python vision.py invoice.png "What is the total?"
 python no_sdk.py                         # no pip needed
 python pair.py --name "my laptop"        # no pip needed, no token needed
 ```

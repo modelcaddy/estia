@@ -1059,10 +1059,12 @@ mod tests {
         let spec = DownloadSpec::from(a);
         assert!(std::ptr::eq(explicit_artifact(&spec).unwrap(), a));
         let planned: Vec<PlannedFile> = a.files.iter().map(PlannedFile::from).collect();
-        assert_eq!(planned.len(), 1);
+        assert_eq!(planned.len(), 2);
         assert_eq!((planned[0].remote.as_str(), planned[0].local.as_str()), ("gemma-4-E2B_q4_0-it.gguf", "model.gguf"));
         assert_eq!(planned[0].sha256.as_deref(), Some(a.files[0].sha256));
         assert_eq!(planned[0].size, 3_349_516_256);
+        assert_eq!((planned[1].remote.as_str(), planned[1].local.as_str()), ("gemma-4-E2B-it-mmproj.gguf", "mmproj.gguf"));
+        assert_eq!(planned[1].size, 986_833_664);
         // Another revision or repository is not that artifact.
         assert!(explicit_artifact(&DownloadSpec { revision: "main".into(), ..spec.clone() }).is_none());
         assert!(explicit_artifact(&DownloadSpec { repo_id: "someone/else".into(), ..spec }).is_none());

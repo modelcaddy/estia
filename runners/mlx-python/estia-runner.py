@@ -57,6 +57,7 @@ Embedding uses mlx-embeddings, the same API as oneshot-runner.py:
 `generate(model, processor, texts=[...]).text_embeds` — mean-pooled, normalized
 sentence vectors (768-dim for nomicai-modernbert-embed-base-6bit).
 """
+import os
 import sys
 import collections
 import json
@@ -84,7 +85,7 @@ _GEN_CACHE = {}
 # Protocol v2 identity. Bump RUNNER_VERSION on any behaviour change a client
 # could care about; PROTOCOL is the dialect number from the engine's proto crate.
 RUNNER_NAME = "mlx-python"
-RUNNER_VERSION = "2.3.0"
+RUNNER_VERSION = "2.4.0"
 PROTOCOL = 2
 CAPABILITIES = {
     "generate": True,
@@ -100,6 +101,8 @@ CAPABILITIES = {
     "structured": [],
     # Tool calls are left in the text; the client parses them.
     "parses_tool_calls": False,
+    # Messages may carry images (base64); the vision tower reads them.
+    "images": True,
     # Part of every embedding fingerprint this runner's vectors carry.
     "backend": "mlx-python",
 }
@@ -211,8 +214,8 @@ def embed_batch(model_path, inputs):
 
 
 def load_gen(path):
-    # Gemma 4 (e2b/e4b) are multimodal — load with mlx-vlm (text-only: no image).
-    # Same loader as oneshot-runner.py.
+    # Gemma 4 is multimodal; mlx-vlm loads the language model and the vision
+    # tower together. Same loader as oneshot-runner.py.
     if path not in _GEN_CACHE:
         from mlx_vlm import load
         _GEN_CACHE[path] = load(path)
@@ -566,7 +569,8 @@ def _prefill(model, model_path, cache, ids, start, stop, snap_at=None, on_snapsh
     _PREFILL_STEP[model_path] = step
 
 
-def _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv=None, history=None):
+def _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv=None, history=None,
+              images=None):
     """Yield mlx-vlm GenerationResults for `prompt`, with prefix reuse from
     `conv` and an interruptible prefill. Fills `info` with prompt_tokens and
     cached_tokens (the whole prompt and its reused part). `history` is the
@@ -579,6 +583,18 @@ def _generate(model, model_path, processor, prompt, max_tokens, temperature, inf
     stream_fn = _stream_generate_fn()
     if stream_fn is None:
         raise RuntimeError("no streaming API in this mlx-vlm")
+    if images:
+        # A turn with images goes through mlx-vlm whole: the vision tower
+        # turns each image into embeddings that the text cache cannot hold,
+        # so there is no prefix reuse and no chunked prefill (a cancel lands
+        # once the prompt is read, when the first token is due).
+        if conv is not None:
+            conv.reset()
+            conv.snap = None
+        info["cached_tokens"] = 0
+        yield from stream_fn(model, processor, prompt, image=list(images), max_tokens=max_tokens,
+                             temperature=temperature)
+        return
     try:
         ids = _encode(model, processor, prompt)
         if not ids:
@@ -686,6 +702,62 @@ def _call_arguments(raw):
     return {} if raw is None else raw
 
 
+def _prepare_image(data_b64, index):
+    """One message image as a file mlx-vlm can read: decoded, converted to
+    RGB, and cropped to its content when the content is a small island on a
+    plain ground (a rendered page, a screenshot with margins). Measured on
+    Gemma 4 E4B: a 1200 px page with four lines of text at the top read as
+    "no picture" about half the time at temperature 0.2; cropped to the text
+    it read every time. Returns the path of a temporary PNG."""
+    import base64
+    import io
+    import tempfile
+    from PIL import Image, ImageChops
+
+    raw = base64.b64decode(data_b64)
+    with Image.open(io.BytesIO(raw)) as im:
+        if getattr(im, "is_animated", False):
+            im.seek(0)  # a GIF: its first frame
+        rgb = im.convert("RGB")
+    w, h = rgb.size
+    try:
+        corner = rgb.getpixel((0, 0))
+        bbox = ImageChops.difference(rgb, Image.new("RGB", rgb.size, corner)).getbbox()
+        if bbox:
+            left, top, right, bottom = bbox
+            if (right - left) * (bottom - top) < 0.6 * w * h:
+                pad = max(24, int(0.04 * max(w, h)))
+                rgb = rgb.crop((max(0, left - pad), max(0, top - pad), min(w, right + pad), min(h, bottom + pad)))
+    except Exception:  # noqa: BLE001
+        pass  # cropping is an improvement, never a requirement
+    out = tempfile.NamedTemporaryFile(prefix=f"estia-image-{index}-", suffix=".png", delete=False)
+    out.close()
+    rgb.save(out.name, "PNG")
+    return out.name
+
+
+def _message_images(messages):
+    """Every image in the conversation, in order, prepared as files. The
+    caller deletes them (see _remove_files)."""
+    paths = []
+    try:
+        for m in messages:
+            for img in m.get("images") or []:
+                paths.append(_prepare_image(img["data"], len(paths)))
+    except Exception:
+        _remove_files(paths)
+        raise
+    return paths
+
+
+def _remove_files(paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _template_messages(messages):
     """Messages as chat templates expect them: content always a string,
     assistant tool_calls OpenAI-shaped with their arguments as a mapping, and
@@ -694,6 +766,14 @@ def _template_messages(messages):
     out = []
     for i, m in enumerate(messages):
         msg = {"role": m.get("role", "user"), "content": m.get("content") or ""}
+        images = m.get("images") or []
+        if images:
+            # Content parts, images first: the template writes each image
+            # part as <|image|>, which mlx-vlm expands into the image's tokens.
+            parts = [{"type": "image"} for _ in images]
+            if msg["content"]:
+                parts.append({"type": "text", "text": msg["content"]})
+            msg["content"] = parts
         for key in ("name", "tool_call_id"):
             if m.get(key):
                 msg[key] = m[key]
@@ -757,6 +837,10 @@ def _render_messages(processor, messages, tools):
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "") or ""
+        if isinstance(content, list):
+            # Image parts from _template_messages: Gemma's image placeholder,
+            # then the text.
+            content = "".join("<|image|>" if p.get("type") == "image" else p.get("text", "") for p in content)
         if role == "system":
             system = (system + "\n" if system else "") + content
             continue
@@ -816,7 +900,8 @@ def _finish_reason(last, raw_text):
     return "length" if getattr(last, "finish_reason", None) == "length" else "stop"
 
 
-def _stream_core(model, model_path, processor, prompt, raw_prompt, max_tokens, temperature, conv, history=None):
+def _stream_core(model, model_path, processor, prompt, raw_prompt, max_tokens, temperature, conv, history=None,
+                 images=None):
     """Stream a rendered prompt. Emits token lines and returns (any_emitted,
     cancelled, meta, error). Anti-leak strategy: re-clean the WHOLE accumulated
     buffer each step and emit only the newly revealed cleaned suffix, holding
@@ -836,7 +921,7 @@ def _stream_core(model, model_path, processor, prompt, raw_prompt, max_tokens, t
     cancelled = False
     last = None
     info = {}
-    gen = _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv, history)
+    gen = _generate(model, model_path, processor, prompt, max_tokens, temperature, info, conv, history, images)
     try:
         for chunk in gen:
             if _CANCEL.is_set():
@@ -905,27 +990,33 @@ _OPEN_TOOL_TURN = "<tool_response|>"
 _REOPEN_MODEL_TURN = "<turn|>\n<|turn>model\n"
 
 
-def _chat_core(model, model_path, processor, prompt, native, history, max_tokens, temperature, conv):
+def _chat_core(model, model_path, processor, prompt, native, history, max_tokens, temperature, conv, images=None):
     """_stream_core, asked once more in a new model turn when the answer after
     a tool result came back empty."""
-    result = _stream_core(model, model_path, processor, prompt, "", max_tokens, temperature, conv, history)
+    result = _stream_core(model, model_path, processor, prompt, "", max_tokens, temperature, conv, history, images)
     any_emitted, cancelled, _meta, error = result
     if native and not (any_emitted or cancelled or error) and prompt.rstrip().endswith(_OPEN_TOOL_TURN):
         print("estia-runner: empty answer after a tool result; asking again in a new model turn", file=sys.stderr, flush=True)
         result = _stream_core(model, model_path, processor, prompt + _REOPEN_MODEL_TURN, "", max_tokens,
-                              temperature, conv, history)
+                              temperature, conv, history, images)
     return result
 
 
 def chat_stream_lines(req):
     model_path = req["model_path"]
     model, processor = load_gen(model_path)
-    prompt, native, history = _render_messages(processor, req.get("messages") or [], req.get("tools"))
+    messages = req.get("messages") or []
+    prompt, native, history = _render_messages(processor, messages, req.get("tools"))
     max_tokens = int(req.get("max_tokens") or 256)
     temperature = float(req.get("temperature") or 0.0)
-    conv = _conversation(model_path, req.get("cache_key"))
-    any_emitted, cancelled, meta, error = _chat_core(
-        model, model_path, processor, prompt, native, history, max_tokens, temperature, conv)
+    images = _message_images(messages)
+    try:
+        # No prompt cache for a conversation with images (see _generate).
+        conv = None if images else _conversation(model_path, req.get("cache_key"))
+        any_emitted, cancelled, meta, error = _chat_core(
+            model, model_path, processor, prompt, native, history, max_tokens, temperature, conv, images)
+    finally:
+        _remove_files(images)
     if cancelled:
         emit({"done": True, "cancelled": True})
         return
@@ -958,11 +1049,16 @@ def chat_text(req):
     try:
         model_path = req["model_path"]
         model, processor = load_gen(model_path)
-        prompt, native, history = _render_messages(processor, req.get("messages") or [], req.get("tools"))
-        conv = _conversation(model_path, req.get("cache_key"))
-        any_emitted, cancelled, meta, error = _chat_core(
-            model, model_path, processor, prompt, native, history, int(req.get("max_tokens") or 256),
-            float(req.get("temperature") or 0.0), conv)
+        messages = req.get("messages") or []
+        prompt, native, history = _render_messages(processor, messages, req.get("tools"))
+        images = _message_images(messages)
+        try:
+            conv = None if images else _conversation(model_path, req.get("cache_key"))
+            any_emitted, cancelled, meta, error = _chat_core(
+                model, model_path, processor, prompt, native, history, int(req.get("max_tokens") or 256),
+                float(req.get("temperature") or 0.0), conv, images)
+        finally:
+            _remove_files(images)
     finally:
         globals()["emit"] = real_emit
     if error and not collected:

@@ -8,6 +8,8 @@
 //!   these tests check mechanics, not quality)
 //! - `ESTIA_LLAMA_TEST_EMBED_MODEL`: an embedding GGUF with 384 dimensions
 //!   (CI uses all-MiniLM-L6-v2 Q8_0)
+//! - `ESTIA_LLAMA_TEST_MMPROJ` (optional, for the image test): the test chat
+//!   model's image projector (CI uses tinygemma3's `mmproj-tinygemma3.gguf`, 1 MB)
 //!
 //! `ESTIA_LLAMA_TEST_VERBOSE=1` echoes the adapter's stderr.
 
@@ -591,4 +593,57 @@ fn an_orphaned_adapter_stops_its_server() {
     assert!(left.is_empty(), "files left in the run dir: {left:?}");
     drop(stdin);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A valid 1×1 PNG.
+const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+#[test]
+fn images_reach_a_model_with_a_projector_and_are_refused_without() {
+    let Some(a) = assets("images_reach_a_model_with_a_projector_and_are_refused_without") else { return };
+    let Some(mmproj) = std::env::var_os("ESTIA_LLAMA_TEST_MMPROJ").filter(|v| !v.is_empty()).map(PathBuf::from) else {
+        eprintln!("skipping images_reach_a_model_with_a_projector_and_are_refused_without: set ESTIA_LLAMA_TEST_MMPROJ to run it");
+        return;
+    };
+    let dir = scratch("img");
+    // The store's layout: model.gguf with mmproj.gguf beside it.
+    let with = dir.join("with");
+    std::fs::create_dir_all(&with).unwrap();
+    std::os::unix::fs::symlink(std::fs::canonicalize(&a.model).unwrap(), with.join("model.gguf")).unwrap();
+    std::os::unix::fs::symlink(std::fs::canonicalize(&mmproj).unwrap(), with.join("mmproj.gguf")).unwrap();
+    let mut ad = Adapter::start(&a, &dir.join("run"));
+    let image = json!({"mime": "image/png", "data": TINY_PNG});
+    let turn = |content: &str, with_image: bool| {
+        let mut m = json!({"role": "user", "content": content});
+        if with_image {
+            m["images"] = json!([image]);
+        }
+        m
+    };
+
+    // Without a projector: a clear error, not an answer that ignores the image.
+    let r = ad
+        .call(json!({"type": "chat", "model_path": a.model, "messages": [turn("What is this?", true)], "max_tokens": 4, "cache_key": "k"}));
+    let err = r["error"].as_str().unwrap_or_else(|| panic!("expected an error: {r}"));
+    assert!(err.contains("cannot read images"), "{err}");
+
+    // With one: llama-server starts with --mmproj, and the image adds tokens.
+    let text = ad.ok(json!({"type": "chat", "model_path": with, "messages": [turn("What is this?", false)], "max_tokens": 4}));
+    let text_prompt = text["meta"]["prompt_tokens"].as_u64().unwrap();
+    let r =
+        ad.ok(json!({"type": "chat", "model_path": with, "messages": [turn("What is this?", true)], "max_tokens": 4, "cache_key": "img"}));
+    let img_prompt = r["meta"]["prompt_tokens"].as_u64().unwrap();
+    assert!(img_prompt > text_prompt, "the image should add tokens: {img_prompt} vs {text_prompt}");
+    assert_eq!(r["meta"]["cached_tokens"], 0, "an image turn is never served from the cache: {r}");
+    // Streamed too.
+    let mut req = json!({"type": "chat_stream", "model_path": with, "messages": [turn("Describe.", true)], "max_tokens": 4});
+    req["cache_key"] = json!("img");
+    let (_tokens, meta, end) = ad.stream(req);
+    assert_eq!(end, json!({"done": true}));
+    assert_eq!(meta.expect("meta")["cached_tokens"], 0);
+    let cmd = std::fs::read_to_string(format!("/proc/{}/cmdline", ad.server_pid())).ok();
+    if let Some(cmd) = cmd {
+        assert!(cmd.contains("--mmproj"), "{cmd}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

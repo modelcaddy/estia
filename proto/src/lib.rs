@@ -151,12 +151,39 @@ pub struct Message {
     /// called it, so dropping these dropped the results too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<Value>>,
+    /// Images attached to this turn, in order. The runner places them before
+    /// the turn's text, as the model's chat template expects. Only runners
+    /// that declare [`Capabilities::images`] receive them; the server refuses
+    /// images for any other runner rather than dropping them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageData>>,
 }
 
 impl Message {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self { role: role.into(), content: content.into(), name: None, tool_call_id: None, tool_calls: None }
+        Self { role: role.into(), content: content.into(), name: None, tool_call_id: None, tool_calls: None, images: None }
     }
+
+    /// This turn with `images` attached.
+    pub fn with_images(mut self, images: Vec<ImageData>) -> Self {
+        self.images = if images.is_empty() { None } else { Some(images) };
+        self
+    }
+
+    /// Whether any turn in `messages` carries an image.
+    pub fn any_images(messages: &[Message]) -> bool {
+        messages.iter().any(|m| m.images.as_ref().is_some_and(|i| !i.is_empty()))
+    }
+}
+
+/// An image attached to a [`Message`]: the encoded file (PNG, JPEG, WebP or
+/// GIF), base64 with the standard alphabet and padding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageData {
+    /// `image/png`, `image/jpeg`, `image/webp` or `image/gif`.
+    pub mime: String,
+    /// The file's bytes, base64.
+    pub data: String,
 }
 
 /// Token accounting a runner reports for one generation.
@@ -261,6 +288,9 @@ pub struct Capabilities {
     /// `meta.tool_calls` (llama.cpp does); text is not re-parsed.
     #[serde(default)]
     pub parses_tool_calls: bool,
+    /// The runner accepts [`Message::images`] and passes them to the model.
+    #[serde(default)]
+    pub images: bool,
     /// The backend id vectors and outputs from this runner carry
     /// (`mlx-python`, `llama-cpp`). Absent on older runners.
     #[serde(default, skip_serializing_if = "Option::is_none")]

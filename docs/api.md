@@ -176,7 +176,7 @@ Supported request fields:
 | Field | Notes |
 |---|---|
 | `model` | Role, family or artifact id |
-| `messages` | `system`, `user`, `assistant`, `tool`. `content` may be a string or an array of parts. Text parts are joined. Other parts, such as images, are replaced by a marker like `[image_url omitted]`: image input is not passed to the model yet. An assistant message's `tool_calls` reach the model's chat template as structured calls, so the `{"role": "tool", "tool_call_id": …}` results after it are rendered too. |
+| `messages` | `system`, `user`, `assistant`, `tool`. `content` may be a string or an array of parts: `text` parts (joined) and, in `user` messages, `image_url` parts (see [Images](#images)). Any other part type is a 400. An assistant message's `tool_calls` reach the model's chat template as structured calls, so the `{"role": "tool", "tool_call_id": …}` results after it are rendered too. |
 | `tools` | OpenAI tool schemas, rendered by the model's chat template. The model's calls come back as `tool_calls`. On `llama-cpp`, llama-server parses them; on `mlx-python` the server parses Gemma 4's native syntax and a `{"tool_call": {"name", "arguments"}}` object. |
 | `response_format` | `text`, `json_object`, or `json_schema` with `json_schema.schema`. See [Structured output](#structured-output). |
 | `max_completion_tokens`, `max_tokens` | Default 1024, at most 8192 (larger values are lowered) |
@@ -347,9 +347,9 @@ yet.
 `bytes_on_disk`, `required_disk_bytes` and `pulling` (the running job id, if
 any). Generation entries add `family`, `backend`, `context_length`,
 `capabilities` and `partial_bytes`. `capabilities` lists what reaches the
-model through this API: `["text", "tools"]` for the Gemma 4 families. None
-lists `vision`, because image parts in a message are not passed to the model
-yet. Embedding entries describe the model and
+model through this API: `["text", "tools", "vision"]` for the Gemma 4
+families; an imported GGUF lists `vision` only when it was imported with its
+projector (`estia import --mmproj`). Embedding entries describe the model and
 its artifact for the running backend: `artifact`, `dims`, `arch`,
 `multilingual`, `fingerprint`, and `artifacts`, every artifact of the model
 (`id`, `format`, `backend`, `installed`). For an imported model linked with
@@ -453,6 +453,36 @@ that just died, or a platform other than macOS and Linux). Reading stats never
 waits for a generation in progress.
 
 `queue` counts the generation calls waiting, by priority.
+
+## Images
+
+A `user` message's content can include images, as OpenAI `image_url` parts:
+
+```json
+{"model": "vision", "messages": [{"role": "user", "content": [
+  {"type": "text", "text": "What is the total on this invoice?"},
+  {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+]}]}
+```
+
+- **Inline only.** The URL must be a `data:` URL with base64 data. A remote
+  URL (`https://…`, `file://…`) is a 400: the engine never fetches a URL on a
+  client's behalf.
+- **Formats:** PNG, JPEG, WebP and GIF (its first frame). The format is read
+  from the bytes; a declared type that disagrees is ignored.
+- **Limits:** 20 MB per image and 8 images per request. Over the size limit is
+  413; more images, or an image in a `system`, `assistant` or `tool` message,
+  is 400.
+- **Models:** the model must read images: the `vision` role (Gemma 4 E4B by
+  default), any Gemma 4 family or artifact, or an import with a projector.
+  Anything else is a 400 that says so, rather than an answer that ignores the
+  image. `/engine/generate` takes the same `messages`.
+- **Preparation:** the MLX runner converts each image to RGB and, when its
+  content is a small island on a plain background (a rendered page, a
+  screenshot with margins), crops to it; small text reads much more
+  reliably that way.
+- **Prompt cache:** a request with images is never served from the prompt
+  cache, and `cached_tokens` is 0.
 
 ## Structured output
 

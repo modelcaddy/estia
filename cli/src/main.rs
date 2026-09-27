@@ -136,6 +136,10 @@ enum Cmd {
         /// Replace an earlier import with the same id.
         #[arg(long)]
         replace: bool,
+        /// Generation models: the image projector (`mmproj-….gguf`) that lets
+        /// the model read images. Stored beside it as `mmproj.gguf`.
+        #[arg(long, value_name = "FILE")]
+        mmproj: Option<PathBuf>,
     },
     /// Remove an installed model and any partial download.
     Rm { id: String },
@@ -223,6 +227,10 @@ enum Cmd {
         /// and a follow-up) to show the prompt cache at work.
         #[arg(long)]
         two_turns: bool,
+        /// Attach an image (PNG, JPEG, WebP or GIF) to the user message; repeat
+        /// for several. Needs a model that reads images, such as the `vision` role.
+        #[arg(long = "image", value_name = "FILE")]
+        images: Vec<PathBuf>,
     },
     /// Count tokens of stdin under a model's tokenizer.
     Tokens {
@@ -978,6 +986,7 @@ fn import(
     doc_prefix: Option<String>,
     link: bool,
     replace: bool,
+    mmproj: Option<PathBuf>,
 ) -> Result<()> {
     let kind = match kind.as_deref() {
         Some("generation") => Some(ModelKind::Generation),
@@ -996,6 +1005,7 @@ fn import(
         doc_prefix,
         mode: if link { ImportMode::Symlink } else { ImportMode::Copy },
         replace,
+        projector: mmproj,
     };
     if !link {
         eprintln!("copying and hashing {} …", file.display());
@@ -1370,9 +1380,20 @@ fn chat(
     max_tokens: u32,
     temperature: f32,
     two_turns: bool,
+    images: &[PathBuf],
 ) -> Result<()> {
     let engine = ctx.engine()?;
     let artifact = ctx.resolve_generation(&engine, model)?;
+    if !images.is_empty() && !artifact.has(estia_engine::models::Capability::Vision) {
+        return Err(anyhow!("{} does not read images; try --model vision", artifact.id));
+    }
+    let images: Vec<estia_engine::proto::ImageData> = images
+        .iter()
+        .map(|p| {
+            let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+            estia_server::openai::image_from_bytes(&bytes).map_err(|e| anyhow!("{}: {e}", p.display()))
+        })
+        .collect::<Result<_>>()?;
     let input = read_stdin()?;
     let mut messages: Vec<Message> = if input.trim_start().starts_with('[') {
         serde_json::from_str(&input).context("stdin is not a JSON array of messages")?
@@ -1381,9 +1402,15 @@ fn chat(
         if let Some(sys) = system {
             m.push(Message::new("system", sys));
         }
-        m.push(Message::new("user", input));
+        m.push(Message::new("user", input).with_images(images.clone()));
         m
     };
+    if !images.is_empty() && !Message::any_images(&messages) {
+        // A JSON conversation on stdin: the images go with its last user turn.
+        if let Some(last) = messages.iter_mut().rev().find(|m| m.role == "user") {
+            last.images = Some(images);
+        }
+    }
     let tools: Option<Vec<serde_json::Value>> = match tools {
         Some(path) => Some(
             serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?)
@@ -2843,9 +2870,9 @@ async fn run_cli() -> Result<()> {
     match cli.cmd {
         Cmd::Models => models(&ctx),
         Cmd::Pull { id } => pull(&ctx, &id).await,
-        Cmd::Import { file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace } => {
+        Cmd::Import { file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace, mmproj } => {
             tokio::task::block_in_place(|| {
-                import(&ctx, &file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace)
+                import(&ctx, &file, id, kind, family, label, context_length, dims, query_prefix, doc_prefix, link, replace, mmproj)
             })
         }
         Cmd::Runner { .. } => unreachable!("handled above"),
@@ -2866,8 +2893,8 @@ async fn run_cli() -> Result<()> {
         }
         Cmd::Runtime { action } => runtime(&ctx, action).await,
         Cmd::RunnerCheck => tokio::task::block_in_place(|| runner_check(&ctx)),
-        Cmd::Chat { model, system, cache_key, tools, max_tokens, temperature, two_turns } => tokio::task::block_in_place(|| {
-            chat(&ctx, &model, system.as_deref(), cache_key.as_deref(), tools, max_tokens, temperature, two_turns)
+        Cmd::Chat { model, system, cache_key, tools, max_tokens, temperature, two_turns, images } => tokio::task::block_in_place(|| {
+            chat(&ctx, &model, system.as_deref(), cache_key.as_deref(), tools, max_tokens, temperature, two_turns, &images)
         }),
         Cmd::Tokens { model } => tokio::task::block_in_place(|| tokens(&ctx, &model)),
         Cmd::Setup { roles, no_models, variant } => setup(&ctx, &roles, no_models, variant.as_deref()).await,

@@ -17,7 +17,7 @@
 
 use super::embed::{self, EmbedArch, EmbedModel, Pooling};
 use super::gguf::{self, GgufMetadata};
-use super::registry::{self, Artifact, Capability, Format, ModelKind, GGUF_MODEL_FILE};
+use super::registry::{self, Artifact, Capability, Format, ModelKind, GGUF_MMPROJ_FILE, GGUF_MODEL_FILE};
 use super::store::ModelStore;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,20 @@ pub struct ImportOptions {
     pub mode: ImportMode,
     /// Replace an earlier import with the same id.
     pub replace: bool,
+    /// A generation model's image projector (a `clip` GGUF, often named
+    /// `mmproj-….gguf`), stored as `mmproj.gguf` beside the model. With it
+    /// the model reads images; without it, it is text-only.
+    pub projector: Option<PathBuf>,
+}
+
+/// A second file stored with an import: its projector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImportedFile {
+    /// Where it came from (absolute).
+    pub source_path: String,
+    /// SHA-256 of the stored file, lowercase hex.
+    pub sha256: String,
+    pub bytes: u64,
 }
 
 /// The manifest: everything needed to register the import again at startup.
@@ -115,6 +129,9 @@ pub struct ImportManifest {
     /// Unix seconds.
     #[serde(default)]
     pub imported_at: u64,
+    /// The image projector stored as `mmproj.gguf`, when one was imported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector: Option<ImportedFile>,
 }
 
 impl ImportManifest {
@@ -179,6 +196,22 @@ pub fn import_gguf(store: &ModelStore, source: &Path, opts: ImportOptions) -> Re
         tracing::warn!(model = %id, "imported generation model has no chat template; llama-server will fall back to a generic one");
     }
     let tools = meta.chat_template().is_some_and(|t| t.contains("tool"));
+    let projector = match &opts.projector {
+        None => None,
+        Some(_) if kind == ModelKind::Embedding => bail!("an image projector goes with a generation model, not an embedding model"),
+        Some(p) => {
+            let p = std::fs::canonicalize(p).with_context(|| format!("no projector file at {}", p.display()))?;
+            let pm = gguf::read_metadata(&p).with_context(|| format!("{} is not a GGUF file", p.display()))?;
+            if pm.architecture() != Some("clip") {
+                bail!(
+                    "{} is not an image projector (its architecture is {}, not clip)",
+                    p.display(),
+                    pm.architecture().unwrap_or("unknown")
+                );
+            }
+            Some(p)
+        }
+    };
 
     // Stage beside the destination and rename into place, so a failed copy
     // never leaves a half-written import that the next startup would load.
@@ -196,6 +229,20 @@ pub fn import_gguf(store: &ModelStore, source: &Path, opts: ImportOptions) -> Re
             ImportMode::Symlink => symlink_file(&source, &staged)?,
         }
         let (sha256, bytes) = sha256_file(&staged)?;
+        let projector = match &projector {
+            None => None,
+            Some(src) => {
+                let dst = staging.join(GGUF_MMPROJ_FILE);
+                match opts.mode {
+                    ImportMode::Copy => {
+                        std::fs::copy(src, &dst).with_context(|| format!("copy {} into the model store", src.display()))?;
+                    }
+                    ImportMode::Symlink => symlink_file(src, &dst)?,
+                }
+                let (sha256, bytes) = sha256_file(&dst)?;
+                Some(ImportedFile { source_path: src.display().to_string(), sha256, bytes })
+            }
+        };
         let manifest = ImportManifest {
             label: opts.label.clone().or_else(|| meta.name().map(str::to_string)).unwrap_or_else(|| id.clone()),
             family: opts.family.clone().unwrap_or_else(|| id.clone()),
@@ -216,6 +263,7 @@ pub fn import_gguf(store: &ModelStore, source: &Path, opts: ImportOptions) -> Re
             bytes,
             mode: opts.mode,
             imported_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            projector,
         };
         std::fs::write(staging.join(MANIFEST_FILE), serde_json::to_vec_pretty(&manifest)?).context("write the import manifest")?;
         if dest.exists() {
@@ -298,11 +346,13 @@ pub fn register(m: &ImportManifest) -> &'static Artifact {
         format: m.format,
         repo_id: "",
         revision: "",
-        required_disk_bytes: m.bytes,
-        capabilities: match (m.kind, m.tools) {
-            (ModelKind::Embedding, _) => &[Capability::Embed],
-            (ModelKind::Generation, true) => &[Capability::Text, Capability::Tools],
-            (ModelKind::Generation, false) => &[Capability::Text],
+        required_disk_bytes: m.bytes + m.projector.as_ref().map_or(0, |p| p.bytes),
+        capabilities: match (m.kind, m.tools, m.projector.is_some()) {
+            (ModelKind::Embedding, _, _) => &[Capability::Embed],
+            (ModelKind::Generation, true, true) => &[Capability::Text, Capability::Tools, Capability::Vision],
+            (ModelKind::Generation, true, false) => &[Capability::Text, Capability::Tools],
+            (ModelKind::Generation, false, true) => &[Capability::Text, Capability::Vision],
+            (ModelKind::Generation, false, false) => &[Capability::Text],
         },
         context_length: m.context_length,
         license: "unknown (imported)",

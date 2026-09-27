@@ -82,6 +82,17 @@ pub(crate) fn resolve_model(model_path: &str) -> Result<PathBuf, String> {
     Err(format!("model not found: {model_path}"))
 }
 
+/// The image projector's file name, next to a model's `model.gguf`. A
+/// generation model with one can read images (`--mmproj`); one without is
+/// text-only.
+pub const MMPROJ_FILE: &str = "mmproj.gguf";
+
+/// The projector for `model`, when there is one beside it.
+pub(crate) fn projector_for(model: &Path) -> Option<PathBuf> {
+    let p = model.parent()?.join(MMPROJ_FILE);
+    p.is_file().then_some(p)
+}
+
 /// The llama-server command line (after the program name).
 pub(crate) fn server_args(
     model: &Path,
@@ -89,6 +100,7 @@ pub(crate) fn server_args(
     endpoint: &Endpoint,
     key_file: &Path,
     ctx: Option<u32>,
+    projector: Option<&Path>,
     extra: &[String],
 ) -> Vec<OsString> {
     let mut a: Vec<OsString> = vec!["-m".into(), model.into()];
@@ -105,6 +117,9 @@ pub(crate) fn server_args(
         Kind::Generation => {
             let c = ctx.unwrap_or(DEFAULT_CTX).to_string();
             a.extend(["-np".into(), "1".into(), "-c".into(), c.into()]);
+            if let Some(p) = projector {
+                a.extend(["--mmproj".into(), p.into()]);
+            }
         }
         Kind::Embedding => {
             // No --pooling: the model's own pooling type from its GGUF
@@ -487,6 +502,8 @@ pub(crate) struct Server {
     /// Embedding models: the special tokens `add_special` adds to empty text,
     /// used to cut long inputs without losing them.
     pub specials: Option<Vec<i64>>,
+    /// Generation models: started with an image projector, so it reads images.
+    pub projector: bool,
     spawned: Instant,
     key_file: PathBuf,
 }
@@ -510,8 +527,9 @@ impl Server {
         write_private_file(&key_file, format!("{key}\n").as_bytes()).map_err(|e| format!("cannot write {}: {e}", key_file.display()))?;
         let record = run_dir.join(format!("llama-{pid}.json"));
 
+        let projector = if kind == Kind::Generation { projector_for(model) } else { None };
         let mut cmd = Command::new(&opts.server_bin);
-        cmd.args(server_args(model, kind, &endpoint, &key_file, opts.context_length, &opts.extra_args))
+        cmd.args(server_args(model, kind, &endpoint, &key_file, opts.context_length, projector.as_deref(), &opts.extra_args))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -615,6 +633,7 @@ impl Server {
             ready: false,
             log: log_tail,
             specials: None,
+            projector: projector.is_some(),
             spawned,
             key_file,
         })
@@ -688,6 +707,7 @@ mod tests {
             &Endpoint::Unix("/r/llama-1.sock".into()),
             Path::new("/r/llama-1.key"),
             None,
+            None,
             &["-ngl".into(), "0".into()],
         );
         assert_eq!(
@@ -712,10 +732,36 @@ mod tests {
                 "0"
             ]
         );
-        let a = server_args(Path::new("/m.gguf"), Kind::Generation, &Endpoint::Unix("/s".into()), Path::new("/k"), Some(2048), &[]);
+        let a = server_args(Path::new("/m.gguf"), Kind::Generation, &Endpoint::Unix("/s".into()), Path::new("/k"), Some(2048), None, &[]);
         let s = strs(&a);
         assert_eq!(&s[s.len() - 2..], ["-c", "2048"]);
         assert!(!s.contains(&"--embedding".to_string()));
+        // A projector beside the model makes it read images.
+        let a = server_args(
+            Path::new("/m/model.gguf"),
+            Kind::Generation,
+            &Endpoint::Unix("/s".into()),
+            Path::new("/k"),
+            None,
+            Some(Path::new("/m/mmproj.gguf")),
+            &[],
+        );
+        assert_eq!(&strs(&a)[strs(&a).len() - 2..], ["--mmproj", "/m/mmproj.gguf"]);
+    }
+
+    #[test]
+    fn projector_is_found_beside_the_model_only_by_its_fixed_name() {
+        let dir = std::env::temp_dir().join(format!("estia-mmproj-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        fs::write(&model, b"x").unwrap();
+        assert_eq!(projector_for(&model), None);
+        fs::write(dir.join("mmproj-other.gguf"), b"x").unwrap();
+        assert_eq!(projector_for(&model), None, "only the fixed name counts");
+        fs::write(dir.join(MMPROJ_FILE), b"x").unwrap();
+        assert_eq!(projector_for(&model), Some(dir.join(MMPROJ_FILE)));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -726,13 +772,14 @@ mod tests {
             &Endpoint::Tcp("127.0.0.1:4567".parse().unwrap()),
             Path::new("/k"),
             Some(99),
+            Some(Path::new("/p.gguf")),
             &[],
         );
         let s = strs(&a).join(" ");
         assert!(s.contains("--host 127.0.0.1 --port 4567"), "{s}");
         assert!(s.contains("--embedding -np 4 -c 2048 -b 2048 -ub 2048"), "{s}");
-        // --ctx is for generation models only; no pooling override.
-        assert!(!s.contains("-c 99") && !s.contains("--pooling"), "{s}");
+        // --ctx and --mmproj are for generation models only; no pooling override.
+        assert!(!s.contains("-c 99") && !s.contains("--pooling") && !s.contains("--mmproj"), "{s}");
     }
 
     #[cfg(unix)]

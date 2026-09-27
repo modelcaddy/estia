@@ -50,6 +50,11 @@ pub enum Capability {
 /// `<models_dir>/<artifact id>/`. Fixed, so the llama adapter never guesses.
 pub const GGUF_MODEL_FILE: &str = "model.gguf";
 
+/// The image projector of a multimodal GGUF artifact, beside `model.gguf`.
+/// The llama.cpp adapter starts `llama-server --mmproj` with it when present
+/// (the same name is fixed in `estia-llama`).
+pub const GGUF_MMPROJ_FILE: &str = "mmproj.gguf";
+
 /// One file of an artifact that lists its files explicitly (every GGUF
 /// artifact does: a GGUF repository often holds many quantisations).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -130,13 +135,12 @@ impl Artifact {
     }
 }
 
-/// Gemma 4, on either backend: text, and tool calls in its chat template's
+/// Gemma 4, on either backend: text, tool calls in its chat template's
 /// native `<|tool_call>` syntax (the MLX runner renders and parses it;
-/// llama-server parses it for the GGUF artifacts). The models are multimodal,
-/// but no image reaches them yet: the MLX runner loads them text-only and the
-/// GGUF artifacts do not fetch their `mmproj` projector. So none advertises
-/// `Vision` until the API passes images to the model (ROADMAP L9).
-const GEMMA4_CAPS: &[Capability] = &[Capability::Text, Capability::Tools];
+/// llama-server parses it for the GGUF artifacts), and images: the MLX
+/// artifacts carry their vision tower, and every GGUF artifact fetches its
+/// `mmproj` projector as `mmproj.gguf`.
+const GEMMA4_CAPS: &[Capability] = &[Capability::Text, Capability::Tools, Capability::Vision];
 
 /// Every generation artifact the engine ships knowledge of, in the order a
 /// picker should list them. Per family, the first artifact of a format is
@@ -206,9 +210,8 @@ pub const GENERATION_MODELS: &[Artifact] = &[
     // Google's own quantisation-aware-trained Q4_0 GGUF files (not gated,
     // Apache-2.0 per the model cards). Revisions are commits; sizes and
     // SHA-256 are from the Hugging Face tree listing at that commit. Each
-    // repository also holds an `mmproj` projector (E2B/E4B
-    // `gemma-4-E?B-it-mmproj.gguf`, 12B `mmproj-gemma-4-12b-it-qat-q4_0.gguf`),
-    // fetched as `mmproj.gguf` once the API passes images (L9).
+    // repository also holds the model's image projector, fetched as
+    // `mmproj.gguf` (about 1 GB for E2B and E4B, 175 MB for 12B).
     Artifact {
         id: "gemma4-e4b-it-qat-q4_0-gguf",
         family: "gemma4-e4b",
@@ -217,16 +220,24 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         format: Format::Gguf,
         repo_id: "google/gemma-4-E4B-it-qat-q4_0-gguf",
         revision: "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
-        required_disk_bytes: 5_154_941_280,
+        required_disk_bytes: 6_146_493_536,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
-        files: &[ArtifactFile {
-            remote: "gemma-4-E4B_q4_0-it.gguf",
-            local: GGUF_MODEL_FILE,
-            bytes: 5_154_941_280,
-            sha256: "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
-        }],
+        files: &[
+            ArtifactFile {
+                remote: "gemma-4-E4B_q4_0-it.gguf",
+                local: GGUF_MODEL_FILE,
+                bytes: 5_154_941_280,
+                sha256: "676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee",
+            },
+            ArtifactFile {
+                remote: "gemma-4-E4B-it-mmproj.gguf",
+                local: GGUF_MMPROJ_FILE,
+                bytes: 991_552_256,
+                sha256: "7498a37cb619e55f2fcf87eb931f56e99389ed6d432e4c5c66110694c0d65578",
+            },
+        ],
     },
     Artifact {
         id: "gemma4-12b-it-qat-q4_0-gguf",
@@ -236,16 +247,24 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         format: Format::Gguf,
         repo_id: "google/gemma-4-12B-it-qat-q4_0-gguf",
         revision: "29d097773436b69ff9feafd636ab4cf873786537",
-        required_disk_bytes: 6_975_879_296,
+        required_disk_bytes: 7_150_994_912,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
-        files: &[ArtifactFile {
-            remote: "gemma-4-12b-it-qat-q4_0.gguf",
-            local: GGUF_MODEL_FILE,
-            bytes: 6_975_879_296,
-            sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
-        }],
+        files: &[
+            ArtifactFile {
+                remote: "gemma-4-12b-it-qat-q4_0.gguf",
+                local: GGUF_MODEL_FILE,
+                bytes: 6_975_879_296,
+                sha256: "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+            },
+            ArtifactFile {
+                remote: "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
+                local: GGUF_MMPROJ_FILE,
+                bytes: 175_115_616,
+                sha256: "cb018338a7538a9814d994bfe54644c71eb7ed54e31eae2f721e45fd3c260da7",
+            },
+        ],
     },
     Artifact {
         id: "gemma4-e2b-it-qat-q4_0-gguf",
@@ -255,16 +274,24 @@ pub const GENERATION_MODELS: &[Artifact] = &[
         format: Format::Gguf,
         repo_id: "google/gemma-4-E2B-it-qat-q4_0-gguf",
         revision: "675cff42a74c774d6cb76f76d8eacb49b48c9b93",
-        required_disk_bytes: 3_349_516_256,
+        required_disk_bytes: 4_336_349_920,
         capabilities: GEMMA4_CAPS,
         context_length: Some(32_768),
         license: "Apache-2.0",
-        files: &[ArtifactFile {
-            remote: "gemma-4-E2B_q4_0-it.gguf",
-            local: GGUF_MODEL_FILE,
-            bytes: 3_349_516_256,
-            sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
-        }],
+        files: &[
+            ArtifactFile {
+                remote: "gemma-4-E2B_q4_0-it.gguf",
+                local: GGUF_MODEL_FILE,
+                bytes: 3_349_516_256,
+                sha256: "fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634",
+            },
+            ArtifactFile {
+                remote: "gemma-4-E2B-it-mmproj.gguf",
+                local: GGUF_MMPROJ_FILE,
+                bytes: 986_833_664,
+                sha256: "021059cce659fe7f9170d5599761d7bbaf644b798dab9503aca30dc43e6beb14",
+            },
+        ],
     },
 ];
 
@@ -411,19 +438,29 @@ mod tests {
 
     #[test]
     fn gemma4_advertises_what_reaches_the_model() {
-        // Tools work on both backends; images reach neither yet, so no
-        // artifact claims vision, and a family's formats agree.
+        // Text, tools and images reach the model on both backends, and a
+        // family's formats agree.
         for a in GENERATION_MODELS {
-            assert!(a.has(Capability::Text) && a.has(Capability::Tools), "{}", a.id);
-            assert!(!a.has(Capability::Vision), "{} must not claim vision before images reach the model", a.id);
+            assert!(a.has(Capability::Text) && a.has(Capability::Tools) && a.has(Capability::Vision), "{}", a.id);
             for other in GENERATION_MODELS.iter().filter(|o| o.family == a.family) {
                 assert_eq!(a.capabilities, other.capabilities, "{} vs {}", a.id, other.id);
             }
         }
-        assert!(!family_has("gemma4-e4b", Capability::Vision));
-        assert!(family_has("gemma4-e2b", Capability::Tools));
+        assert!(family_has("gemma4-e4b", Capability::Vision));
         let json = serde_json::to_value(find_artifact("gemma4-e4b-it-4bit-mlx").unwrap().capabilities).unwrap();
-        assert_eq!(json, serde_json::json!(["text", "tools"]));
+        assert_eq!(json, serde_json::json!(["text", "tools", "vision"]));
+    }
+
+    #[test]
+    fn vision_gguf_artifacts_fetch_their_projector() {
+        // A GGUF model reads images only with its projector beside it; the
+        // disk it needs counts both files.
+        for a in GENERATION_MODELS.iter().filter(|a| a.format == Format::Gguf) {
+            let locals: Vec<&str> = a.files.iter().map(|f| f.local).collect();
+            assert_eq!(locals, [GGUF_MODEL_FILE, GGUF_MMPROJ_FILE], "{}", a.id);
+            assert_eq!(a.required_disk_bytes, a.files.iter().map(|f| f.bytes).sum::<u64>(), "{}", a.id);
+            assert!(a.files.iter().all(|f| f.sha256.len() == 64), "{}", a.id);
+        }
     }
 
     #[test]
@@ -441,12 +478,16 @@ mod tests {
         for a in GENERATION_MODELS.iter().filter(|a| a.format == Format::Gguf) {
             assert_eq!(a.revision.len(), 40, "{} must pin a commit", a.id);
             assert!(a.revision.bytes().all(|b| b.is_ascii_hexdigit()), "{}", a.id);
-            assert_eq!(a.files.len(), 1, "{}: weights only until images are supported", a.id);
-            let f = a.files[0];
-            assert_eq!(f.local, GGUF_MODEL_FILE);
-            assert!(f.remote.ends_with(".gguf") && !f.remote.contains("mmproj"), "{}", a.id);
-            assert_eq!(f.sha256.len(), 64);
-            assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            assert_eq!(a.files.len(), 2, "{}: the weights and the image projector", a.id);
+            let (model, projector) = (a.files[0], a.files[1]);
+            assert_eq!(model.local, GGUF_MODEL_FILE);
+            assert!(model.remote.ends_with(".gguf") && !model.remote.contains("mmproj"), "{}", a.id);
+            assert_eq!(projector.local, GGUF_MMPROJ_FILE);
+            assert!(projector.remote.ends_with(".gguf") && projector.remote.contains("mmproj"), "{}", a.id);
+            for f in a.files {
+                assert_eq!(f.sha256.len(), 64);
+                assert!(f.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            }
             assert_eq!(a.listed_bytes(), Some(a.required_disk_bytes));
             assert_eq!(a.license, "Apache-2.0");
             assert!(a.id.ends_with("-gguf"));

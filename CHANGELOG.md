@@ -14,7 +14,25 @@ and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
-Nothing yet.
+### Image input
+
+- Chat messages can carry images: OpenAI `image_url` parts with a `data:` URL
+  (PNG, JPEG, WebP, GIF), in `user` messages, up to 8 per request and 20 MB
+  each. Remote URLs are refused (the engine never fetches for a client), as
+  are unknown content-part types, which used to be replaced by a text marker.
+- The Gemma 4 models read them on both backends, so they advertise `vision`
+  again and the `vision` role requires it. On MLX the runner (2.4.0) passes
+  images to mlx-vlm's vision tower, after converting to RGB and cropping to
+  the content when it is a small island on a plain background (a measured
+  gain on rendered pages). On llama.cpp each GGUF artifact now downloads its
+  image projector (`mmproj.gguf`) and the adapter starts `llama-server
+  --mmproj`; `estia import --mmproj <file>` does the same for your own
+  models.
+- A request with images for a model or runner that cannot read them is a 400
+  that says so. Image turns bypass the prompt cache.
+- `estia chat --image <file>` attaches images from the terminal.
+- Protocol: `Message.images` (`{mime, data}` base64) and
+  `capabilities.images`.
 
 ## 0.4.0 — 2026-09-27
 

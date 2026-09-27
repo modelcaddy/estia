@@ -27,7 +27,7 @@ until `unload` or until the process exits. A failed request answers
 
 | Request | Answer |
 |---|---|
-| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.3.0","protocol":2,"capabilities":{…}}` |
+| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.4.0","protocol":2,"capabilities":{…}}` |
 | `{"type":"load","model_path":…,"kind":"generation"\|"embedding"}` | `{"ok":true,"loaded":true,"ms":N}` |
 | `{"type":"unload","model_path":…}` | `{"ok":true,"unloaded":true\|false}` |
 | `{"type":"chat","model_path":…,"messages":[…],"tools":[…],"cache_key":…,"format":…,"max_tokens":…,"temperature":…}` | `{"text":"…","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,"template":…,"generation_tps":…,"finish_reason":…}}` |
@@ -41,6 +41,10 @@ template; an assistant message's `tool_calls` are structured, so the template
 renders the `tool` results that answer them. `cache_key` keeps the KV cache for one conversation, so the next
 turn only prefills the new suffix. `meta.finish_reason` is `length` when
 `max_tokens` ran out, `tool_calls` when the text holds a call, else `stop`.
+
+A user message may carry `images`: `[{"mime":"image/png","data":"<base64>"}]`.
+The runner decodes each to RGB, places it before the message text, and passes
+it to the model's vision tower. An image turn is not prompt-cached.
 
 The v1 requests still work: `ping`, `generate`, `generate_stream`, `embed`
 and `embed_batch`. The docstring at the top of `estia-runner.py` lists every
@@ -57,7 +61,7 @@ as well as between tokens.
 The engine sends `hello` once after it starts the process. A runner that
 answers `hello` with an error is treated as protocol v1 with no capabilities.
 `estia-runner.py` declares `generate`, `stream`, `embed`, `cancel`, `load`,
-`chat`, `tools`, `prompt_cache` and `count_tokens`, with `backend:
+`chat`, `tools`, `images`, `prompt_cache` and `count_tokens`, with `backend:
 "mlx-python"` and `parses_tool_calls: false`. Its `structured` list is empty:
 it cannot constrain decoding, so the engine never sends it `format`. Instead
 the server puts the schema in the prompt and validates and repairs the output.

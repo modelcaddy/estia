@@ -35,8 +35,9 @@ breaking changes before 1.0.
   Gemma 4 generation families and four embedding models, with an MLX
   artifact, a GGUF artifact or both. On the llama.cpp backend, `estia import`
   adds a GGUF file of your own.
-- **Text only through the API.** Image parts in chat messages are replaced by
-  a text marker before they reach the model.
+- **Images in, text out.** Chat messages can carry images (PNG, JPEG, WebP,
+  GIF as `data:` URLs), and the Gemma 4 models read them on both backends.
+  There is no audio or video input yet.
 
 [ROADMAP.md](ROADMAP.md) lists what is planned, in order, with the check that
 closes each item.
@@ -299,8 +300,9 @@ their SHA-256.
 running backend's artifact; an artifact id downloads that artifact. Roles
 resolve the same way: `"model": "fast"` answers from
 `gemma4-e2b-it-4bit-mlx` on MLX and from `gemma4-e2b-it-qat-q4_0-gguf` on
-llama.cpp. The files for image input (`mmproj`) are not downloaded yet,
-because the API does not pass images.
+llama.cpp. Each GGUF artifact also downloads its image projector
+(`mmproj.gguf`: about 1 GB for E2B and E4B, 175 MB for 12B), which is what
+lets llama.cpp read images; the sizes above are the model file alone.
 
 These GGUF artifacts have not been run through Estia yet: their names, sizes
 and hashes were checked against Hugging Face, but the files (3.35 GB and up)
@@ -507,7 +509,7 @@ model family, so clients do not hard-code model names.
 |---|---|---|---|
 | `text` | text | `gemma4-e4b` | error |
 | `fast` | text | `gemma4-e2b` | falls back to `text` |
-| `vision` | text (vision once a model advertises it) | `gemma4-e4b` | falls back to `text` |
+| `vision` | vision | `gemma4-e4b` | falls back to `text` |
 | `code` | text | none | falls back to `text` |
 | `embed` | embedding | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`; `embeddinggemma-300m-q8_0-gguf` on llama.cpp) |
 
@@ -523,10 +525,9 @@ estia roles rm code                      # back to the fallback
 ```
 
 A binding is checked against the family's capabilities: `embed` needs an
-embedding model (built-in or imported), and every other name needs text.
-`vision` needs text for now: image input is not passed through the API yet,
-so no model advertises `vision`, and the role will require it once one
-does. Bindings are stored in
+embedding model (built-in or imported), `vision` a model that reads images
+(every Gemma 4 family does; an imported GGUF does when it was imported with
+`--mmproj`), and every other name needs text. Bindings are stored in
 `config.json`. A running server reads that file when it starts, so restart it
 after `estia roles set`, or change roles live with `PUT /engine/defaults`
 (admin scope) or the Setup tab of `/client`.

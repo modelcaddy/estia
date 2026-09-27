@@ -127,6 +127,9 @@ pub fn capabilities() -> estia_proto::Capabilities {
         count_tokens: true,
         structured: vec!["json".into(), "json_schema".into()],
         parses_tool_calls: true,
+        // Read only by a model started with a projector (`mmproj.gguf`);
+        // images for one without get a clear error, not silence.
+        images: true,
         backend: Some("llama-cpp".into()),
     }
 }
@@ -307,13 +310,24 @@ impl Adapter {
             Source::Prompt => prompt_body(req)?,
         };
         self.ensure(seq, &model, Want::Kind(Kind::Generation), stream.then_some(out))?;
+        let images = matches!(source, Source::Messages) && has_images(req);
+        if images && !self.server.as_ref().is_some_and(|s| s.projector) {
+            return Err(msg(format!(
+                "this model cannot read images: there is no image projector ({}) beside {}",
+                server::MMPROJ_FILE,
+                model.display()
+            )));
+        }
 
         // One slot. It reuses its cached prefix only for the conversation
         // that filled it: a new key, or no key, starts cold, so
-        // `cached_tokens` never reveals another conversation's prompt.
+        // `cached_tokens` never reveals another conversation's prompt. A turn
+        // with images never reuses, and leaves the slot to nobody: image
+        // embeddings sit in the cache as placeholders that do not compare
+        // like text.
         let key = match source {
-            Source::Messages => req.get("cache_key").and_then(Value::as_str).filter(|k| !k.is_empty()),
-            Source::Prompt => None,
+            Source::Messages if !images => req.get("cache_key").and_then(Value::as_str).filter(|k| !k.is_empty()),
+            _ => None,
         };
         let reuse = key.is_some() && key == self.slot_key.as_deref();
         // Until this request succeeds nobody owns the slot: a request that
@@ -644,16 +658,39 @@ fn sampling(body: &mut Value, req: &Value) {
     body["chat_template_kwargs"] = json!({"enable_thinking": false});
 }
 
+/// Whether any message in a `chat` request carries images.
+fn has_images(req: &Value) -> bool {
+    req.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|ms| ms.iter().any(|m| m.get("images").and_then(Value::as_array).is_some_and(|i| !i.is_empty())))
+}
+
 fn map_message(m: &Value) -> Result<Value, Fail> {
     let o = m.as_object().ok_or_else(|| msg("each message must be an object"))?;
     let role = o.get("role").and_then(Value::as_str).ok_or_else(|| msg("each message needs a role"))?;
-    let content = match o.get("content") {
+    let mut content = match o.get("content") {
         None | Some(Value::Null) => Value::String(String::new()),
         Some(Value::String(s)) => Value::String(s.clone()),
         // OpenAI content parts; llama-server takes text parts.
         Some(Value::Array(parts)) => Value::Array(parts.clone()),
         Some(_) => return Err(msg("message content must be a string")),
     };
+    // Images become OpenAI `image_url` parts with a data URL, before the
+    // text, which is where Gemma's template puts them.
+    if let Some(images) = o.get("images").and_then(Value::as_array).filter(|i| !i.is_empty()) {
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        for img in images {
+            let mime = img.get("mime").and_then(Value::as_str).ok_or_else(|| msg("each image needs a mime"))?;
+            let data = img.get("data").and_then(Value::as_str).ok_or_else(|| msg("each image needs data"))?;
+            parts.push(json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{data}")}}));
+        }
+        match content {
+            Value::String(t) if !t.is_empty() => parts.push(json!({"type": "text", "text": t})),
+            Value::Array(existing) => parts.extend(existing),
+            _ => {}
+        }
+        content = Value::Array(parts);
+    }
     let mut out = Map::new();
     out.insert("role".into(), json!(role));
     out.insert("content".into(), content);
@@ -986,6 +1023,30 @@ mod tests {
         let got = ask(&mut a, json!({"type": "load", "model_path": model, "kind": "vision"}));
         assert!(got[0]["error"].as_str().unwrap().contains("unknown model kind"), "{got:?}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn images_become_data_url_parts_before_the_text() {
+        let req = json!({"messages": [
+            {"role": "user", "content": "What is in this picture?", "images": [
+                {"mime": "image/png", "data": "iVBORw0KGgo="},
+                {"mime": "image/jpeg", "data": "/9j/4AAQ"}
+            ]},
+            {"role": "assistant", "content": "A cat."},
+            {"role": "user", "content": "", "images": [{"mime": "image/webp", "data": "UklGRg=="}]}
+        ]});
+        assert!(has_images(&req));
+        let body = chat_body(&req).unwrap();
+        let m = &body["messages"];
+        assert_eq!(m[0]["content"][0], json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}));
+        assert_eq!(m[0]["content"][1]["image_url"]["url"], "data:image/jpeg;base64,/9j/4AAQ");
+        assert_eq!(m[0]["content"][2], json!({"type": "text", "text": "What is in this picture?"}));
+        assert_eq!(m[1]["content"], "A cat.", "a turn without images stays a string");
+        assert_eq!(m[2]["content"].as_array().unwrap().len(), 1, "no empty text part");
+        assert!(m[0].get("images").is_none(), "images are not passed on as a field");
+        assert!(!has_images(&json!({"messages": [{"role": "user", "content": "hi"}]})));
+        let bad = json!({"messages": [{"role": "user", "content": "x", "images": [{"data": "AAAA"}]}]});
+        assert!(chat_body(&bad).is_err(), "an image without a mime is refused");
     }
 
     #[test]

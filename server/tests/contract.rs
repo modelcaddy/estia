@@ -557,11 +557,11 @@ async fn a_client_that_leaves_during_prefill_cancels_it() {
     }
 }
 
-/// api-F8: models list what reaches them through the API. Image parts are
-/// not passed to the model, so no model says `vision`, on /v1/models or
-/// /engine/models; the `vision` role still binds (to a text model).
+/// api-F8: models list what reaches them through the API. Images reach the
+/// Gemma 4 models, so each says `vision` on /v1/models and /engine/models,
+/// and the `vision` role binds to one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn no_model_claims_vision() {
+async fn models_claim_vision_only_when_images_reach_them() {
     if !python3_available() {
         eprintln!("skip: python3 not available");
         return;
@@ -573,12 +573,12 @@ async fn no_model_claims_vision() {
         v["data"].as_array().unwrap().iter().filter(|m| m["x_estia"]["family"].is_string() && m["x_estia"]["role"].is_null()).collect();
     assert!(!gen.is_empty(), "{v}");
     for m in gen {
-        assert_eq!(m["x_estia"]["capabilities"], json!(["text", "tools"]), "{m}");
+        assert_eq!(m["x_estia"]["capabilities"], json!(["text", "tools", "vision"]), "{m}");
     }
     let (s, v) = get(&h, "/engine/models").await;
     assert_eq!(s, 200);
     for m in v["generation"].as_array().unwrap() {
-        assert!(!m["capabilities"].as_array().unwrap().contains(&json!("vision")), "{m}");
+        assert!(m["capabilities"].as_array().unwrap().contains(&json!("vision")), "{m}");
     }
     let (s, defaults) = get(&h, "/engine/defaults").await;
     assert_eq!(s, 200);

@@ -353,6 +353,39 @@ you declare can be called, and nothing runs on the engine.
 Examples: [`python/tools.py`](../examples/python/tools.py), `quickstart.sh`
 step 9.
 
+## Images
+
+Send an image in a `user` message as an OpenAI `image_url` part with a
+`data:` URL, and ask a model that reads images: the `vision` role, or any
+Gemma 4 family. [examples/python/vision.py](../examples/python/vision.py)
+does this with a file from disk.
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:27200/v1", api_key=token)
+data = base64.b64encode(open("invoice.png", "rb").read()).decode()
+r = client.chat.completions.create(
+    model="vision",
+    temperature=0,
+    messages=[{"role": "user", "content": [
+        {"type": "text", "text": "What is the total on this invoice?"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{data}"}},
+    ]}],
+)
+print(r.choices[0].message.content)
+```
+
+- Inline data only: a remote URL is refused, so fetch it yourself and send
+  the bytes.
+- PNG, JPEG, WebP or GIF; at most 20 MB each and 8 per request.
+- Use temperature 0 for reading text in a picture: sampling is what makes a
+  legible page come back as "no text".
+- A model that cannot read images answers 400, never with a guess that
+  ignores the picture.
+- Image requests are not served from the prompt cache.
+
 ## Embeddings
 
 ```python
@@ -441,6 +474,8 @@ out, so `ps` can show 100 MB for a model that holds 3.8 GB. In Rust,
 | `max_tokens` | default 1024, at most 8192 | Lowered to 8192 without an error |
 | `temperature` | default 0.2 | |
 | Inputs per embedding request | 256 | 400 |
+| Images per request | 8, in `user` messages | 400 |
+| Image size | 20 MB decoded | 413 |
 | Request body | 32 MiB, unless the operator changed it (`estia serve --max-body-bytes`, `ESTIA_MAX_BODY_BYTES`) | 413, with the limit in the message |
 | `max_attempts` on `/engine/generate` | 1 to 3 | Held to that range |
 | Pending pairing requests | 24, and 4 per client address | 429 `rate_limit_error` |
@@ -639,7 +674,7 @@ what order.
   ([design/llama-backend.md](design/llama-backend.md) has the status). Ask
   by role, not artifact id, and store embedding fingerprints, and your app
   works on either backend unchanged.
-- Image parts in messages are replaced by a text marker.
+- Images are read, but there is no audio or video input.
 - A non-streaming request is not cancelled when its client disconnects.
 - `tool_choice`, `n`, `stop` and `top_p` are accepted and ignored, on both
   backends. Plan for it: leave `tools` out rather than sending

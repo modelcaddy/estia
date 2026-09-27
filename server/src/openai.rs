@@ -14,7 +14,8 @@ use axum::{
     Json,
 };
 use estia_engine::models::embed::EmbedTask;
-use estia_engine::proto::{Capabilities, Message};
+use estia_engine::models::{Artifact, Capability};
+use estia_engine::proto::{Capabilities, ImageData, Message};
 use estia_engine::structured::{self, OutputFormat, Structured};
 use estia_engine::{CancelToken, Priority};
 use serde::Deserialize;
@@ -64,37 +65,162 @@ pub struct ChatCompletionRequest {
     pub priority: Option<String>,
 }
 
-/// Flatten OpenAI content (a string, or an array of `{type:"text",text}` parts)
-/// to text. Non-text parts are dropped with a marker.
-fn content_text(v: &Option<Value>) -> String {
+/// At most this many images in one request, across all its messages.
+pub const MAX_IMAGES_PER_REQUEST: usize = 8;
+
+/// The largest image accepted, decoded: 20 MiB.
+pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// The text and the images of OpenAI message content: a string, or an array
+/// of parts. `text` parts are joined with newlines; `image_url` parts must be
+/// `data:` URLs (the engine never fetches a URL on a client's behalf). Any
+/// other part type is refused rather than silently dropped.
+fn content_parts(v: &Option<Value>) -> Result<(String, Vec<ImageData>), ApiError> {
     match v {
-        None => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .map(|p| match p.get("type").and_then(Value::as_str) {
-                Some("text") => p.get("text").and_then(Value::as_str).unwrap_or("").to_string(),
-                Some(other) => format!("[{other} omitted]"),
-                None => p.as_str().unwrap_or("").to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Some(other) => other.to_string(),
+        None | Some(Value::Null) => Ok((String::new(), Vec::new())),
+        Some(Value::String(s)) => Ok((s.clone(), Vec::new())),
+        Some(Value::Array(parts)) => {
+            let mut texts = Vec::new();
+            let mut images = Vec::new();
+            for p in parts {
+                match p.get("type").and_then(Value::as_str) {
+                    Some("text") => texts.push(p.get("text").and_then(Value::as_str).unwrap_or("").to_string()),
+                    Some("image_url") => {
+                        let url = match p.get("image_url") {
+                            Some(Value::String(u)) => u.as_str(),
+                            Some(o) => o.get("url").and_then(Value::as_str).unwrap_or(""),
+                            None => "",
+                        };
+                        images.push(image_from_data_url(url)?);
+                    }
+                    Some(other) => {
+                        return Err(ApiError::bad_request(format!(
+                            "content part type `{other}` is not supported; send `text` and `image_url` parts"
+                        )))
+                    }
+                    None => texts.push(p.as_str().unwrap_or("").to_string()),
+                }
+            }
+            Ok((texts.join("\n"), images))
+        }
+        Some(other) => Ok((other.to_string(), Vec::new())),
     }
 }
 
-pub(crate) fn to_messages(msgs: &[OaiMessage]) -> Vec<Message> {
-    msgs.iter()
-        .map(|m| Message {
-            role: m.role.clone(),
-            content: content_text(&m.content),
-            name: m.name.clone(),
-            tool_call_id: m.tool_call_id.clone(),
-            // Passed through structured: chat templates render a `tool` result
-            // only after the assistant turn whose `tool_calls` it answers.
-            tool_calls: m.tool_calls.clone().filter(|c| !c.is_empty()),
-        })
-        .collect()
+/// A `data:image/...;base64,...` URL as an image the runner can take. The
+/// format is read from the bytes, not trusted from the URL.
+pub(crate) fn image_from_data_url(url: &str) -> Result<ImageData, ApiError> {
+    use base64::Engine as _;
+    let url = url.trim();
+    let Some(rest) = url.strip_prefix("data:") else {
+        let shown: String = url.chars().take(40).collect();
+        return Err(ApiError::bad_request(format!(
+            "image URLs are not fetched: send the image itself as a data URL (data:image/png;base64,...), not `{shown}`"
+        )));
+    };
+    let (header, payload) = rest.split_once(',').ok_or_else(|| ApiError::bad_request("an image data URL needs a comma before its data"))?;
+    let mut fields = header.split(';');
+    let declared = fields.next().unwrap_or("").trim().to_ascii_lowercase();
+    if !fields.any(|f| f.trim().eq_ignore_ascii_case("base64")) {
+        return Err(ApiError::bad_request("image data URLs must be base64 (data:image/png;base64,...)"));
+    }
+    if !["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"].contains(&declared.as_str()) {
+        return Err(ApiError::bad_request(format!("image type `{declared}` is not supported; send PNG, JPEG, WebP or GIF")));
+    }
+    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    // Rough size check before decoding: base64 is 4 characters per 3 bytes.
+    if compact.len() / 4 * 3 > MAX_IMAGE_BYTES + 3 {
+        return Err(ApiError::payload_too_large(format!("an image is over the {} MB limit", MAX_IMAGE_BYTES / (1024 * 1024))));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&compact)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&compact))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&compact))
+        .map_err(|_| ApiError::bad_request("image data is not valid base64"))?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(ApiError::payload_too_large(format!("an image is over the {} MB limit", MAX_IMAGE_BYTES / (1024 * 1024))));
+    }
+    image_from_bytes(&bytes).map_err(ApiError::bad_request)
+}
+
+/// An image file's bytes as an image a runner can take: the format read from
+/// the bytes (PNG, JPEG, WebP or GIF), the data base64. Hosts that embed the
+/// engine use this to attach a picture from disk.
+pub fn image_from_bytes(bytes: &[u8]) -> Result<ImageData, String> {
+    use base64::Engine as _;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!("the image is over the {} MB limit", MAX_IMAGE_BYTES / (1024 * 1024)));
+    }
+    let mime = sniff_image(bytes).ok_or("image data is not a PNG, JPEG, WebP or GIF file")?;
+    Ok(ImageData { mime: mime.to_string(), data: base64::engine::general_purpose::STANDARD.encode(bytes) })
+}
+
+/// The image format from its first bytes.
+fn sniff_image(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// OpenAI messages as runner messages, with their images. Refuses images
+/// outside user turns and more than [`MAX_IMAGES_PER_REQUEST`] in total.
+pub(crate) fn to_messages(msgs: &[OaiMessage]) -> Result<Vec<Message>, ApiError> {
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let (content, images) = content_parts(&m.content)?;
+        if !images.is_empty() && m.role != "user" {
+            return Err(ApiError::bad_request(format!("images are accepted in user messages only, not in a `{}` message", m.role)));
+        }
+        total += images.len();
+        if total > MAX_IMAGES_PER_REQUEST {
+            return Err(ApiError::bad_request(format!("at most {MAX_IMAGES_PER_REQUEST} images per request")));
+        }
+        out.push(
+            Message {
+                role: m.role.clone(),
+                content,
+                name: m.name.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+                // Passed through structured: chat templates render a `tool` result
+                // only after the assistant turn whose `tool_calls` it answers.
+                tool_calls: m.tool_calls.clone().filter(|c| !c.is_empty()),
+                images: None,
+            }
+            .with_images(images),
+        );
+    }
+    Ok(out)
+}
+
+/// Refuse images for a model or runner that cannot read them, rather than
+/// answering as if the images were not there.
+pub(crate) fn check_images(messages: &[Message], artifact: &Artifact, caps: Option<&Capabilities>) -> Result<(), ApiError> {
+    if !Message::any_images(messages) {
+        return Ok(());
+    }
+    if !artifact.has(Capability::Vision) {
+        return Err(ApiError::bad_request(format!(
+            "model `{}` does not read images; use the `vision` role or another model that does",
+            artifact.id
+        )));
+    }
+    if caps.is_some_and(|c| !c.images) {
+        return Err(ApiError::bad_request(format!(
+            "the runner serving `{}` cannot take images; it is older than this engine",
+            artifact.id
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_response_format(v: &Option<Value>) -> Result<OutputFormat, ApiError> {
@@ -212,7 +338,8 @@ pub async fn chat_completions(
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
-    let messages = to_messages(&req.messages);
+    let messages = to_messages(&req.messages)?;
+    check_images(&messages, artifact, None)?;
     let format = parse_response_format(&req.response_format)?;
     let tools = req.tools.clone().filter(|t| !t.is_empty());
     // Per token: another token sending the same `user` gets its own entry.
@@ -234,6 +361,7 @@ pub async fn chat_completions(
         a.loaded(ms);
     }
     let caps = session.capabilities();
+    check_images(&messages, artifact, Some(&caps))?;
     let parses_calls = caps.parses_tool_calls;
     let constrain = runner_format(&caps, &format, tools.is_some());
     // A runner that cannot constrain decoding (MLX) is shown the schema in
@@ -641,4 +769,106 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Json<Value> {
                         "installed": artifact.is_some_and(|a| store.is_installed(a.id))}}));
     }
     Json(json!({"object": "list", "data": data}))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    fn data_url(mime: &str, bytes: &[u8]) -> String {
+        format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    fn user(content: Value) -> OaiMessage {
+        OaiMessage { role: "user".into(), content: Some(content), name: None, tool_call_id: None, tool_calls: None }
+    }
+
+    #[test]
+    fn data_urls_become_images_with_the_sniffed_type() {
+        let img = image_from_data_url(&data_url("image/png", PNG)).unwrap();
+        assert_eq!(img.mime, "image/png");
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&img.data).unwrap(), PNG);
+        // The type is read from the bytes: a PNG declared as JPEG is a PNG.
+        assert_eq!(image_from_data_url(&data_url("image/jpg", PNG)).unwrap().mime, "image/png");
+        let jpeg = image_from_data_url(&data_url("image/jpeg", &[0xFF, 0xD8, 0xFF, 0xE0, 0, 0])).unwrap();
+        assert_eq!(jpeg.mime, "image/jpeg");
+        let webp = image_from_data_url(&data_url("image/webp", b"RIFF\0\0\0\0WEBPVP8 ")).unwrap();
+        assert_eq!(webp.mime, "image/webp");
+        // Whitespace and URL-safe base64 are tolerated.
+        let spaced = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(PNG).replace('A', "A\n"));
+        assert!(image_from_data_url(&spaced).is_ok());
+    }
+
+    #[test]
+    fn what_is_not_an_inline_image_is_refused() {
+        let msg = |url: &str| image_from_data_url(url).unwrap_err().message;
+        assert!(msg("https://example.com/cat.png").contains("not fetched"));
+        assert!(msg("file:///etc/passwd").contains("not fetched"));
+        assert!(msg("data:image/png,rawbytes").contains("base64"));
+        assert!(msg("data:image/svg+xml;base64,PHN2Zz4=").contains("not supported"));
+        assert!(msg("data:image/png;base64,!!!notbase64!!!").contains("base64"));
+        assert!(msg(&data_url("image/png", b"GIF-looking but not")).contains("not a PNG"));
+        let big = vec![0u8; MAX_IMAGE_BYTES + 16];
+        let err = image_from_data_url(&data_url("image/png", &big)).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn messages_carry_images_from_user_turns_only() {
+        let url = data_url("image/png", PNG);
+        let msgs = vec![user(json!([
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": url}},
+            {"type": "text", "text": "Be brief."}
+        ]))];
+        let out = to_messages(&msgs).unwrap();
+        assert_eq!(out[0].content, "What is this?\nBe brief.");
+        assert_eq!(out[0].images.as_ref().unwrap().len(), 1);
+        // The bare-string form of image_url works too.
+        let out = to_messages(&[user(json!([{"type": "image_url", "image_url": url}]))]).unwrap();
+        assert!(Message::any_images(&out));
+        // Not in a system message.
+        let sys = OaiMessage { role: "system".into(), ..user(json!([{"type": "image_url", "image_url": {"url": url}}])) };
+        assert!(to_messages(&[sys]).unwrap_err().message.contains("user messages only"));
+        // Unknown part types are refused, not dropped.
+        let err = to_messages(&[user(json!([{"type": "input_audio", "input_audio": {}}]))]).unwrap_err();
+        assert!(err.message.contains("input_audio"));
+        // At most MAX_IMAGES_PER_REQUEST across the request.
+        let many: Vec<Value> = (0..=MAX_IMAGES_PER_REQUEST).map(|_| json!({"type": "image_url", "image_url": {"url": url}})).collect();
+        assert!(to_messages(&[user(Value::Array(many))]).unwrap_err().message.contains("at most"));
+        // Plain strings stay plain.
+        let out = to_messages(&[user(json!("hi"))]).unwrap();
+        assert!(out[0].images.is_none());
+    }
+
+    #[test]
+    fn images_need_a_vision_model_and_runner() {
+        let text_only = Artifact {
+            id: "t",
+            family: "t",
+            label: "t",
+            kind: estia_engine::models::ModelKind::Generation,
+            format: estia_engine::models::Format::Gguf,
+            repo_id: "",
+            revision: "",
+            required_disk_bytes: 0,
+            capabilities: &[Capability::Text],
+            context_length: None,
+            license: "",
+            files: &[],
+        };
+        let with_image = vec![Message::new("user", "x").with_images(vec![ImageData { mime: "image/png".into(), data: "AA==".into() }])];
+        let plain = vec![Message::new("user", "x")];
+        assert!(check_images(&plain, &text_only, None).is_ok());
+        assert!(check_images(&with_image, &text_only, None).unwrap_err().message.contains("does not read images"));
+        let vision = estia_engine::models::find_artifact("gemma4-e2b-it-4bit-mlx").unwrap();
+        assert!(check_images(&with_image, vision, None).is_ok());
+        let old_runner = Capabilities { chat: true, ..Default::default() };
+        assert!(check_images(&with_image, vision, Some(&old_runner)).unwrap_err().message.contains("cannot take images"));
+        let runner = Capabilities { images: true, ..Default::default() };
+        assert!(check_images(&with_image, vision, Some(&runner)).is_ok());
+    }
 }
