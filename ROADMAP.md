@@ -39,7 +39,7 @@ it fix problems builders hit today; they are short and do not wait for it.
 macOS, Linux and Windows, for CPU, Metal, Vulkan, CUDA (NVIDIA), ROCm and HIP
 (AMD) and SYCL (Intel). One backend brings Linux servers, Windows desktops,
 Intel Macs, CPU-only machines and discrete GPUs. It also constrains decoding
-to a JSON Schema, and its download is 12 to 33 MB for CPU, Metal or Vulkan,
+to a JSON Schema, and its download is 11 to 31 MB for CPU, Metal or Vulkan,
 against about 700 MB for the Python runtime.
 
 **What.** From [docs/design/llama-backend.md](docs/design/llama-backend.md):
@@ -75,7 +75,7 @@ one backend must be re-embedded before it is searched from the other, and
 | L6 | Prompt-cache isolation between tokens, and more than one cache slot |
 | L7 | CI on Linux and macOS with a tiny model; release archives for Linux and Intel macOS |
 | L8 | Benchmarks against MLX on the same Mac; a decision on the Mac default |
-| L9 | Images and audio (after the protocol change in item 6) |
+| L9 | Images and audio (after the protocol change in item 5) |
 
 **Exit check.** On a fresh Ubuntu 24.04 machine with no GPU:
 `estia setup --roles fast,embed`, then `estia serve`, then
@@ -110,56 +110,7 @@ the backend, and the `/client` page in a browser; after SIGTERM no
 chat and embeddings on the same build. The design's
 [status block](docs/design/llama-backend.md#status) has the details.
 
-### 2. Tool results and JSON Schemas reach the model
-
-**Why.** Both are bugs, and both push builders into workarounds that
-`docs/building-clients.md` and the examples have to explain. A tool loop is
-the first thing many assistants build.
-
-**What.**
-
-- Add `tool_calls` to the runner protocol's `Message`, and pass an assistant's
-  calls to the runner as structured data, so the model's chat template renders
-  the tool turn and the `{"role": "tool"}` result after it.
-- Pass `response_format` to the runner as `format`. For a runner that cannot
-  constrain decoding (MLX), the engine adds the schema to the system prompt.
-  For one that can (llama.cpp, slice L3), decoding follows the schema. The
-  engine still validates.
-
-**Exit check.** `examples/python/tools.py`, changed to send results as
-`{"role": "tool"}`, answers from the tool's result, and the prompt token count
-grows when the tool message is added. `examples/python/structured.py`, with
-the schema removed from its prompt, returns valid JSON in 10 of 10 runs on
-`fast`. The workarounds are removed from the guide and the examples.
-
-**Status (2026-09-27): done on MLX; on llama.cpp the mechanics are in place
-and Gemma 4 is untested.**
-
-- Tool results: `Message.tool_calls` carries an assistant's calls to the
-  runner as structured data, and both runners hand them to the chat template.
-  On MLX with `gemma4-e2b`, `tools.py` now sends `{"role": "tool"}` and
-  answered from the result for 5 questions out of 5, in each of two
-  separate runs. Gemma 4's template leaves the model's turn open
-  after a tool result, and the 4-bit E2B model often ended the turn there
-  with no text (3 of those 5 questions, at every temperature tried), so the
-  MLX runner now asks once more in a new model turn when that happens. On
-  llama.cpp the structured calls and results reach `llama-server` and its
-  template: with a tool-capable template passed through `ESTIA_LLAMA_ARGS`,
-  the prompt grew from 190 tokens (question) to 267 (with the call and a short
-  result) and 317 (a longer result). tinygemma3, the only model run, never
-  calls a tool, so a tool call parsed by `llama-server` and Gemma 4's answer
-  from a result are unchecked.
-- JSON Schemas: on llama.cpp the adapter constrains decoding (ten
-  `/engine/generate` calls and `structured.py`: `attempts: 1`,
-  `repaired: false`). A grammar cannot stop `max_tokens` from cutting a long
-  string short; that output fails validation and is retried like any other.
-  On MLX the engine adds the schema to the system prompt; `structured.py`
-  with the schema removed from its prompt returned valid JSON in 10 runs out
-  of 10 on `fast` (`gemma4-e2b`), none repaired.
-- The workarounds are gone from `tools.py`, `structured.py`,
-  `quickstart.sh`, `in_process.rs` and the guide.
-
-### 3. Request lifetime: body timeout, cancel on disconnect
+### 2. Request lifetime: body timeout, cancel on disconnect
 
 **Why.** A client that gives up on a non-streaming request still holds the
 model until the generation ends, and everyone behind it waits. A client that
@@ -175,7 +126,7 @@ after it is not delayed by the rest of the 600 tokens. A connection that sends
 headers and then stops sending its body is closed within the limit, and the
 limit is in [docs/api.md](docs/api.md#limits).
 
-### 4. mlx-vlm 0.7
+### 3. mlx-vlm 0.7
 
 **Why.** The runtime installs `mlx-vlm>=0.6.13,<0.7`. 0.7 changed its
 dependency set (it no longer pulls in `mlx-lm`), and the runner has not been
@@ -191,7 +142,7 @@ passes for all three Gemma 4 families and the default embedding model, and
 
 ## Soon
 
-### 5. TLS on the LAN
+### 4. TLS on the LAN
 
 **Why.** A LAN engine sends tokens, prompts and outputs in plain text. Today
 the advice is to serve the LAN only on a network you trust, or use an SSH
@@ -211,7 +162,7 @@ different certificate at the same address. `estia remote-check`,
 `remote_client.rs` and the Python examples work with the pinned certificate,
 and the guide shows how.
 
-### 6. Image input through `/v1`
+### 5. Image input through `/v1`
 
 **Why.** The `vision` role exists and Gemma 4 E2B and E4B are multimodal, but
 image parts in a message are replaced by a text marker.
@@ -227,7 +178,7 @@ PNG describes the image, on MLX and on llama.cpp. A remote `image_url` gets
 400. An image over the size limit gets 400. The marker is gone from
 [docs/api.md](docs/api.md).
 
-### 7. Role options and `embed` rebinding
+### 6. Role options and `embed` rebinding
 
 **Why.** A role can store `temperature`, `max_tokens` and `pin`, and the
 server ignores all three, so an operator's setting silently does nothing.
@@ -246,7 +197,7 @@ role's model is still loaded after `--idle-unload-minutes 1` has passed.
 `"model": "embed"` return 384 dimensions and the fingerprint
 `multilingual-e5-small-mlx@mlx-python`.
 
-### 8. Fair sharing between clients
+### 7. Fair sharing between clients
 
 **Why.** Many devices can share one engine, and each loaded model serves one
 call at a time. Today one client that sends a burst of requests at the same
@@ -261,9 +212,9 @@ after: B's request is served second, not sixth. A token over its limit gets
 429 with `Retry-After`. `/engine/stats` shows the waiting calls per token
 name.
 
-### 9. A conformance suite for runners
+### 8. A conformance suite for runners
 
-**Why.** The llama adapter will be the second resident runner, and anyone who
+**Why.** The llama adapter is the second resident runner, and anyone who
 writes a runner for another backend needs a way to show that it follows
 protocol v2. The engine's tests use a fake runner; they test the engine, not
 the runner.
@@ -277,7 +228,7 @@ child processes are left. It grows out of the L1 and L7 tests.
 same checks) passes for the MLX runner and the llama adapter in CI. A runner
 that ignores `cancel` fails with a message that names the check.
 
-### 10. Thin SDKs for Python and TypeScript
+### 9. Thin SDKs for Python and TypeScript
 
 **Why.** The OpenAI SDKs cover chat and embeddings. Everything else a builder
 writes by hand: pairing and saving the token, discovery, checking
@@ -295,6 +246,30 @@ are shorter and give the same results in the same live runs. The packages
 install from PyPI and npm. A `RemoteEngine` 401 can be matched on its status
 instead of its text, and carries the request id.
 
+### 10. Embeddings without mlx-embeddings
+
+**Why.** On MLX the runner embeds through `mlx-embeddings`, which is
+GPL-3.0; the rest of the MLX path (`mlx`, `mlx-lm`, `mlx-vlm`) is MIT. Estia
+does not ship `mlx-embeddings`: `estia runtime install` fetches it from PyPI.
+But a host app that bundles or installs the MLX runtime next to closed-source
+code combines it with GPL code at run time, and the default `embed` model
+goes through it. It is pinned to 0.1.0 so that its licence cannot change
+unnoticed, which also means it gets no upstream fixes.
+
+**What.** Do the embedding in the runner on `mlx` and `mlx-lm`: EmbeddingGemma
+on `mlx-lm`'s `gemma3_text` model, with mean pooling, its dense projection
+layers and normalisation; and the BERT-family models in the registry
+(ModernBERT, Nomic Embed, multilingual E5) as small encoder definitions in the
+runner with their own pooling. Then drop `mlx-embeddings` from the packages
+the runtime installs.
+
+**Exit check.** After a clean `estia runtime install`, `pip list` in the
+runtime shows no `mlx-embeddings`, and `grep -rn mlx_embeddings runners/`
+finds nothing. For each built-in MLX embedding model, vectors for a fixed set
+of texts have a cosine similarity above 0.999 with the vectors 0.4.0 returns,
+so indexes built on 0.4.0 stay valid. `scripts/smoke-test.sh` passes with the
+default `embed` model.
+
 ## Later
 
 ### 11. Packages: Homebrew, `.deb`, Windows installer
@@ -302,7 +277,7 @@ instead of its text, and carries the request id.
 **Why.** Building from source asks too much of people who only want to run
 an engine.
 
-**What.** In order: a Homebrew tap for macOS, which can come as soon as there
+**What.** In order: a Homebrew tap for macOS, which can come now that there
 is a tagged release, since the macOS tarball already exists; a `.deb` for
 Ubuntu and Debian once the llama backend ships Linux archives (slice L7); a
 Windows installer once Estia builds on Windows and has a way to run as a
@@ -332,8 +307,8 @@ headers. Without the flag, behaviour is exactly as today.
 
 ### 13. The llama.cpp default on Apple Silicon
 
-**Why.** llama.cpp on a Mac would replace a 700 MB Python runtime with a
-12 MB download. Published numbers put its generation 12 to 18 percent behind
+**Why.** llama.cpp on a Mac would replace a 700 MB Python runtime with an
+11 MB download. Published numbers put its generation 12 to 18 percent behind
 MLX on Gemma 4 E4B.
 
 **What.** Decide from slice L8's benchmarks, run on the same Mac as the MLX
@@ -351,6 +326,60 @@ These are too small for a section but are on the list:
   on the rate `mlx-vlm` measures.
 - Answer `/v1/models` differently for artifacts the active backend cannot
   load (open question 5 in the llama design).
+
+## Done in 0.4.0
+
+Items from this list that shipped. [CHANGELOG.md](CHANGELOG.md) has the full
+0.4.0 entry.
+
+### Tool results and JSON Schemas reach the model
+
+**Why.** Both were bugs, and both pushed builders into workarounds that
+`docs/building-clients.md` and the examples had to explain. A tool loop is
+the first thing many assistants build.
+
+**What.**
+
+- `tool_calls` was added to the runner protocol's `Message`, and an
+  assistant's calls go to the runner as structured data, so the model's chat
+  template renders the tool turn and the `{"role": "tool"}` result after it.
+- `response_format` goes to the runner as `format`. For a runner that cannot
+  constrain decoding (MLX), the engine adds the schema to the system prompt.
+  For one that can (llama.cpp, slice L3), decoding follows the schema. The
+  engine still validates.
+
+**Exit check.** `examples/python/tools.py`, changed to send results as
+`{"role": "tool"}`, answers from the tool's result, and the prompt token count
+grows when the tool message is added. `examples/python/structured.py`, with
+the schema removed from its prompt, returns valid JSON in 10 of 10 runs on
+`fast`. The workarounds are removed from the guide and the examples.
+
+**Status (2026-09-27): shipped in 0.4.0. Done on MLX; on llama.cpp the
+mechanics are in place and Gemma 4 is untested.**
+
+- Tool results: `Message.tool_calls` carries an assistant's calls to the
+  runner as structured data, and both runners hand them to the chat template.
+  On MLX with `gemma4-e2b`, `tools.py` now sends `{"role": "tool"}` and
+  answered from the result for 5 questions out of 5, in each of two
+  separate runs. Gemma 4's template leaves the model's turn open
+  after a tool result, and the 4-bit E2B model often ended the turn there
+  with no text (3 of those 5 questions, at every temperature tried), so the
+  MLX runner now asks once more in a new model turn when that happens. On
+  llama.cpp the structured calls and results reach `llama-server` and its
+  template: with a tool-capable template passed through `ESTIA_LLAMA_ARGS`,
+  the prompt grew from 190 tokens (question) to 267 (with the call and a short
+  result) and 317 (a longer result). tinygemma3, the only model run, never
+  calls a tool, so a tool call parsed by `llama-server` and Gemma 4's answer
+  from a result are unchecked.
+- JSON Schemas: on llama.cpp the adapter constrains decoding (ten
+  `/engine/generate` calls and `structured.py`: `attempts: 1`,
+  `repaired: false`). A grammar cannot stop `max_tokens` from cutting a long
+  string short; that output fails validation and is retried like any other.
+  On MLX the engine adds the schema to the system prompt; `structured.py`
+  with the schema removed from its prompt returned valid JSON in 10 runs out
+  of 10 on `fast` (`gemma4-e2b`), none repaired.
+- The workarounds are gone from `tools.py`, `structured.py`,
+  `quickstart.sh`, `in_process.rs` and the guide.
 
 ## Helping
 

@@ -1,7 +1,7 @@
 # Examples
 
 Small programs that use Estia, one idea each. They are meant to be read and
-copied. Every one of them was run against a live engine. Those that need a
+copied. Every one of them was run against a live MLX engine. Those that need a
 token exit with a clear message when it is missing, unknown or lacks a scope.
 
 The concepts behind them are explained in
@@ -30,8 +30,10 @@ The concepts behind them are explained in
    estia serve        # http://127.0.0.1:27200
    ```
 
-   The examples work on either backend, MLX or llama.cpp: they ask for roles
-   (`fast`, `embed`), never for artifact ids.
+   The HTTP examples ask for roles (`fast`, `embed`), never artifact ids, so
+   they are written to work on either backend. They were run on MLX; on
+   llama.cpp they have not been run with the Gemma 4 models yet.
+   `in_process.rs` runs MLX only (Apple Silicon).
 
 2. You have a token.
 

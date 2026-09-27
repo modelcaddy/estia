@@ -59,7 +59,7 @@ operator swaps a model.
 | `fast` | `gemma4-e2b` | falls back to `text` |
 | `vision` | `gemma4-e4b` | falls back to `text` |
 | `code` | none | falls back to `text` |
-| `embed` | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`) |
+| `embed` | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`; `embeddinggemma-300m-q8_0-gguf` on llama.cpp) |
 
 `model` also accepts a family (`gemma4-e2b`) or an artifact id
 (`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family, and a family
@@ -175,9 +175,9 @@ hostname, and the TXT record has three keys:
 
 ```text
 $ dns-sd -B _estia._tcp
-  Add  ...  local.  _estia._tcp.  MacBook-Pro-5
-$ dns-sd -L MacBook-Pro-5 _estia._tcp local.
-  MacBook-Pro-5._estia._tcp.local. can be reached at MacBook-Pro-5.local.:27200
+  Add  ...  local.  _estia._tcp.  studio
+$ dns-sd -L studio _estia._tcp local.
+  studio._estia._tcp.local. can be reached at studio.local.:27200
   api_version=1 engine_version=0.4.0 protocol_version=2
 ```
 
@@ -214,10 +214,12 @@ Rules that follow from how it works:
   same way then share one entry. Send `user`.
 - Sending the same messages again (a regenerate) reuses all of the prompt but
   its last few tokens, the ones that open the model's turn.
-- The runner keeps a small number of conversation caches per loaded model (8
-  today), least recently used out first. An idle unload or a runner restart
-  drops them all. After a cancelled turn, the next one reuses whatever part of
-  the prompt was prefilled before the cancel.
+- The runner keeps a small number of conversation caches per loaded model,
+  least recently used out first: 8 on MLX, 1 on llama.cpp today, so on
+  llama.cpp two conversations that alternate each prefill from scratch. An
+  idle unload or a runner restart drops them all. After a cancelled turn,
+  the next one reuses whatever part of the prompt was prefilled before the
+  cancel.
 
 Examples: [`python/chat.py`](../examples/python/chat.py),
 [`javascript/chat.mjs`](../examples/javascript/chat.mjs),
@@ -398,10 +400,10 @@ Other facts: at most 256 inputs per request (more is a 400, so batch);
 the OpenAI SDKs ask for when you pass nothing, and decode for you), so either
 way the SDK hands you numbers; `usage` is reported as zero; `embed` means
 EmbeddingGemma 300M (768 dimensions) unless the operator binds it to another
-model. The snippets pass `"float"` anyway: engines from before base64
-support (0.4.0 and earlier) always send arrays, and the JavaScript SDK, unless
-it asked for `"float"`, decodes those arrays as base64 into wrong numbers (192
-of them for a 768-dimension vector). The native `POST /engine/embed` takes
+model. The snippets pass `"float"` anyway: builds before 0.4.0 always sent
+arrays, and against those the JavaScript SDK, unless it asked for `"float"`,
+decodes the arrays as base64 into wrong numbers (192 of them for a
+768-dimension vector). The native `POST /engine/embed` takes
 `inputs` and returns `vectors`, `fingerprint` and `dims` at the top level.
 
 Examples: [`python/rag.py`](../examples/python/rag.py) (explains the choice of
@@ -632,10 +634,11 @@ Examples: [`remote_client.rs`](../engine/examples/remote_client.rs),
 what order.
 
 - The llama.cpp backend is new. It has run end to end only on an Apple
-  Silicon Mac with small test models; the Gemma 4 GGUF files, Linux and
-  Windows are untested ([design/llama-backend.md](design/llama-backend.md)
-  has the status). Ask by role, not artifact id, and store embedding
-  fingerprints, and your app works on either backend unchanged.
+  Silicon Mac with small test models; the Gemma 4 GGUF files and Linux
+  (outside CI) are untested, and Estia does not build for Windows yet
+  ([design/llama-backend.md](design/llama-backend.md) has the status). Ask
+  by role, not artifact id, and store embedding fingerprints, and your app
+  works on either backend unchanged.
 - Image parts in messages are replaced by a text marker.
 - A non-streaming request is not cancelled when its client disconnects.
 - `tool_choice`, `n`, `stop` and `top_p` are accepted and ignored, on both

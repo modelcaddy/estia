@@ -6,7 +6,9 @@ which build is running, and how a release is made.
 ## Which build is running
 
 `estia --version` prints one line: the version, the commit it was built from
-and the UTC day it was built.
+and the UTC day it was built. The samples in this section come from a
+development build made before the release, so they show `+dirty`; a release
+binary shows the tag's commit without it.
 
 ```console
 $ estia --version
@@ -336,28 +338,39 @@ old build keep working until `estia runtime install` is run again.
 
    A tag with a hyphen (`v0.5.0-rc.1`) makes a pre-release; the crate version
    must then be `0.5.0-rc.1` as well.
-7. **Check the release** as described below. The workflow leaves the release
-   notes empty; add a link to the CHANGELOG section.
+7. **Check the release** as described below. The release notes link the
+   version's CHANGELOG section, so the tagged commit must have it.
 
 ### What the release workflow produces
 
-Pushing a `v*` tag runs `.github/workflows/release.yml` on a pinned macOS
-Apple Silicon runner. It:
+Pushing a `v*` tag runs `.github/workflows/release.yml`. Its build runs on a
+pinned macOS Apple Silicon runner. It:
 
-1. stops unless the tag, minus the `v`, equals the version of the `estia`
-   crate;
-2. builds `cargo build --release --locked -p estia --target
+1. waits for a successful CI run (`ci.yml`, from a push or a manual run) on
+   the tagged commit, up to an hour, and stops if there is none. To release
+   a commit CI has not run on, run CI on the tag first:
+   `gh workflow run ci.yml --ref vX.Y.Z`;
+2. stops unless the tag, minus the `v`, equals the version of the `estia`
+   crate, and, for a final version, unless `CHANGELOG.md` has a
+   `## X.Y.Z — YYYY-MM-DD` section (a pre-release links `Unreleased`);
+3. builds `cargo build --release --locked -p estia --target
    aarch64-apple-darwin`, for macOS 11 and later;
-3. packs `estia-X.Y.Z-aarch64-apple-darwin.tar.gz`: the `estia` binary,
+4. packs `estia-X.Y.Z-aarch64-apple-darwin.tar.gz`: the `estia` binary,
    `runners/mlx-python/*.py`, `LICENSE`, `NOTICE`, `README.md` and
    `THIRD_PARTY_LICENSES` (the licences of the Rust crates in the binary),
    and writes its SHA-256 to `estia-X.Y.Z-aarch64-apple-darwin.tar.gz.sha256`;
-4. checks the tarball it just made: the hash, the files, `estia --version`
+5. checks the tarball it just made: the hash, the files, `estia --version`
    and `estia version`, that `estia version --json` names the tag's commit
    (the first 9 hex digits, without `+dirty`), and that `estia status`, run
    from an unrelated directory, finds the runner inside the tarball;
-5. creates a GitHub release for the tag with the two files, marked as a
-   pre-release when the tag has a hyphen.
+6. creates a GitHub release for the tag with the two files and notes that
+   link the version's CHANGELOG section, marked as a pre-release when the
+   tag has a hyphen.
+
+Only the last step has a token that can write to the repository. It runs in
+its own job, which checks the tarball's SHA-256 again and builds nothing; the
+build job's token is read-only. Third-party actions are pinned to commit
+SHAs.
 
 There is no Linux or Intel macOS archive yet. The binary is not signed with a
 Developer ID or notarized: macOS blocks a copy downloaded with a browser until
@@ -382,9 +395,9 @@ tar -xzf estia-0.4.0-aarch64-apple-darwin.tar.gz
 git rev-parse 'v0.4.0^{commit}' | cut -c1-9
 ```
 
-The two `curl` lines have not been run: no release existed when this page was
-written. The other commands were run on a tarball with the same layout, built
-locally.
+The two `curl` lines have not been run yet; they will be checked against the
+v0.4.0 release. The other commands were run on a tarball with the same
+layout, built locally.
 
 ## Build information
 

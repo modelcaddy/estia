@@ -49,9 +49,12 @@ cargo deny check
 cargo +1.89.0 check --workspace --all-targets --all-features --locked   # the minimum Rust version
 ```
 
-`rustfmt.toml` sets the line width. `deny.toml` sets the dependency policy:
-permissive licences only (no GPL, AGPL, LGPL or other copyleft) and crates.io
-sources only. Install the tool with `cargo install cargo-deny --locked`.
+`rustfmt.toml` sets the line width. `deny.toml` sets the policy for the Rust
+dependency graph: permissive licences only (no GPL, AGPL, LGPL or other
+copyleft) and crates.io sources only. It does not cover the Python packages
+the MLX runtime installs at run time; the README's
+[Licence](README.md#licence) section lists those. Install the tool with
+`cargo install cargo-deny --locked`.
 
 Release tarballs include `THIRD_PARTY_LICENSES`, the licence texts of the
 crates compiled into `estia`, built by
@@ -98,7 +101,7 @@ client authors would notice.
 ## Commits and pull requests
 
 - Keep a pull request to one change, and explain why in its description.
-- Write commit subjects as `type(scope): summary`, for example
+- Prefer `type(scope): summary` for commit subjects, for example
   `docs(server): describe the token scopes`. Types: `feat`, `fix`, `docs`,
   `refactor`, `test`, `chore`. Scopes: `engine`, `server`, `cli`, `proto`,
   `llama`, `runners`, `client`, `ci`.

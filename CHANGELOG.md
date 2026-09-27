@@ -144,7 +144,12 @@ See [docs/versioning.md](docs/versioning.md).
   build instructions name the Linux packages (a C compiler, `pkg-config`,
   the OpenSSL headers). `examples/README.md` points to the smoke test.
 - **Release workflow:** the packaged binary must report the tag's commit,
-  without `+dirty` (`estia version --json`), or the release stops.
+  without `+dirty` (`estia version --json`), or the release stops. It
+  releases only a commit on which CI passed, and a final version only when
+  `CHANGELOG.md` has its section, which the release notes link. It builds
+  with a read-only token; a separate job, the only one that can write,
+  publishes the tarball after checking its SHA-256 again. Third-party
+  actions are pinned to commit SHAs.
 - A second `estia serve` on a data directory that already has an engine now
   says "one engine per data directory" instead of "one engine per machine",
   which was wrong: engines with different data directories can run side by
@@ -242,12 +247,28 @@ re-tested live on a scratch engine; the ids are the run's finding ids.
   `estia pair` subcommand, argument and option has help text. `pair.py` and
   `estia pair request` stop waiting at 290 s, before the engine drops an
   undecided request at 300 s, and say so, instead of ending on a 404. The
-  API reference documents the fields MLX ignores (`tool_choice`, `stop`,
-  `n`), `/engine/stats`, and the new fields and limits above.
+  API reference documents the fields Estia accepts and ignores
+  (`tool_choice`, `stop`, `n`), `/engine/stats`, and the new fields and
+  limits above.
 - **MLX runner 2.3.0** carries the runner side of these: chunked prefill,
   `meta.finish_reason`, the conversation cache, and a cancelled stream that
   records exactly what its cache holds.
 
+### Licences
+
+- `estia pull` and `estia setup` print a model's licence before they
+  download it. For the Gemma Terms of Use (EmbeddingGemma) they add the links
+  to the terms and the prohibited-use policy; a vendor licence Estia has no
+  links for points to the model's Hugging Face card. `estia models` has a
+  licence column, and the Models table in `/client` a Licence column.
+- The MLX runtime install pins `mlx-embeddings` to 0.1.0. It is GPL-3.0;
+  Estia does not ship it, and `estia runtime install` fetches it from PyPI.
+  The pin does not force a reinstall.
+
+### Other fixes
+
+- `estia import --label`, `--query-prefix` and `--doc-prefix` each have
+  their own help text.
 - `estia setup` no longer writes a `backend` key into `config.json` when the
   backend is only this machine's default; running it again changes nothing.
   An explicit `--backend` (or `ESTIA_BACKEND`) is still saved.

@@ -53,6 +53,7 @@ th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line
 th { color: var(--mute); font-weight: 500; font-size: 12px; }
 .tbl { overflow-x: auto; }
 .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .mute { color: var(--mute); }
+a { color: var(--accent); }
 .bar { height: 6px; background: var(--code); border-radius: 3px; overflow: hidden; margin-top: 4px; min-width: 120px; }
 .bar > i { display: block; height: 100%; background: var(--accent); width: 0; transition: width .3s; }
 .msgs { display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow-y: auto; margin-bottom: 10px; }
@@ -136,8 +137,8 @@ button { touch-action: manipulation; }
   <div class="card">
     <h2>Models</h2>
     <div class="row"><button class="b" id="btnModels">Refresh</button><span class="note" id="modelsDir"></span></div>
-    <div class="tbl"><table><thead><tr><th>Model</th><th>Kind</th><th>Size</th><th>State</th><th></th></tr></thead><tbody id="models"></tbody></table></div>
-    <p class="note">Pull and delete need <code>models:write</code>.</p>
+    <div class="tbl"><table><thead><tr><th>Model</th><th>Kind</th><th>Licence</th><th>Size</th><th>State</th><th></th></tr></thead><tbody id="models"></tbody></table></div>
+    <p class="note">Each model comes under its own licence; read it before you pull. Pull and delete need <code>models:write</code>.</p>
   </div>
   <div class="card">
     <h2>Roles</h2>
@@ -213,6 +214,15 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 // talks to whatever URL is typed in, and that server's JSON is untrusted.
 const num = (x) => { const n = Number(x); return Number.isFinite(n) ? n : 0; };
 const fmtBytes = (n) => n == null ? "—" : n < 1e6 ? (n / 1e3).toFixed(0) + " KB" : n < 1e9 ? (n / 1e6).toFixed(0) + " MB" : (n / 1e9).toFixed(2) + " GB";
+// Where to read a model licence that is not an SPDX id: the same pages
+// `estia pull` prints (license_links in cli/src/main.rs).
+const LICENSE_LINKS = new Map([
+  ["Gemma Terms of Use", [["terms", "https://ai.google.dev/gemma/terms"], ["prohibited use", "https://ai.google.dev/gemma/prohibited_use_policy"]]],
+]);
+const licenseCell = (l) => {
+  const links = LICENSE_LINKS.get(l);
+  return esc(l ?? "—") + (links ? "<br>" + links.map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`).join(" · ") : "");
+};
 const fmtDur = (s) => s < 60 ? s + "s" : s < 3600 ? Math.floor(s / 60) + "m" : Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
 
 const defaultBase = location.protocol.startsWith("http") ? location.origin : "http://127.0.0.1:27200";
@@ -420,11 +430,11 @@ async function loadModels() {
       const act = m.installed ? `<button class="b s" data-del="${esc(m.id)}">Delete</button>` : `<button class="b s" data-pull="${esc(m.id)}">${m.pulling ? "Watch" : m.partial_bytes ? "Resume" : "Pull"}</button>`;
       const fmt = m.format ? ` · ${esc(m.format)}` + (m.runnable === false ? ` <span class="mute">(other backend)</span>` : "") : "";
       const kind = (m.kind === "embedding" ? `embedding · ${num(m.dims)}d` : `${esc(m.family)} · ${esc((m.capabilities || []).join(", "))}`) + fmt;
-      return `<tr><td><div class="mono">${esc(m.id)}</div><div class="mute">${esc(m.label)}</div><div id="pp-${esc(m.id)}"></div></td><td>${kind}</td><td class="mono">${size}</td><td>${state}</td><td>${act}</td></tr>`;
+      return `<tr><td><div class="mono">${esc(m.id)}</div><div class="mute">${esc(m.label)}</div><div id="pp-${esc(m.id)}"></div></td><td>${kind}</td><td>${licenseCell(m.license)}</td><td class="mono">${size}</td><td>${state}</td><td>${act}</td></tr>`;
     }).join("");
     for (const m of rows) if (m.pulling) watchPull(m.id);
     renderRoles();
-  } catch (e) { tb.innerHTML = `<tr><td colspan="5" class="bad">${esc(e.message)}</td></tr>`; }
+  } catch (e) { tb.innerHTML = `<tr><td colspan="6" class="bad">${esc(e.message)}</td></tr>`; }
 }
 $("btnModels").onclick = loadModels;
 $("models").addEventListener("click", async (e) => {

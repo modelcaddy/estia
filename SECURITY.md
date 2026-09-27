@@ -31,12 +31,12 @@ show a practical impact beyond what is described here are welcome.
   `--local`.
 - **Pairing trusts the operator's judgement.** Any device on the LAN can send a
   pairing request, with a name and scopes of its choosing. It gets a token only
-  after you approve it with `estia pair approve <id>` or a host app. Names are
-  limited to printable letters, digits and a little punctuation so they cannot
-  rewrite your terminal, and `estia pair approve` refuses a request for
-  `admin` without `--allow-admin`. The HTTP approve route and the `/client`
-  Admin tab grant exactly what was asked. Denying an approved pairing revokes
-  its token.
+  after you approve it with `estia pair approve <id>` or an app that embeds
+  Estia and holds an admin token. Names are limited to printable letters,
+  digits and a little punctuation so they cannot rewrite your terminal, and
+  `estia pair approve` refuses a request for `admin` without
+  `--allow-admin`. The HTTP approve route and the `/client` Admin tab grant
+  exactly what was asked. Denying an approved pairing revokes its token.
 - **Host names.** The server refuses a request whose `Host` is not an IP
   address, `localhost`, a `.local` name, the machine's hostname or a name you
   allowed (`--allow-host`, `ESTIA_ALLOWED_HOSTS`), and a cross-origin browser
@@ -55,9 +55,16 @@ show a practical impact beyond what is described here are welcome.
 - **`--no-auth` is for testing.** It accepts requests without a token, and the
   server refuses it on any address but loopback. Every local process can then
   use the engine. Web pages cannot, thanks to the Host and Origin checks.
-- **Downloaded code and weights.** The MLX backend runs on a Python runtime
-  that `estia setup` downloads. The Python build is checked against a SHA-256
-  pinned in the source. The MLX packages are then installed from PyPI with
-  pip, with minimum versions and no hash check. Model weights come from
-  Hugging Face; large (LFS) files are checked against the SHA-256 that
-  Hugging Face publishes. Estia trusts PyPI and Hugging Face.
+- **Downloaded code and weights.** `estia setup` downloads code and weights
+  for the backend.
+  - MLX: a Python build checked against a SHA-256 pinned in the source, then
+    `mlx-vlm` (`>=0.6.13,<0.7`), `mlx-lm` (a floor only) and
+    `mlx-embeddings` (`==0.1.0`) from PyPI with pip, with no hash check.
+  - llama.cpp: upstream `llama-server` archives from GitHub, checked against
+    SHA-256s pinned in the source. They are not signed or notarized on
+    macOS. `ESTIA_LLAMA_SERVER` runs whatever binary you name.
+  - Weights: MLX large (LFS) files are checked against the SHA-256 that
+    Hugging Face publishes, small files by size. GGUF files are pinned to a
+    commit and checked against their SHA-256.
+
+  Estia trusts PyPI, GitHub releases and Hugging Face.

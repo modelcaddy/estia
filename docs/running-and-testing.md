@@ -10,8 +10,11 @@ This guide is for three kinds of reader:
   another device: [Test it](#test-it) and [Troubleshooting](#troubleshooting).
 - **You are changing Estia's code**: [For contributors](#for-contributors).
 
-Commands and output in this guide come from real runs of Estia 0.4.0 on an
-Apple Silicon Mac with the MLX backend, unless a section says otherwise. The
+Commands and output in this guide come from real runs of Estia 0.4.0 (from a
+development build before the release) on an Apple Silicon Mac with the MLX
+backend, unless a section says otherwise. So sample output shows a `+dirty`
+commit and MLX runner 2.2.0, where the release reports its tagged commit and
+runner 2.3.0. The
 sample runs used a second engine on port 27381 with its own data directory,
 next to an installed one; the commands show the default port, 27200. Paths in
 sample output are shortened or replaced with example ones. Not run for this guide: the `estia service`
@@ -76,7 +79,7 @@ On an Apple Silicon Mac the MLX backend needs its runner script,
 `runners/mlx-python/estia-runner.py`. A binary built from the checkout finds
 it, and every binary also carries a copy it writes into the data directory
 when it needs one, so there is nothing to copy by hand. The README's
-[Install from source](../README.md#install-from-source) has the lookup order.
+[Install](../README.md#install) section has the lookup order.
 
 ### From a release archive
 
@@ -109,7 +112,8 @@ is. A download saved by a browser is quarantined, and macOS refuses to open
 it; clear the flag with `xattr -dr com.apple.quarantine estia-$V-$T`.
 
 The steps after `curl` were checked on an archive built the way the release
-workflow builds it; the download URLs were not.
+workflow builds it. The download URLs have not been run yet; they will be
+checked against the v0.4.0 release.
 
 ### Which build is this?
 
@@ -238,6 +242,10 @@ estia token new smoke --scopes generate,embed,models:read
 ```
 
 ## First run on Linux with llama.cpp
+
+This path has not been run end to end on Linux yet: see
+[What has run on Linux](#what-has-run-on-linux). `estia setup --roles
+fast,embed`, below, is the smaller first try, and reports are welcome.
 
 On Linux the default backend is llama.cpp: upstream's `llama-server`, run by
 Estia behind a small adapter. The steps are the same as on a Mac; what
@@ -611,8 +619,9 @@ pair and save the token in a file only you can read:
     --scopes generate,embed,models:read > ~/.estia-token)
 ```
 
-It prints the pairing id and the command to approve it, waits up to 5 minutes,
-and writes only the token to standard output. Without `estia`, pair with
+It prints the pairing id and the command to approve it, waits up to 290
+seconds (`--wait-seconds`), and writes only the token to standard output.
+Without `estia`, pair with
 `examples/python/pair.py`, which needs only Python. Then check the engine from
 the laptop:
 
@@ -679,7 +688,6 @@ shows each request and response in full.
 | `Error: an engine is already running for this data directory (pid …)` | Another `estia serve`, or the service, is using the same data directory | Use that engine, or stop it (`estia service stop`, or Ctrl-C), or give this one its own `--data-dir`. |
 | `Error: Address already in use` | Another program holds the port | Pick another port with `--port`, or find the program: `lsof -nP -iTCP:27200 -sTCP:LISTEN`. |
 | `estia discover` finds nothing | The engine serves loopback only (`serve` without `--lan`, or `service install --local`), advertising is off (`--no-advertise`), or the network does not pass multicast between devices (guest networks and some routers isolate clients) | Connect by address: `estia status` on the engine's machine prints the URL. |
-| On an iPhone, `/client` zooms in when you type and stays zoomed | Safari zooms into text fields smaller than 16 px. The page was fixed before 0.4.0, the first published version. | Update the engine (the page is built into it) and reload the page. |
 | A request you gave up on still holds the model, and the next one waits | A known limit: a non-streaming request is not cancelled when its client disconnects; the generation runs to the end | Use `"stream": true` for anything a user may cancel; closing a stream cancels the generation. Keep `max_tokens` modest. |
 | `ps` or `top` shows an MLX runner using about 100 MB while the Mac is short of memory | On macOS, a process's resident size (RSS) leaves out the Metal buffers MLX keeps the weights and KV cache in. In one run, `ps` showed 102 MB for a `gemma4-e2b` runner whose footprint was 3.8 GB, 3.4 GB of it Metal buffers. | Read the runner's physical footprint instead: `GET /engine/stats` reports it per loaded model, as does the Memory column in Activity Monitor (`footprint <pid>` in a terminal). To free memory, let idle models unload (`--idle-unload-minutes`) or stop the engine. |
 | `estia serve` says it minted an admin token but did not print it | stderr was not a terminal, so the token would have gone to a log file | `estia token new local --replace` prints a new one. |

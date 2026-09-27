@@ -85,8 +85,9 @@ pub struct Artifact {
     /// is what the llama adapter passes as `-c`: the files declare 128K or
     /// 256K, and llama-server would size its KV cache for that.
     pub context_length: Option<u32>,
-    /// SPDX-style licence identifier or the vendor's licence name, shown to
-    /// the user before a pull.
+    /// SPDX licence identifier or the vendor's licence name. `estia pull` and
+    /// `estia setup` print it before a download (with the terms' links for a
+    /// vendor licence), and `estia models` and the test client list it.
     pub license: &'static str,
     /// The files to fetch and the names to store them under. Empty means
     /// "the repository's model files" (the MLX artifacts: see
@@ -140,6 +141,16 @@ const GEMMA4_CAPS: &[Capability] = &[Capability::Text, Capability::Tools];
 /// Every generation artifact the engine ships knowledge of, in the order a
 /// picker should list them. Per family, the first artifact of a format is
 /// that format's default.
+///
+/// `license` is the licence of Google's base model: google/gemma-4-E4B-it,
+/// -E2B-it and -12B-it are Apache-2.0 (license_link
+/// <https://ai.google.dev/gemma/docs/gemma_4_license>), and a conversion does
+/// not change it. The Hugging Face cards of the MLX conversions
+/// (mlx-community/gemma-4-e4b-it-4bit, mlx-community/gemma-4-e2b-it-4bit,
+/// modelcaddy/gemma-4-12b-it-qat-4bit-mlx) still carry `license: gemma`, the
+/// tag of the earlier Gemma Terms of Use; that tag is stale, not a different
+/// licence. The GGUF artifacts come from Google's own repositories, whose
+/// cards say apache-2.0.
 pub const GENERATION_MODELS: &[Artifact] = &[
     Artifact {
         id: "gemma4-e4b-it-4bit-mlx",

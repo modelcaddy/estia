@@ -71,10 +71,17 @@ const PBS_SHA256: Option<&str> = Some("4c18852bf9c1a11b56f21bcf0df1946f7e98ee43e
 /// mlx-vlm 0.6.x pulled it in (`mlx-lm>=0.31.3`) but 0.7 dropped it, and
 /// [`verify_install`] imports it and stamps its version, so a clean install
 /// that resolved mlx-vlm 0.7 failed verification without it.
+///
+/// `mlx-embeddings` is GPL-3.0 (0.1.0's PyPI metadata and its repository's
+/// LICENSE). Estia does not ship it; this install fetches it from PyPI. It
+/// is pinned to an exact version so that neither its code nor its licence
+/// changes without a commit here: re-check the licence before a bump. The
+/// pin forces no reinstall: [`stack_importable`] checks only that it
+/// imports, and pip changes it only when a top-up runs for another reason.
 #[cfg(feature = "python-mlx")]
-// Capped below 0.7 until the runner is verified against it: 0.7 changed the
-// dependency set (see above) and nothing has been run on it yet.
-const PIP_PACKAGES: &[&str] = &["mlx-vlm>=0.6.13,<0.7", "mlx-lm>=0.31.3", "mlx-embeddings"];
+// mlx-vlm is capped below 0.7 until the runner is verified against it: 0.7
+// changed the dependency set (see above) and nothing has been run on it yet.
+const PIP_PACKAGES: &[&str] = &["mlx-vlm>=0.6.13,<0.7", "mlx-lm>=0.31.3", "mlx-embeddings==0.1.0"];
 
 /// Fetch the release's sibling `<asset>.sha256` and return the 64-char hex
 /// digest. GitHub serves it right next to the asset.

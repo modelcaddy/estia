@@ -1,8 +1,9 @@
 name: Release
 
 # Push a tag like v0.4.0 to publish a release. The tag must match the version
-# in the workspace Cargo.toml, or the job stops before building. The release
-# checklist is in docs/versioning.md.
+# in the workspace Cargo.toml, and CI (ci.yml) must have passed on the tagged
+# commit, or the workflow stops before building. The release checklist is in
+# docs/versioning.md.
 #
 # Artifacts: aarch64-apple-darwin only. Linux and Intel Macs use the llama.cpp
 # backend, but there are no archives for them yet (ROADMAP.md, slice L7);
@@ -16,13 +17,23 @@ name: Release
 # it cannot change under a release. Move it to the next version before GitHub
 # retires this one. MACOSX_DEPLOYMENT_TARGET states the oldest macOS the binary
 # runs on; 11.0 is rustc's default for this target whatever the image's SDK.
+#
+# Three jobs, so the write token is never in the job that builds (which runs
+# every dependency's build script, and cargo-about):
+#   ci-passed  reads the CI runs of the tagged commit (actions: read);
+#   build      builds and checks the tarball with a read-only token and
+#              uploads it as a workflow artifact;
+#   publish    downloads the tarball and creates the release. It is the only
+#              job with contents: write; it checks out and builds nothing and
+#              runs two actions, both pinned.
+# Third-party actions are pinned to a full commit SHA, with the release it was
+# in a comment; bump them on purpose, never to a moving tag.
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
   # The Rust release CI builds, lints and tests with. Pinned so a new stable
@@ -32,14 +43,72 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  macos-arm64:
+  ci-passed:
+    # This workflow runs no tests of its own. It releases only a commit on
+    # which a CI run from a push (to main) or a manual dispatch finished with
+    # success. Pull request runs do not count: they test a merge commit, not
+    # this one. A tag pushed together with its commit finds CI still running,
+    # so this waits for it. To release a commit CI has not run on, run CI on
+    # the tag first: gh workflow run ci.yml --ref <tag>.
+    name: CI passed on the tagged commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for a successful CI run of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          start="$(date +%s)"
+          while :; do
+            runs="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --commit "$GITHUB_SHA" \
+              --limit 100 --json databaseId,event,status,conclusion,url \
+              | jq '[.[] | select(.event == "push" or .event == "workflow_dispatch")]')"
+            passed="$(jq -r '[.[] | select(.status == "completed" and .conclusion == "success")][0].url // empty' <<<"$runs")"
+            if [ -n "$passed" ]; then
+              echo "CI passed on $GITHUB_SHA: $passed"
+              exit 0
+            fi
+            running="$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")"
+            found="$(jq 'length' <<<"$runs")"
+            waited=$(( $(date +%s) - start ))
+            # A run can take a minute or two to appear after its push.
+            if [ "$running" -eq 0 ] && { [ "$found" -gt 0 ] || [ "$waited" -ge 600 ]; }; then
+              echo "::error::no successful CI run (ci.yml, push or workflow_dispatch) for $GITHUB_SHA"
+              jq -r '.[] | "  \(.status) \(.conclusion // "-") \(.url)"' <<<"$runs"
+              echo "Fix CI and tag a green commit, or run CI on this one: gh workflow run ci.yml --ref $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            if [ "$waited" -ge 3600 ]; then
+              echo "::error::CI on $GITHUB_SHA has not finished after an hour"
+              exit 1
+            fi
+            echo "waiting for CI on $GITHUB_SHA ($found run(s), $running not finished, ${waited}s so far)"
+            sleep 30
+          done
+
+  build:
     name: aarch64-apple-darwin
+    needs: ci-passed
     runs-on: macos-15
+    permissions:
+      contents: read
     env:
       TARGET: aarch64-apple-darwin
       MACOSX_DEPLOYMENT_TARGET: "11.0"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      name: ${{ steps.package.outputs.name }}
+      changelog_anchor: ${{ steps.changelog.outputs.anchor }}
     steps:
+      # Nothing below pushes, so the token is not left in .git/config while
+      # the build runs every dependency's build script.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: |
@@ -48,7 +117,7 @@ jobs:
 
       # For THIRD_PARTY_LICENSES (see about.toml). A pinned prebuilt binary,
       # checked against the hash install-action records for it.
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
           tool: cargo-about@0.9.2
 
@@ -62,6 +131,29 @@ jobs:
             exit 1
           fi
           echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      # The release notes link the version's CHANGELOG.md section, by the
+      # anchor GitHub gives its heading: `## 0.4.0 — 2026-09-27` becomes
+      # #040--2026-09-27 (lower case, punctuation dropped, spaces to hyphens).
+      # A release must have its section; a pre-release may link Unreleased.
+      - name: Find the CHANGELOG section
+        id: changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          LC_ALL: C
+        run: |
+          set -euo pipefail
+          heading="$(awk -v h="## $VERSION — " 'index($0, h) == 1 { print; exit }' CHANGELOG.md)"
+          if [ -n "$heading" ]; then
+            anchor="$(printf '%s' "${heading#"## "}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9 _-]//g; s/ /-/g')"
+          elif [[ "$VERSION" == *-* ]]; then
+            anchor="unreleased"
+          else
+            echo "::error::CHANGELOG.md has no '## $VERSION — YYYY-MM-DD' section"
+            exit 1
+          fi
+          echo "CHANGELOG.md#$anchor"
+          echo "anchor=$anchor" >> "$GITHUB_OUTPUT"
 
       - name: Build
         run: cargo build --release --locked -p estia --target "$TARGET"
@@ -134,10 +226,48 @@ jobs:
             exit 1
           fi
 
-      - uses: softprops/action-gh-release@v3
+      - uses: actions/upload-artifact@v7
         with:
-          files: |
+          name: release
+          path: |
             dist/${{ steps.package.outputs.name }}.tar.gz
             dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: dist
+
+      - name: Check the download and write the release notes
+        env:
+          NAME: ${{ needs.build.outputs.name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          ANCHOR: ${{ needs.build.outputs.changelog_anchor }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c "$NAME.tar.gz.sha256")
+          src="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME"
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          Estia $VERSION. What changed: [CHANGELOG.md]($src/CHANGELOG.md#$ANCHOR).
+
+          \`$NAME.tar.gz\` holds the \`estia\` binary for Apple Silicon Macs (macOS 11 or later), the MLX runner scripts, LICENSE, NOTICE, README.md and THIRD_PARTY_LICENSES. The binary is not signed with a Developer ID or notarized. To check the download and see which commit it was built from: [Checking a release download]($src/docs/versioning.md#checking-a-release-download). Other platforms build from source (README.md).
+          EOF
+          cat "$RUNNER_TEMP/notes.md"
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          body_path: ${{ runner.temp }}/notes.md
+          files: |
+            dist/${{ needs.build.outputs.name }}.tar.gz
+            dist/${{ needs.build.outputs.name }}.tar.gz.sha256
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}

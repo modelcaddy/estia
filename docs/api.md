@@ -245,7 +245,7 @@ the end, and later requests to that model wait for it.
 
 | Field | Notes |
 |---|---|
-| `model` | `embed` (the model the `embed` role is bound to, else `embeddinggemma-300m-4bit`) or an embedding model id |
+| `model` | `embed` (the model the `embed` role is bound to, else `embeddinggemma-300m-4bit`, or `embeddinggemma-300m-q8_0-gguf` on llama.cpp) or an embedding model id |
 | `input` | A string or an array of at most 256 strings |
 | `task` | Estia extension: `document` (default), `query`, `clustering`, or `none`. The model's own prefix for that task is prepended. `none` sends the inputs unchanged. |
 | `encoding_format` | `float` (default) or `base64`, as OpenAI. Anything else is a 400. |

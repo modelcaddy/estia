@@ -80,9 +80,12 @@ directory are git-ignored.
    into one directory inside the host's bundle.
 2. Sign the binary with the host's identity and entitlements, like any other
    nested executable.
-3. Build `estia-engine` without the `python-mlx` feature (it is off by
+3. Include the licence texts of the Swift packages in `Package.resolved` in
+   the host's acknowledgements. They are MIT and Apache-2.0, and swift-crypto
+   adds BoringSSL's notices.
+4. Build `estia-engine` without the `python-mlx` feature (it is off by
    default), so the Python runtime installer is not compiled in.
-4. Drive the runner with the engine's one-shot client:
+5. Drive the runner with the engine's one-shot client:
    `OneShot::new(Launch::new(path_to_binary), OneShotConfig::default(), observer)`,
    then `call` with `estia_proto::Request::Health`, `Generate`, `Embed`,
    `AppleHealth` or `AppleGenerate`. See `engine/src/oneshot.rs`.

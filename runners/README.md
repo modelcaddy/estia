@@ -203,6 +203,10 @@ runtime and returns `EngineError::NoInterpreter` if that is missing.
   can put the script anywhere and pass its path to `EngineConfig::new`. The
   interpreter and MLX packages are not shipped: `PythonRuntime` downloads them
   on first use. The installer is behind the engine's `python-mlx` feature.
+  The embedding path imports `mlx-embeddings`, which is GPL-3.0 (`mlx`,
+  `mlx-lm` and `mlx-vlm` are MIT). Estia does not ship it:
+  `estia runtime install` fetches it from PyPI. A host that bundles or
+  installs the MLX runtime should review its licence.
 - **Apple runner.** Build it, ship the `estia-apple-runner` binary, sign it
   with the host, and call it through `OneShot`:
 
@@ -218,8 +222,12 @@ runtime and returns `EngineError::NoInterpreter` if that is missing.
 - **Swift MLX runner.** For a host that must ship only signed code, such as a
   sandboxed Mac app. Ship the binary and its `*.bundle` directories side by
   side, sign it with the host, and build `estia-engine` without `python-mlx`
-  (the default) so no downloader for executable code is compiled in. It also
-  answers the Apple calls, so such a host does not need the Apple runner. See
+  (the default) so no downloader for executable code is compiled in. The
+  binary statically links the Swift packages in
+  [`mlx-swift/Package.resolved`](mlx-swift/Package.resolved): include their
+  licence texts in the host's acknowledgements. They are MIT and Apache-2.0,
+  and swift-crypto adds BoringSSL's notices. The runner also answers the
+  Apple calls, so such a host does not need the Apple runner. See
   [`mlx-swift/README.md`](mlx-swift/README.md).
 
 Compiled runner binaries and build directories are git-ignored.

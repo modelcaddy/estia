@@ -114,6 +114,8 @@ enum Cmd {
         /// The family roles bind to. Default: the id.
         #[arg(long)]
         family: Option<String>,
+        /// Display name, shown in `/engine/models` and the test client.
+        /// Default: the file's `general.name`, else the id.
         #[arg(long)]
         label: Option<String>,
         /// Context length to run it with. Default: the file's, capped at 32768.
@@ -122,9 +124,10 @@ enum Cmd {
         /// Embedding models: vector width, when a projection head changes it.
         #[arg(long)]
         dims: Option<usize>,
-        /// Embedding models: text put before queries and before documents.
+        /// Embedding models: text put before each query (`query: `). Default: none.
         #[arg(long)]
         query_prefix: Option<String>,
+        /// Embedding models: text put before each document (`passage: `). Default: none.
         #[arg(long)]
         doc_prefix: Option<String>,
         /// Link to the file where it is instead of copying it.
@@ -755,9 +758,48 @@ fn read_stdin() -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Google's terms for the Gemma models, and the use policy they incorporate.
+const GEMMA_TERMS_URL: &str = "https://ai.google.dev/gemma/terms";
+const GEMMA_PROHIBITED_USE_URL: &str = "https://ai.google.dev/gemma/prohibited_use_policy";
+
+/// Where to read a model licence that is not an SPDX id: its terms and its
+/// prohibited-use policy. The test client (server/client/index.html) links
+/// the same pages.
+fn license_links(license: &str) -> Option<(&'static str, &'static str)> {
+    (license == "Gemma Terms of Use").then_some((GEMMA_TERMS_URL, GEMMA_PROHIBITED_USE_URL))
+}
+
+/// Whether `license` is a single SPDX licence id (`Apache-2.0`, `MIT`)
+/// rather than a vendor's licence name (`Gemma Terms of Use`).
+fn is_spdx_id(license: &str) -> bool {
+    !license.is_empty() && license.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '+'))
+}
+
+/// A licence name, followed by its terms and prohibited-use pages when it
+/// has them.
+fn license_detail(license: &str) -> String {
+    match license_links(license) {
+        Some((terms, prohibited)) => format!("{} · terms: {terms} · prohibited use: {prohibited}", safe(license)),
+        None => safe(license),
+    }
+}
+
+/// An artifact's licence as printed before it is downloaded: an SPDX id on
+/// its own; any other licence with the pages to read, or, when Estia knows
+/// none, the model card.
+fn license_text(a: &Artifact) -> String {
+    if is_spdx_id(a.license) || license_links(a.license).is_some() || a.repo_id.is_empty() {
+        license_detail(a.license)
+    } else {
+        format!("{} · read the model card: https://huggingface.co/{}", safe(a.license), safe(a.repo_id))
+    }
+}
+
 async fn pull(ctx: &Ctx, id: &str) -> Result<()> {
-    let spec = estia_server::catalog::pull_spec(&ctx.resolver(), id).map_err(|e| anyhow!("{e} (see `estia models`)"))?;
+    let artifact = estia_server::catalog::pull_artifact(&ctx.resolver(), id).map_err(|e| anyhow!("{e} (see `estia models`)"))?;
+    let spec = DownloadSpec::from(artifact);
     eprintln!("pulling {} from {}@{} ({} required)", spec.id, spec.repo_id, spec.revision, gb(spec.required_disk_bytes));
+    eprintln!("licence: {}", license_text(artifact));
     let summary = ctx.store.download(&spec, print_progress).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
@@ -778,14 +820,37 @@ fn model_row(ctx: &Ctx, a: &Artifact, family: &str, kind: &str, extra: &str) -> 
     };
     let runs = if a.format == ctx.backend.format() { "*" } else { " " };
     let source = if imported { "imported" } else { "built-in" };
-    format!("{runs} {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} {size}{extra}", safe(a.id), safe(family), kind, a.format.id(), source, state)
+    format!(
+        "{runs} {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} {:<18} {size}{extra}",
+        safe(a.id),
+        safe(family),
+        kind,
+        a.format.id(),
+        source,
+        state,
+        safe(a.license)
+    )
+}
+
+/// The lines under `estia models` that say where to read each listed
+/// licence that has its own terms, once per licence.
+fn license_notes<'a>(licenses: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for l in licenses {
+        if license_links(l).is_some() && !seen.contains(&l) {
+            seen.push(l);
+        }
+    }
+    seen.into_iter().map(license_detail).collect()
 }
 
 fn models(ctx: &Ctx) -> Result<()> {
     println!("backend {} ({}) · * = runs on it", ctx.backend, ctx.backend_source);
-    println!("  {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} size", "id", "family / model", "kind", "format", "source", "state");
+    println!("  {:<36} {:<24} {:<5} {:<6} {:<8} {:<9} {:<18} size", "id", "family / model", "kind", "format", "source", "state", "licence");
+    let mut licenses = Vec::new();
     for a in generation_artifacts() {
         println!("{}", model_row(ctx, a, a.family, "gen", ""));
+        licenses.push(a.license);
     }
     for e in embed_models() {
         for a in e.artifacts {
@@ -796,6 +861,14 @@ fn models(ctx: &Ctx) -> Result<()> {
             };
             let extra = format!(" ({}-dim{fp})", e.dims);
             println!("{}", model_row(ctx, a, e.id, "embed", &extra));
+            licenses.push(a.license);
+        }
+    }
+    let notes = license_notes(licenses);
+    if !notes.is_empty() {
+        println!();
+        for n in notes {
+            println!("{n}");
         }
     }
     Ok(())
@@ -1588,6 +1661,7 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
             } else {
                 let spec = DownloadSpec::from(a);
                 println!("… model    : pulling {} ({} required)", spec.id, gb(spec.required_disk_bytes));
+                println!("  licence  : {}", license_text(a));
                 ctx.store.download(&spec, print_progress).await?;
                 println!("✓ model    : {}", spec.id);
             }
@@ -3240,6 +3314,60 @@ mod tests {
             _ => panic!("not an import"),
         }
         assert!(Cli::try_parse_from(["estia", "import", "x.gguf", "--kind", "chat"]).is_err());
+    }
+
+    #[test]
+    fn every_import_flag_has_its_own_help() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let import = cmd.find_subcommand("import").unwrap();
+        for arg in import.get_arguments().filter(|a| !a.is_global_set() && a.get_id() != "help") {
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(!help.is_empty(), "`estia import --{}` has no help text", arg.get_id());
+        }
+        let help = |id: &str| import.get_arguments().find(|a| a.get_id() == id).unwrap().get_help().unwrap().to_string();
+        assert!(help("query_prefix").contains("query") && !help("query_prefix").contains("document"), "{}", help("query_prefix"));
+        assert!(help("doc_prefix").contains("document"), "{}", help("doc_prefix"));
+    }
+
+    #[test]
+    fn licences_print_with_where_to_read_them() {
+        use estia_engine::models::embed::EMBEDDING_GEMMA_300M_4BIT;
+        let gemma = &EMBEDDING_GEMMA_300M_4BIT.artifacts[0];
+        assert_eq!(
+            license_text(gemma),
+            "Gemma Terms of Use · terms: https://ai.google.dev/gemma/terms \
+             · prohibited use: https://ai.google.dev/gemma/prohibited_use_policy"
+        );
+        let e4b = find_artifact("gemma4-e4b-it-4bit-mlx").unwrap();
+        assert_eq!(license_text(e4b), "Apache-2.0");
+        assert!(is_spdx_id("MIT") && is_spdx_id("Apache-2.0") && is_spdx_id("GPL-2.0+"));
+        assert!(!is_spdx_id("Gemma Terms of Use") && !is_spdx_id("unknown (imported)") && !is_spdx_id(""));
+        // A vendor licence Estia has no pages for points at the model card.
+        let other = Artifact { license: "Acme Model Licence", ..e4b.clone() };
+        assert_eq!(
+            license_text(&other),
+            "Acme Model Licence · read the model card: https://huggingface.co/mlx-community/gemma-4-e4b-it-4bit"
+        );
+        // `estia models` names each licence's pages once, under the table.
+        assert_eq!(license_notes(["Apache-2.0", "Gemma Terms of Use", "MIT", "Gemma Terms of Use"]), vec![license_text(gemma)]);
+        assert!(license_notes(["Apache-2.0", "MIT"]).is_empty());
+    }
+
+    /// Every built-in model's licence is an SPDX id or one whose pages
+    /// `estia pull` can print; a new vendor licence needs its links added to
+    /// `license_links` (and the test client's `LICENSE_LINKS`).
+    #[test]
+    fn every_built_in_licence_is_spdx_or_has_its_pages() {
+        // Imports have no repository and the licence `unknown (imported)`.
+        let embed = embed_models().into_iter().filter(|e| !e.repo_id.is_empty()).collect::<Vec<_>>();
+        for e in &embed {
+            assert!(is_spdx_id(e.license) || license_links(e.license).is_some(), "{}: licence `{}`", e.id, e.license);
+        }
+        let artifacts = generation_artifacts().into_iter().chain(embed.iter().flat_map(|e| e.artifacts.iter()));
+        for a in artifacts.filter(|a| !a.repo_id.is_empty()) {
+            assert!(is_spdx_id(a.license) || license_links(a.license).is_some(), "{}: licence `{}`", a.id, a.license);
+        }
     }
 
     /// The engine starts `<estia> runner llama --server … --run-dir … [-- …]`;

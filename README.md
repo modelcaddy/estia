@@ -6,7 +6,11 @@ HTTP API, to programs on that machine and, after pairing, to other devices on
 your network. Clients ask for roles such as `text`, `fast` or `embed`, and the
 engine decides which model answers.
 
-Estia is developed by ModelCaddy and runs inside its apps.
+Estia is developed by [ModelCaddy](https://modelcaddy.com) and runs inside
+its apps.
+
+Full documentation: <https://github.com/modelcaddy/estia>. The links in this
+file are relative to that repository.
 
 ## Status
 
@@ -37,7 +41,14 @@ breaking changes before 1.0.
 [ROADMAP.md](ROADMAP.md) lists what is planned, in order, with the check that
 closes each item.
 
-## Install from source
+## Install
+
+**Apple Silicon Macs:** download `estia-0.4.0-aarch64-apple-darwin.tar.gz`
+from [Releases](https://github.com/modelcaddy/estia/releases) and check it as
+in [docs/running-and-testing.md](docs/running-and-testing.md#from-a-release-archive).
+There are no Linux or Intel Mac archives yet; build from source there.
+
+### From source
 
 You need:
 
@@ -95,6 +106,10 @@ cargo deny check                                             # licence and advis
 ```bash
 estia setup
 ```
+
+On Linux and on `--backend llama` this path has not been run end to end yet
+(see [Status](#status)); `estia setup --roles fast,embed` is the smaller
+first try, and reports are welcome.
 
 `setup` installs the backend's runtime, downloads the models for the `text`,
 `fast` and `embed` roles (about 9 GB on either backend), writes the role table
@@ -196,6 +211,9 @@ each check took, and exits 1 if any check failed.
 explains the fields, how the version numbers change and how a release is
 made.
 
+This sample comes from a development build made before the release; a release
+binary names the tag's commit, without `+dirty`:
+
 ```console
 $ estia --version
 estia 0.4.0 (8642bfc4e+dirty, 2026-09-26)
@@ -208,7 +226,7 @@ A backend is what runs the models. An engine uses one backend at a time.
 | Backend | Id | Runs on | Default on | Runtime Estia installs |
 |---|---|---|---|---|
 | MLX | `mlx-python` | Apple Silicon Macs | Apple Silicon Macs | Python 3.12 with `mlx-vlm`, `mlx-lm` and `mlx-embeddings`, about 700 MB |
-| llama.cpp | `llama-cpp` | Macs and Linux (x64, arm64) | every other machine | upstream's `llama-server`, pinned build b11146: 11 to 31 MB for CPU, Metal and Vulkan; 235 MB for ROCm; 590 to 765 MB for CUDA with its runtime libraries |
+| llama.cpp | `llama-cpp` | Macs and Linux (x64, arm64); run end to end only on Apple Silicon so far | every other machine | upstream's `llama-server`, pinned build b11146: 11 to 31 MB for CPU, Metal and Vulkan; 235 MB for ROCm; 590 to 765 MB for CUDA with its runtime libraries |
 
 llama.cpp publishes Windows builds and Estia pins their hashes, but Estia
 itself does not build for Windows yet.
@@ -491,7 +509,7 @@ model family, so clients do not hard-code model names.
 | `fast` | text | `gemma4-e2b` | falls back to `text` |
 | `vision` | text (vision once a model advertises it) | `gemma4-e4b` | falls back to `text` |
 | `code` | text | none | falls back to `text` |
-| `embed` | embedding | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`) |
+| `embed` | embedding | none | EmbeddingGemma 300M (`embeddinggemma-300m-4bit`; `embeddinggemma-300m-q8_0-gguf` on llama.cpp) |
 
 Role names are open. Bind any name to a generation family, and `embed` to an
 embedding model:
@@ -516,8 +534,9 @@ after `estia roles set`, or change roles live with `PUT /engine/defaults`
 `GET /v1/models` lists the roles in the role table first, each with
 `"x_estia": {"role": true, "family": ...}`. These are the generation roles that
 `estia roles` shows, such as `text`, `fast` and `vision`, and `embed` once it
-is bound. Unbound, `"model": "embed"` means `embeddinggemma-300m-4bit` on the
-embedding routes. A request's `model` can also be a family (`gemma4-e2b`) or
+is bound. Unbound, `"model": "embed"` means `embeddinggemma-300m-4bit`
+(`embeddinggemma-300m-q8_0-gguf` on llama.cpp) on the embedding routes. A
+request's `model` can also be a family (`gemma4-e2b`) or
 an artifact id (`gemma4-e2b-it-4bit-mlx`). An artifact id wins over a family,
 and a family over a role. The running backend picks the family's artifact in
 its own format; an artifact id of the other format is a 400.
@@ -543,9 +562,9 @@ the server does not apply them yet.
 | `nomic-embed-text-v1.5-q8_0-gguf` | GGUF | the same model, 768 dims | 0.15 GB | Apache-2.0 |
 
 All come from Hugging Face. `estia models` shows each one's format, whether
-the running backend can load it (`*`), and whether it is installed, along
-with imported models; `estia pull <id>` and `estia rm <id>` add and remove
-them.
+the running backend can load it (`*`), whether it is installed and its
+licence, along with imported models; `estia pull <id>` and `estia rm <id>`
+add and remove them.
 
 ## HTTP API
 
@@ -781,9 +800,9 @@ the crates in your own program.
   against SHA-256 hashes pinned in the source. MLX model weights are checked
   against the SHA-256 Hugging Face publishes for large files; small files get
   a size check. GGUF files are pinned to a commit and checked against their
-  SHA-256. The MLX packages come from
-  PyPI and are not pinned: `mlx-vlm` is held to `>=0.6.13,<0.7`, `mlx-lm` has
-  a floor and `mlx-embeddings` has no bound.
+  SHA-256. The MLX packages come from PyPI with no hash check: `mlx-vlm` is
+  held to `>=0.6.13,<0.7`, `mlx-lm` has a floor and `mlx-embeddings` is
+  pinned to 0.1.0.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
@@ -868,13 +887,32 @@ Estia is licensed under the Apache License 2.0. See [LICENSE](LICENSE) and
 [NOTICE](NOTICE). The licence covers the code, not the names "Estia" or
 "ModelCaddy"; see [TRADEMARKS.md](TRADEMARKS.md).
 
-The release binary links many Rust crates, under MIT, Apache-2.0, BSD-3-Clause
-and Unicode-3.0 licences. Each release tarball includes
+The release binary links many Rust crates, under MIT, MIT-0, Apache-2.0,
+BSD-3-Clause and Unicode-3.0 licences. Each release tarball includes
 `THIRD_PARTY_LICENSES` with their licence texts, generated from `Cargo.lock`
 by [cargo-about](https://github.com/EmbarkStudios/cargo-about) (configuration
 in `about.toml`).
 
-Models, the Python packages and the llama.cpp builds (MIT) that Estia
-downloads come under their own licences.
-Gemma 4 is Apache-2.0 (per Google's model cards); EmbeddingGemma is under the
-Gemma Terms of Use. `GET /engine/models` lists each model's licence.
+Models, the Python packages and the llama.cpp builds that Estia downloads
+come under their own licences:
+
+- **llama.cpp** builds are MIT. The CUDA builds also fetch NVIDIA's CUDA
+  runtime libraries, under NVIDIA's CUDA EULA, as upstream publishes them.
+- **The MLX packages.** `mlx`, `mlx-lm` and `mlx-vlm` are MIT. The MLX
+  embedding path imports `mlx-embeddings`, which is GPL-3.0. Estia does not
+  ship it: `estia runtime install` fetches it from PyPI. Hosts that bundle or
+  install the MLX runtime should review its licence. Removing it is on the
+  [roadmap](ROADMAP.md#10-embeddings-without-mlx-embeddings).
+- **Gemma 4** is Apache-2.0 (per Google's model cards and the
+  [Gemma 4 licence page](https://ai.google.dev/gemma/docs/gemma_4_license)).
+  The licence given is that of Google's base model; some community MLX
+  conversions carry a stale `gemma` tag on their cards.
+- **EmbeddingGemma**, the default `embed` model that `estia setup` pulls, is
+  under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and the
+  [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
+  Read them before you pull it; using the model means accepting them.
+
+`estia pull` and `estia setup` print a model's licence before they download
+it, with the terms and prohibited-use links for the Gemma Terms of Use.
+`estia models`, the Models table in `/client` and `GET /engine/models` list
+each model's licence.
