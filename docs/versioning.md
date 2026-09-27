@@ -395,9 +395,9 @@ tar -xzf estia-0.4.0-aarch64-apple-darwin.tar.gz
 git rev-parse 'v0.4.0^{commit}' | cut -c1-9
 ```
 
-The two `curl` lines have not been run yet; they will be checked against the
-v0.4.0 release. The other commands were run on a tarball with the same
-layout, built locally.
+All of these were run against the public v0.4.0 release on 2026-09-27:
+`shasum` printed OK, and `--version` printed `8058df07a`, which is
+`git rev-parse 'v0.4.0^{commit}' | cut -c1-9`.
 
 ## Build information
 
@@ -451,21 +451,10 @@ Every output above comes from a debug build of the commit it names, with
 uncommitted changes (hence `+dirty`), on an Apple Silicon Mac. The health and
 log examples come from an engine on a spare port (not 27200) with its own data
 directory.
-The following were not run, and why:
-
-- `git tag` and `git push`: making a release is the maintainer's decision.
-- The two `curl` downloads: there was no release yet.
-- The live adapter tests and `estia --backend llama chat`: they need the
-  pinned `llama-server` and GGUF models, which were not downloaded for this
-  page.
-- `"<data dir>/engine/estia" --version`: the service on the machine was in use
-  by other tests.
-- `cargo package --workspace --locked` ran as `cargo package --workspace
-  --allow-dirty --offline --locked`, because the tree had uncommitted changes.
-
-The release workflow's package and check steps were run locally, on a new git
-repository holding a copy of this tree, with a debug build instead of a
-release build and a placeholder `THIRD_PARTY_LICENSES` (cargo-about was not
-installed). The clean build reported its commit without `+dirty` and the
-check passed; the same check with a `+dirty` binary stopped with exit code 1.
-GitHub has not run the workflow: no tag has been pushed.
+Since then, v0.4.0 was tagged and released: GitHub ran the release workflow
+(CI gate, build, publish) on 2026-09-27, and the download commands above were
+run against the published archive. The installed service on the maintainer's
+machine runs that release binary (`"<data dir>/engine/estia" --version`
+prints `estia 0.4.0 (8058df07a, 2026-09-27)`). The live llama.cpp adapter
+tests run in CI with the tiny test models; Gemma 4 GGUF models have not been
+run yet.

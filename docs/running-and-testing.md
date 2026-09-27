@@ -111,9 +111,9 @@ The binary is not signed or notarized. A download made with `curl` runs as it
 is. A download saved by a browser is quarantined, and macOS refuses to open
 it; clear the flag with `xattr -dr com.apple.quarantine estia-$V-$T`.
 
-The steps after `curl` were checked on an archive built the way the release
-workflow builds it. The download URLs have not been run yet; they will be
-checked against the v0.4.0 release.
+These commands were run as written against the public v0.4.0 release on
+2026-09-27: the checksum matched and `--version` printed
+`estia 0.4.0 (8058df07a, 2026-09-27)`, the tagged commit.
 
 ### Which build is this?
 
