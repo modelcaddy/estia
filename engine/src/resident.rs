@@ -194,6 +194,11 @@ impl EmbedSession {
         self.session.is_idle(timeout)
     }
 
+    /// How long since this session last served a call.
+    pub fn idle_for(&self) -> Duration {
+        self.session.idle_for()
+    }
+
     pub fn maybe_shutdown(&self, timeout: Duration) -> bool {
         self.session.maybe_shutdown(timeout)
     }
@@ -392,6 +397,11 @@ impl GenSession {
 
     pub fn is_idle(&self, timeout: Duration) -> bool {
         self.session.is_idle(timeout)
+    }
+
+    /// How long since this session last served a call.
+    pub fn idle_for(&self) -> Duration {
+        self.session.idle_for()
     }
 
     pub fn maybe_shutdown(&self, timeout: Duration) -> bool {

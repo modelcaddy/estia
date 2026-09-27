@@ -85,7 +85,7 @@ _GEN_CACHE = {}
 # Protocol v2 identity. Bump RUNNER_VERSION on any behaviour change a client
 # could care about; PROTOCOL is the dialect number from the engine's proto crate.
 RUNNER_NAME = "mlx-python"
-RUNNER_VERSION = "2.4.0"
+RUNNER_VERSION = "2.5.0"
 PROTOCOL = 2
 CAPABILITIES = {
     "generate": True,
@@ -153,6 +153,7 @@ def load_embed(path):
     if _embed_load is None:
         raise RuntimeError("mlx-embeddings is not installed or importable")
     if path not in _EMBED_CACHE:
+        _apply_memory_governor()
         _EMBED_CACHE[path] = _embed_load(path)
     return _EMBED_CACHE[path]
 
@@ -213,12 +214,75 @@ def embed_batch(model_path, inputs):
     return [_finite(_embed_one(model, processor, text)) for text in inputs]
 
 
+_GOVERNED = False
+
+
+def _env_bytes(name):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        print(f"estia-runner: {name}={raw!r} is not a number of bytes; ignored", file=sys.stderr, flush=True)
+        return None
+    return n if n > 0 else None
+
+
+def _apply_memory_governor():
+    """Apply the engine's memory caps, once, before the first model loads.
+
+    ESTIA_MLX_WIRED_LIMIT_BYTES caps wired memory. mlx-vlm asks for
+    max_recommended_working_set_size (two thirds of RAM) around every
+    generation; wired pages cannot be compressed or paged, and on a 16 GB
+    fanless Mac 10.7 GB of them stalled the whole machine. mlx-vlm calls
+    mx.set_wired_limit through the module at call time, so wrapping it there
+    caps every caller, whichever mlx-vlm module it lives in.
+
+    ESTIA_MLX_CACHE_LIMIT_BYTES caps the freed buffers MLX keeps for reuse,
+    memory the OS sees as used but no model needs."""
+    global _GOVERNED
+    if _GOVERNED:
+        return
+    _GOVERNED = True
+    import mlx.core as mx
+    wired = _env_bytes("ESTIA_MLX_WIRED_LIMIT_BYTES")
+    cache = _env_bytes("ESTIA_MLX_CACHE_LIMIT_BYTES")
+    if cache is not None:
+        mx.set_cache_limit(cache)
+    if wired is not None:
+        original = mx.set_wired_limit
+
+        def capped(limit):
+            return original(min(int(limit), wired))
+
+        mx.set_wired_limit = capped
+    print(f"estia-runner: memory caps: wired {wired or 'mlx default'} bytes, cache {cache or 'mlx default'} bytes",
+          file=sys.stderr, flush=True)
+
+
+def _clear_after_request():
+    """On a tight cache cap, hand freed buffers back after every request
+    rather than when the cap is reached."""
+    limit = _env_bytes("ESTIA_MLX_CACHE_LIMIT_BYTES")
+    if limit is None or limit > 512 * 1024 * 1024 or not _GOVERNED:
+        return
+    import mlx.core as mx
+    mx.clear_cache()
+
+
 def load_gen(path):
-    # Gemma 4 is multimodal; mlx-vlm loads the language model and the vision
-    # tower together. Same loader as oneshot-runner.py.
+    # Gemma 4 is multimodal. Loaded lazily, then only the language model is
+    # read in: the audio and vision towers (about a quarter of E2B's weights)
+    # stay on disk until an image needs them.
     if path not in _GEN_CACHE:
+        _apply_memory_governor()
+        import mlx.core as mx
         from mlx_vlm import load
-        _GEN_CACHE[path] = load(path)
+        model, processor = load(path, lazy=True)
+        lm = getattr(model, "language_model", None)
+        mx.eval((lm if lm is not None else model).parameters())
+        _GEN_CACHE[path] = (model, processor)
     return _GEN_CACHE[path]
 
 
@@ -1335,6 +1399,10 @@ def main():
             resp = {"error": str(e)}
         if resp is not None:
             emit(resp)
+        try:
+            _clear_after_request()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

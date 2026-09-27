@@ -31,9 +31,12 @@ The first request to a model starts a runner and loads the weights, which
 takes a few seconds; requests that arrive meanwhile wait for that same load.
 Later requests reuse it. `x_estia.load_ms` says how long a request waited for
 a load (`null` when the model was ready), and `x_estia.ms` how long the
-generation took. The engine unloads a model after 15 idle minutes by default
-(`estia serve --idle-unload-minutes`), so the next request pays the load
-again.
+generation took. The engine unloads a model after 15 idle minutes by default,
+3 on a constrained machine (`estia serve --idle-unload-minutes`), and earlier
+when another model needs its memory, so the next request pays the load
+again. On a constrained machine only one generation model stays loaded:
+alternating `fast` and `text` there reloads each time, so pick one role per
+task.
 
 ## Two APIs on one port
 
@@ -503,6 +506,7 @@ Errors use OpenAI's shape:
 | 422 | Structured output invalid after the retry; fingerprint mismatch | See the sections above |
 | 429 | Too many pending pairing requests | Wait, then pair again |
 | 500 | Runner failure | Retry once; report it with the request id |
+| 503 | `insufficient_memory`: the model does not fit this engine's memory budget at all. `engine_busy`: it fits only once a request on another model finishes | For `insufficient_memory`, ask for a smaller model or role (`fast`), or have the operator raise `serve --memory-budget`; for `engine_busy`, retry after a few seconds |
 
 A body that is not JSON, or a missing `Content-Type: application/json`, gets a
 400, 415 or 422 from the HTTP framework, in the same JSON shape (type

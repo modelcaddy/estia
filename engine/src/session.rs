@@ -69,16 +69,29 @@ pub struct Launch {
     args: Vec<OsString>,
     /// What the child serves, for log lines (a model id). Not passed to it.
     label: Option<String>,
+    /// Set in the child's environment, on top of what it inherits.
+    env: Vec<(OsString, OsString)>,
 }
 
 impl Launch {
     pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), args: Vec::new(), label: None }
+        Self { program: program.into(), args: Vec::new(), label: None, env: Vec::new() }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
         self
+    }
+
+    /// Set `key` to `value` in the child's environment.
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Variables set with [`Launch::env`].
+    pub fn envs(&self) -> &[(OsString, OsString)] {
+        &self.env
     }
 
     /// Name the child in log events, usually the model id it serves. Log
@@ -112,6 +125,7 @@ impl Launch {
     pub(crate) fn command(&self) -> Command {
         let mut c = Command::new(&self.program);
         c.args(&self.args);
+        c.envs(self.env.iter().map(|(k, v)| (k, v)));
         c
     }
 }
@@ -770,6 +784,11 @@ impl Session {
     /// Calls currently inside the session (0 ⇒ safe to tear down).
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// How long since the last counted call finished (or the session started).
+    pub fn idle_for(&self) -> Duration {
+        self.last_used.lock().unwrap_or_else(PoisonError::into_inner).elapsed()
     }
 
     /// True when nothing is in flight and the last counted call finished at

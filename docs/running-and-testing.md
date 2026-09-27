@@ -226,7 +226,8 @@ request to a model starts a runner and loads the weights, which took 4.6
 seconds in this run; that request's `x_estia.load_ms` says so. The request
 shown came later, so `load_ms` is `null` and it took 0.32 seconds (`ms`).
 Requests that arrive while a model is loading wait for that one load. The
-server releases a model after 15 idle minutes (`serve --idle-unload-minutes`).
+server releases a model after 15 idle minutes, 3 on a constrained machine
+(`serve --idle-unload-minutes`); `estia recommend` shows this machine's tier.
 
 ### 5. Run the smoke test
 
@@ -689,7 +690,8 @@ shows each request and response in full.
 | `Error: Address already in use` | Another program holds the port | Pick another port with `--port`, or find the program: `lsof -nP -iTCP:27200 -sTCP:LISTEN`. |
 | `estia discover` finds nothing | The engine serves loopback only (`serve` without `--lan`, or `service install --local`), advertising is off (`--no-advertise`), or the network does not pass multicast between devices (guest networks and some routers isolate clients) | Connect by address: `estia status` on the engine's machine prints the URL. |
 | A request you gave up on still holds the model, and the next one waits | A known limit: a non-streaming request is not cancelled when its client disconnects; the generation runs to the end | Use `"stream": true` for anything a user may cancel; closing a stream cancels the generation. Keep `max_tokens` modest. |
-| `ps` or `top` shows an MLX runner using about 100 MB while the Mac is short of memory | On macOS, a process's resident size (RSS) leaves out the Metal buffers MLX keeps the weights and KV cache in. In one run, `ps` showed 102 MB for a `gemma4-e2b` runner whose footprint was 3.8 GB, 3.4 GB of it Metal buffers. | Read the runner's physical footprint instead: `GET /engine/stats` reports it per loaded model, as does the Memory column in Activity Monitor (`footprint <pid>` in a terminal). To free memory, let idle models unload (`--idle-unload-minutes`) or stop the engine. |
+| `ps` or `top` shows an MLX runner using about 100 MB while the Mac is short of memory | On macOS, a process's resident size (RSS) leaves out the Metal buffers MLX keeps the weights and KV cache in. In one run, `ps` showed 102 MB for a `gemma4-e2b` runner whose footprint was 3.8 GB, 3.4 GB of it Metal buffers. | Read the runner's physical footprint instead: `GET /engine/stats` reports it per loaded model, as does the Memory column in Activity Monitor (`footprint <pid>` in a terminal). To free memory, let idle models unload (`--idle-unload-minutes`), lower `--memory-budget`, or stop the engine. |
+| A request answers 503 `insufficient_memory` | The model is larger than the memory budget for this machine's tier (`estia recommend` prints both). | Use a smaller model, or raise the budget: `estia serve --memory-budget 10GB` (`service install --memory-budget` for the service). |
 | `estia serve` says it minted an admin token but did not print it | stderr was not a terminal, so the token would have gone to a log file | `estia token new local --replace` prints a new one. |
 
 When you report a problem, include `estia version`, the smoke test's output,

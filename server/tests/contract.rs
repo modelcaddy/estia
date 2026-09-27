@@ -8,7 +8,7 @@
 
 use estia_engine::models::ModelStore;
 use estia_engine::runtime::PythonRuntime;
-use estia_engine::{Engine, EngineConfig};
+use estia_engine::{Engine, EngineConfig, MemoryPolicy};
 use estia_server::tokens::{TokenStore, SCOPE_ADMIN};
 use estia_server::{router, serve_router, AppState, ConnLimits, DEFAULT_MAX_BODY_BYTES};
 use serde_json::{json, Value};
@@ -131,8 +131,10 @@ async fn start_with(configure: impl FnOnce(&AppState)) -> Harness {
     std::fs::create_dir_all(dir.join("models/embeddinggemma-300m-4bit")).unwrap();
     let runner = dir.join("fake_runner.py");
     std::fs::write(&runner, FAKE).unwrap();
-    let cfg =
-        EngineConfig::new(ModelStore::new(dir.join("models")), PythonRuntime::new(dir.join("runtime")), &runner).with_python("python3");
+    let cfg = EngineConfig::new(ModelStore::new(dir.join("models")), PythonRuntime::new(dir.join("runtime")), &runner)
+        .with_python("python3")
+        // The same on every machine: no budget and no slot limit unless a test sets them.
+        .with_memory(MemoryPolicy::unlimited());
     let engine = Arc::new(Engine::new(cfg));
     let tokens = TokenStore::open(dir.join("tokens.json")).unwrap();
     let admin = tokens.mint("admin", &[SCOPE_ADMIN]).unwrap();
@@ -584,4 +586,79 @@ async fn models_claim_vision_only_when_images_reach_them() {
     assert_eq!(s, 200);
     let r = reqwest::Client::new().put(format!("{}/engine/defaults", h.base)).bearer_auth(&h.admin).json(&defaults).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200, "the default table, vision included, passes its own check");
+}
+
+fn loaded(v: &Value) -> Vec<String> {
+    v["loaded"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// mem-F1: before a model loads, idle models are unloaded, least recently
+/// used first, until it fits the memory budget; `/engine/stats` reports the
+/// budget and what the resident models use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_unloads_the_least_recently_used_model_to_fit_the_budget() {
+    if !python3_available() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    // E2B (~2.8 GB estimated) and the embedding model fit 5 GB together;
+    // E4B (~3.9 GB) fits only once E2B, the older of the two, is gone.
+    let h = start_with(|s| s.set_memory_policy(MemoryPolicy::unlimited().with_budget(Some(5 * GIB)))).await;
+    std::fs::create_dir_all(h.dir.join("models/gemma4-e4b-it-4bit-mlx")).unwrap();
+    assert_eq!(post(&h, "/v1/chat/completions", chat("hi", 8)).await.0, 200);
+    assert_eq!(post(&h, "/engine/embed", json!({"inputs": ["x"]})).await.0, 200);
+    let (_, v) = get(&h, "/engine/stats").await;
+    assert_eq!(loaded(&v), ["embeddinggemma-300m-4bit", "gemma4-e2b-it-4bit-mlx"], "{v}");
+    assert_eq!(v["memory"]["budget_bytes"], json!(5 * GIB), "{v}");
+    assert!(v["memory"]["used_bytes"].as_u64().unwrap() > 2 * GIB, "estimates count: {v}");
+    let text = json!({"model": "text", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8});
+    let (s, body) = post(&h, "/v1/chat/completions", text).await;
+    assert_eq!(s, 200, "{body}");
+    let (_, v) = get(&h, "/engine/stats").await;
+    assert_eq!(loaded(&v), ["embeddinggemma-300m-4bit", "gemma4-e4b-it-4bit-mlx"], "E2B made room: {v}");
+    assert!(v["memory"]["used_bytes"].as_u64().unwrap() <= 5 * GIB, "{v}");
+}
+
+/// mem-F2: a model larger than the whole budget is refused with a 503 that
+/// names it and says what to do, and nothing is started or unloaded for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_larger_than_the_budget_is_refused() {
+    if !python3_available() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let h = start_with(|s| s.set_memory_policy(MemoryPolicy::unlimited().with_budget(Some(3 * GIB)))).await;
+    std::fs::create_dir_all(h.dir.join("models/gemma4-e4b-it-4bit-mlx")).unwrap();
+    assert_eq!(post(&h, "/v1/chat/completions", chat("hi", 8)).await.0, 200);
+    let spawns = log_lines(&h, "spawns.log").len();
+    let text = json!({"model": "text", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8});
+    let (s, v) = post(&h, "/v1/chat/completions", text).await;
+    assert_eq!(s, 503, "{v}");
+    assert_eq!(v["error"]["type"], "insufficient_memory", "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("gemma4-e4b-it-4bit-mlx") && msg.contains("--memory-budget"), "{msg}");
+    assert_eq!(log_lines(&h, "spawns.log").len(), spawns, "no runner started for it");
+    let (_, v) = get(&h, "/engine/stats").await;
+    assert_eq!(loaded(&v), ["gemma4-e2b-it-4bit-mlx"], "nothing unloaded for a load that cannot fit: {v}");
+}
+
+/// mem-F3: with one generation model at a time (a constrained machine),
+/// switching models unloads the other one; the embedding model stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_generation_model_at_a_time_when_the_policy_says_so() {
+    if !python3_available() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let h = start_with(|s| s.set_memory_policy(MemoryPolicy { max_generation_models: Some(1), ..MemoryPolicy::unlimited() })).await;
+    std::fs::create_dir_all(h.dir.join("models/gemma4-e4b-it-4bit-mlx")).unwrap();
+    assert_eq!(post(&h, "/engine/embed", json!({"inputs": ["x"]})).await.0, 200);
+    assert_eq!(post(&h, "/v1/chat/completions", chat("hi", 8)).await.0, 200);
+    let text = json!({"model": "text", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8});
+    assert_eq!(post(&h, "/v1/chat/completions", text).await.0, 200);
+    let (_, v) = get(&h, "/engine/stats").await;
+    assert_eq!(loaded(&v), ["embeddinggemma-300m-4bit", "gemma4-e4b-it-4bit-mlx"], "{v}");
+    assert_eq!(v["memory"]["max_generation_models"], 1, "{v}");
 }

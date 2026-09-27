@@ -57,7 +57,7 @@ Send `hello` once after spawn.
 ```
 
 ```json
-{"ok": true, "runner": "mlx-python", "version": "2.4.0", "protocol": 2,
+{"ok": true, "runner": "mlx-python", "version": "2.5.0", "protocol": 2,
  "capabilities": {"generate": true, "stream": true, "embed": true, "cancel": true,
                   "load": true, "chat": true, "tools": true, "prompt_cache": true,
                   "count_tokens": true, "structured": [],

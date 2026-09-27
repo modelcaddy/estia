@@ -109,7 +109,8 @@ async fn start_with(limits: ConnLimits) -> Harness {
 }
 
 async fn serve_engine(dir: std::path::PathBuf, cfg: EngineConfig, limits: ConnLimits) -> Harness {
-    let engine = Arc::new(Engine::new(cfg));
+    // The same on every machine, whatever its memory.
+    let engine = Arc::new(Engine::new(cfg.with_memory(estia_engine::MemoryPolicy::unlimited())));
     let tokens = TokenStore::open(dir.join("tokens.json")).unwrap();
     let admin = tokens.mint("admin", &[SCOPE_ADMIN]).unwrap();
     let embed_only = tokens.mint("embedder", &[SCOPE_EMBED]).unwrap();

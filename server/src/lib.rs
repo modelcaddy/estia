@@ -41,6 +41,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use estia_engine::machine::{self, MemoryPolicy};
 use estia_engine::models::embed::EmbedModel;
 use estia_engine::models::{Artifact, ResolveError};
 use estia_engine::{Backend, EmbedSession, Engine, EngineError, GenSession};
@@ -89,6 +90,11 @@ pub struct AppState {
     hosts: RwLock<HostPolicy>,
     /// Largest request body accepted, in bytes (see [`DEFAULT_MAX_BODY_BYTES`]).
     max_body: std::sync::atomic::AtomicUsize,
+    /// The memory budget and idle window (see [`AppState::set_memory_policy`]).
+    memory: RwLock<MemoryPolicy>,
+    /// Held while a model loads, so two loads never both count the same
+    /// free memory.
+    load_gate: Mutex<()>,
 }
 
 /// Default cap on a request body: 32 MiB, room for a full embed batch
@@ -209,6 +215,7 @@ impl AppState {
     /// hostname and whatever `ESTIA_ALLOWED_HOSTS` lists; add more with
     /// [`AppState::allow_hosts`].
     pub fn new(engine: Arc<Engine>, tokens: TokenStore, require_auth: bool, bind: SocketAddr) -> Self {
+        let engine_memory = engine.config().memory.clone();
         let data_dir = tokens.path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let mut hosts = HostPolicy::default();
         hosts.allow(machine_hostnames());
@@ -230,6 +237,93 @@ impl AppState {
             embed_loads: Mutex::new(HashMap::new()),
             hosts: RwLock::new(hosts),
             max_body: std::sync::atomic::AtomicUsize::new(max_body_from_env().unwrap_or(DEFAULT_MAX_BODY_BYTES)),
+            memory: RwLock::new(engine_memory),
+            load_gate: Mutex::new(()),
+        }
+    }
+
+    /// The memory policy in force: the engine's ([`EngineConfig::memory`](estia_engine::EngineConfig))
+    /// unless [`AppState::set_memory_policy`] replaced it.
+    pub fn memory_policy(&self) -> MemoryPolicy {
+        self.memory.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Replace the memory policy (the CLI's `--memory-budget` and
+    /// `--idle-unload-minutes`). Applies to the next model load.
+    pub fn set_memory_policy(&self, policy: MemoryPolicy) {
+        *self.memory.write().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    /// What resident models hold, by the larger of each runner's measured
+    /// footprint and the estimate for its model (a lazily loaded model
+    /// grows after its first request). Blocking: reads process tables.
+    pub fn memory_in_use(&self) -> u64 {
+        self.residents().iter().map(|r| r.bytes).sum()
+    }
+
+    fn residents(&self) -> Vec<Resident> {
+        let mut out: Vec<Resident> =
+            lock(&self.gen).iter().map(|(k, s)| Resident::new(k, true, s.pid(), s.idle_for(), s.in_flight())).collect();
+        out.extend(lock(&self.embed).iter().map(|(k, s)| Resident::new(k, false, s.pid(), s.idle_for(), s.in_flight())));
+        out
+    }
+
+    /// Unload least recently used idle models until a model needing `need`
+    /// bytes fits the budget, and, for a generation model, until there is a
+    /// free generation slot. Refuses (503) a model larger than the whole
+    /// budget, and one that would only fit by unloading a model in use.
+    fn make_room(&self, id: &str, generation: bool, need: u64) -> Result<(), ApiError> {
+        let policy = self.memory_policy();
+        if let Some(budget) = policy.budget_bytes {
+            if need > budget {
+                tracing::warn!(model = %id, need_bytes = need, budget_bytes = budget, "model is larger than the memory budget");
+                return Err(ApiError::insufficient_memory(format!(
+                    "model `{id}` needs about {} and the memory budget on this engine is {} ({} machine); \
+                     use a smaller model (see `estia recommend`) or raise the budget with `estia serve --memory-budget`",
+                    machine::gb(need),
+                    machine::gb(budget),
+                    policy.tier
+                )));
+            }
+        }
+        loop {
+            let residents = self.residents();
+            let used: u64 = residents.iter().map(|r| r.bytes).sum();
+            let gens = residents.iter().filter(|r| r.generation).count();
+            let slot_full = generation && policy.max_generation_models.is_some_and(|m| gens >= m);
+            let over = policy.budget_bytes.is_some_and(|b| used + need > b);
+            if !slot_full && !over {
+                return Ok(());
+            }
+            // Least recently used first; a generation slot is freed by a
+            // generation model.
+            let victim = residents
+                .iter()
+                .filter(|r| r.in_flight == 0 && r.id != id && (!slot_full || over || r.generation))
+                .max_by_key(|r| r.idle_for)
+                .cloned();
+            let Some(v) = victim else {
+                tracing::warn!(model = %id, need_bytes = need, used_bytes = used, "no idle model to unload; refusing the load");
+                return Err(ApiError::busy(format!(
+                    "model `{id}` does not fit beside the models in use on this engine (using {} of a {} budget); \
+                     retry when the current requests finish",
+                    machine::gb(used),
+                    policy.budget_bytes.map(machine::gb).unwrap_or_else(|| "unlimited".into())
+                )));
+            };
+            if v.generation {
+                lock(&self.gen).remove(&v.id);
+            } else {
+                lock(&self.embed).remove(&v.id);
+            }
+            tracing::info!(
+                model = %v.id,
+                for_model = %id,
+                freed_bytes = v.bytes,
+                idle_s = v.idle_for.as_secs(),
+                reason = if over { "memory budget" } else { "one generation model at a time" },
+                "unloaded a model to make room"
+            );
         }
     }
 
@@ -304,6 +398,8 @@ impl AppState {
     /// resident. Concurrent first requests share one load.
     pub(crate) fn gen_session_timed(&self, artifact: &Artifact) -> Result<(Arc<GenSession>, Option<u64>), ApiError> {
         resident(&self.gen, &self.gen_loads, artifact.id, || {
+            let _gate = lock(&self.load_gate);
+            self.make_room(artifact.id, true, estimate_bytes(artifact.id))?;
             let t0 = Instant::now();
             let s = self.engine.spawn_gen_session(artifact.id)?;
             // Load now rather than inside the first generation, so the log can say
@@ -329,6 +425,8 @@ impl AppState {
             .artifact_for(backend)
             .ok_or_else(|| resolve_error(ResolveError::NoArtifactForBackend { family: model.id.to_string(), backend }))?;
         resident(&self.embed, &self.embed_loads, artifact.id, || {
+            let _gate = lock(&self.load_gate);
+            self.make_room(artifact.id, false, estimate_bytes(artifact.id))?;
             let t0 = Instant::now();
             let s = self.engine.spawn_embed_model(model)?;
             s.load()?;
@@ -398,6 +496,29 @@ impl AppState {
     }
 }
 
+/// A resident session as [`AppState::make_room`] weighs it.
+#[derive(Debug, Clone)]
+struct Resident {
+    id: String,
+    generation: bool,
+    bytes: u64,
+    idle_for: std::time::Duration,
+    in_flight: usize,
+}
+
+impl Resident {
+    fn new(id: &str, generation: bool, pid: Option<u32>, idle_for: std::time::Duration, in_flight: usize) -> Self {
+        let measured = pid.and_then(estia_engine::procmem::tree_footprint).unwrap_or(0);
+        Resident { id: id.to_string(), generation, bytes: measured.max(estimate_bytes(id)), idle_for, in_flight }
+    }
+}
+
+/// About what the artifact `id` holds once loaded
+/// ([`machine::estimate_resident_bytes`]); 0 for an id the registry does not know.
+fn estimate_bytes(id: &str) -> u64 {
+    estia_engine::models::find_any_artifact(id).map(|a| machine::estimate_resident_bytes(a.required_disk_bytes, a.format)).unwrap_or(0)
+}
+
 /// A resident model in `/engine/stats`: see [`AppState::runners`].
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerInfo {
@@ -436,6 +557,14 @@ impl ApiError {
     }
     pub fn payload_too_large(m: impl Into<String>) -> Self {
         Self { status: StatusCode::PAYLOAD_TOO_LARGE, kind: "invalid_request_error", message: m.into() }
+    }
+    /// 503: the model cannot fit in this engine's memory budget at all.
+    pub fn insufficient_memory(m: impl Into<String>) -> Self {
+        Self { status: StatusCode::SERVICE_UNAVAILABLE, kind: "insufficient_memory", message: m.into() }
+    }
+    /// 503: it would fit, but only by unloading a model that is in use.
+    pub fn busy(m: impl Into<String>) -> Self {
+        Self { status: StatusCode::SERVICE_UNAVAILABLE, kind: "engine_busy", message: m.into() }
     }
 }
 
@@ -979,7 +1108,9 @@ pub struct ServeOptions {
     pub advertise: bool,
     /// Instance name for the advertisement; defaults to the hostname.
     pub name: Option<String>,
-    /// Drop a resident model after this much idle time (None = never).
+    /// Drop a resident model after this much idle time. `None` keeps the
+    /// memory policy's window ([`MemoryPolicy::idle_unload`]: 3 minutes on a
+    /// constrained machine, else 15); `Some(Duration::ZERO)` never unloads.
     pub idle_unload: Option<std::time::Duration>,
     /// Extra `Host` names to answer to (the CLI's `--allow-host`, repeatable),
     /// on top of IP literals, `localhost`, `*.local`, this machine's hostname
@@ -1423,6 +1554,12 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
+    let idle_unload = match opts.idle_unload {
+        Some(d) if d.is_zero() => None,
+        Some(d) => Some(d),
+        None => state.memory_policy().idle_unload,
+    };
+    let memory = state.memory_policy();
     let record = EngineRecord {
         pid: std::process::id(),
         port: bound.port(),
@@ -1442,7 +1579,11 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         auth = state.require_auth,
         lan = opts.lan,
         advertise = opts.advertise && !bound.ip().is_loopback(),
-        idle_unload_s = opts.idle_unload.map(|d| d.as_secs()),
+        idle_unload_s = idle_unload.map(|d| d.as_secs()),
+        tier = %memory.tier,
+        memory_budget = %memory.budget_bytes.map(machine::gb).unwrap_or_else(|| "off".into()),
+        max_generation_models = %memory.max_generation_models.map(|n| n.to_string()).unwrap_or_else(|| "budget".into()),
+        mlx_wired_limit = %memory.mlx_wired_limit_bytes.map(machine::gb).unwrap_or_else(|| "mlx default".into()),
         allowed_hosts = %if opts.allowed_hosts.is_empty() { "-".to_string() } else { opts.allowed_hosts.join(",") },
         max_body_bytes = state.max_body_bytes(),
         data_dir = %data_dir.display(),
@@ -1480,11 +1621,13 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
             }
         })
     });
-    if let Some(idle) = opts.idle_unload {
+    if let Some(idle) = idle_unload {
         let st = Arc::clone(&state);
+        // Often enough that a 3-minute window is not rounded up to 4.
+        let tick = (idle / 6).clamp(std::time::Duration::from_secs(5), std::time::Duration::from_secs(60));
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(tick).await;
                 let dropped = st.reap_idle(idle);
                 for d in dropped {
                     tracing::info!(model = %d, idle_s = idle.as_secs(), "released idle model");

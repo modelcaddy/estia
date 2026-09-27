@@ -27,7 +27,7 @@ until `unload` or until the process exits. A failed request answers
 
 | Request | Answer |
 |---|---|
-| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.4.0","protocol":2,"capabilities":{…}}` |
+| `{"type":"hello"}` | `{"ok":true,"runner":"mlx-python","version":"2.5.0","protocol":2,"capabilities":{…}}` |
 | `{"type":"load","model_path":…,"kind":"generation"\|"embedding"}` | `{"ok":true,"loaded":true,"ms":N}` |
 | `{"type":"unload","model_path":…}` | `{"ok":true,"unloaded":true\|false}` |
 | `{"type":"chat","model_path":…,"messages":[…],"tools":[…],"cache_key":…,"format":…,"max_tokens":…,"temperature":…}` | `{"text":"…","meta":{"prompt_tokens":N,"cached_tokens":N,"generation_tokens":N,"template":…,"generation_tps":…,"finish_reason":…}}` |
@@ -41,6 +41,12 @@ template; an assistant message's `tool_calls` are structured, so the template
 renders the `tool` results that answer them. `cache_key` keeps the KV cache for one conversation, so the next
 turn only prefills the new suffix. `meta.finish_reason` is `length` when
 `max_tokens` ran out, `tool_calls` when the text holds a call, else `stop`.
+
+The engine starts the runner with `ESTIA_MLX_WIRED_LIMIT_BYTES` and
+`ESTIA_MLX_CACHE_LIMIT_BYTES` from its memory policy. The runner caps MLX's
+wired memory (mlx-vlm otherwise asks for two thirds of RAM on every
+generation) and its buffer cache to them, and loads generation models lazily
+so that only the language model is read in until an image arrives.
 
 A user message may carry `images`: `[{"mime":"image/png","data":"<base64>"}]`.
 The runner decodes each to RGB, places it before the message text, and passes

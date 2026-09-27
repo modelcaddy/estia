@@ -38,6 +38,10 @@ breaking changes before 1.0.
 - **Images in, text out.** Chat messages can carry images (PNG, JPEG, WebP,
   GIF as `data:` URLs), and the Gemma 4 models read them on both backends.
   There is no audio or video input yet.
+- **Sized to the machine.** Estia classifies the machine (a 16 GB or fanless
+  Mac is `constrained`) and keeps resident models within a memory budget,
+  unloading the least recently used idle one before another loads. `estia
+  recommend` says which models fit. See [Memory](#memory).
 
 [ROADMAP.md](ROADMAP.md) lists what is planned, in order, with the check that
 closes each item.
@@ -170,7 +174,9 @@ print(r.choices[0].message.content)
 
 The first request to a model starts a runner process and loads the weights,
 which takes a few seconds. Later requests reuse it. The server releases a model
-after 15 idle minutes (`serve --idle-unload-minutes`, 0 to keep it loaded).
+after 15 idle minutes, 3 on a constrained machine (`serve
+--idle-unload-minutes`, 0 to keep it loaded), and unloads idle models early
+when another one needs the memory (see [Memory](#memory)).
 
 Give other programs their own tokens with only the scopes they need:
 
@@ -567,6 +573,59 @@ the running backend can load it (`*`), whether it is installed and its
 licence, along with imported models; `estia pull <id>` and `estia rm <id>`
 add and remove them.
 
+## Memory
+
+A loaded model holds gigabytes of memory, and on a Mac that memory is shared
+with the GPU and every open app. Estia sizes itself to the machine:
+
+```bash
+estia recommend
+```
+
+```text
+machine : Apple M2 (Mac14,2) · 16.0 GB RAM · 8 cores · no fan · tier constrained
+memory  : budget 8.0 GB · idle unload 3 min · one generation model at a time
+backend : mlx-python
+
+  family                memory  fits
+  gemma4-e2b            2.8 GB  yes  (reads images)
+  gemma4-e4b            3.9 GB  yes  (reads images)
+  gemma4-12b-qat        5.0 GB  yes  (reads images)
+  (each beside the embedding model, about 0.4 GB)
+
+text    → gemma4-e4b
+fast    → gemma4-e4b
+vision  → gemma4-e4b
+```
+
+`estia recommend --apply` binds those roles; `--json` prints it all.
+
+| Tier | Machine | Budget | Idle unload | Generation models at once | MLX wired memory |
+|---|---|---|---|---|---|
+| `constrained` | 16 GB or less, no fan, or 4 cores or fewer | 50 % of RAM | 3 min | 1 | at most 25 % of RAM |
+| `standard` | more than 16 GB, with a fan | 60 % | 15 min | as the budget allows | at most 50 % |
+| `capable` | 32 GB or more, with a fan | 70 % | 15 min | as the budget allows | MLX's default (two thirds) |
+
+- **The budget.** Before a model loads, the server unloads idle models, least
+  recently used first, until the new one fits. A model counts as the larger
+  of its runner's measured memory and an estimate from its size on disk. A
+  model larger than the whole budget is refused with a 503
+  (`insufficient_memory`); one that fits only by unloading a model in the
+  middle of a request gets a 503 `engine_busy`. Set it with `serve
+  --memory-budget 10GB` (or `off`); `GET /engine/stats` shows the budget and
+  what is in use.
+- **One generation model at a time** on a constrained machine, so switching
+  from `fast` to `text` unloads `fast`. `estia recommend` binds them to one
+  family there, so switching never reloads.
+- **MLX caps.** An MLX runner loads the language model only; the Gemma 4
+  vision and audio towers stay on disk until an image arrives (about 0.9 GB
+  less for E2B and E4B). Its wired memory, which macOS can neither compress
+  nor page out, is capped per tier: MLX's default of two thirds of RAM
+  (10.7 GB on a 16 GB Mac) stalled a fanless MacBook Air system-wide.
+
+To try a small machine's policy on a big one, set `ESTIA_FAKE_RAM_GB=8` or
+`ESTIA_DEVICE_TIER=constrained` before `estia serve` or `estia recommend`.
+
 ## HTTP API
 
 | Method | Path | Scope |
@@ -643,11 +702,12 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | Command | What it does |
 |---|---|
 | `setup` | Install the runtime, pull models for the roles (`--roles`, default `text,fast,embed`), write `config.json`, mint the first admin token |
-| `service install [--local] [--port] [--allow-host] [--log-level] [--log-format] [--max-body-bytes]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
+| `service install [--local] [--port] [--allow-host] [--log-level] [--log-format] [--max-body-bytes] [--memory-budget] [--idle-unload-minutes]` | Run the server at login under launchd (macOS) or systemd `--user` (Linux); LAN unless `--local` |
 | `service uninstall`, `start`, `stop`, `restart`, `status` | Manage that service |
 | `service logs [-n N] [-f]` | Print the last lines of the service log (40 by default); `-f` keeps following it |
-| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--no-auth`, `--max-body-bytes`, `--log-level`, `--log-format`) |
-| `status` | Data directory, runtime, runner, installed models, roles, running server, pending pairings, service |
+| `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--memory-budget`, `--no-auth`, `--max-body-bytes`, `--log-level`, `--log-format`) |
+| `recommend [--apply] [--json]` | This machine's memory tier and budget, which models fit, and the role bindings to use; `--apply` sets them |
+| `status` | Data directory, runtime, runner, machine and memory policy, installed models, roles, running server, pending pairings, service |
 | `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--once` for one snapshot) |
 | `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one |
 | `pair list`, `pair approve <id> [--allow-admin]`, `pair deny <id>` | Decide pairing requests; add `--engine` and `--token` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
@@ -710,6 +770,9 @@ directory answers.
 | `ESTIA_LLAMA_VARIANT` | The llama.cpp build `runtime install` picks: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`, `rocm` |
 | `ESTIA_ALLOWED_HOSTS` | Extra `Host` names the server answers to, comma-separated (same syntax as `serve --allow-host`) |
 | `ESTIA_MAX_BODY_BYTES` | Largest request body the server accepts, in bytes (default 33554432, 32 MiB; `serve --max-body-bytes` wins over it). A larger body gets a 413. For the service, use `service install --max-body-bytes`: the service does not see your shell's environment. |
+| `ESTIA_MEMORY_BUDGET` | Memory budget for resident models: `8GB`, `6144MB` or `off` (`serve --memory-budget` wins over it). See [Memory](#memory). |
+| `ESTIA_DEVICE_TIER` | `constrained`, `standard` or `capable`, whatever was detected. A testing aid. |
+| `ESTIA_FAKE_RAM_GB` | Pretend the machine has this much RAM; the tier follows. A testing aid. |
 | `ESTIA_MDNS_REFRESH_SECS` | How often the built-in Bonjour advertiser re-registers, in seconds (default 300). A testing aid; not used when macOS `dns-sd` does the advertising. |
 | `ESTIA_LOG` | What to log (same as `--log-level`): a level such as `debug`, or filter directives such as `estia_server=debug,mdns_sd=info`. Default: `info` for Estia, `warn` for libraries. See [docs/logging.md](docs/logging.md). |
 | `ESTIA_LOG_FORMAT` | `text` (default) or `json`, one object per line (same as `--log-format`) |

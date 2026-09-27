@@ -22,6 +22,7 @@ depending on it. Each limit below was checked against the code or a live run.
 | Structured output | llama.cpp constrains decoding to the JSON Schema. On MLX the engine puts the schema in the system prompt. Both then validate, repair and retry. |
 | Roles | `temperature`, `max_tokens` and `pin` are stored with a role and not applied. `embed` can be bound to any embedding model; unbound it means EmbeddingGemma 300M. |
 | Network | Plain HTTP. On the LAN, tokens, prompts and outputs are unencrypted. No CORS headers; cross-origin writes get 403. |
+| Memory | Resident models stay within a budget set by the machine's tier (half of RAM on a 16 GB or fanless Mac); idle models are unloaded, least recently used first, to make room. MLX runners load lazily and cap wired memory. Loads are refused rather than queued when the only way to fit is to unload a model in use. |
 | Scheduling | One call at a time per loaded model. Waiting calls go interactive first, then background, and otherwise in arrival order. There is no per-client queue, quota or rate limit. |
 | Request lifetime | A non-streaming request runs to the end after its client disconnects, and the next call waits for it. In a live run, a 600-token request abandoned after 1 s kept the model for 8.3 s, and a 5-token request behind it took 7.4 s. Request headers must arrive within 10 s, but a request body has no time limit: a connection that sent headers and then stalled was still open after 40 s. |
 | Clients | OpenAI SDKs work unchanged on `/v1/*`. There is no Estia SDK for pairing, discovery or `/engine/*`. The Rust `RemoteEngine` returns errors as text, without the HTTP status as a field or the request id. The crates are not on crates.io. |
@@ -184,6 +185,34 @@ number, total and a red circle, in one pass through the runner. On llama.cpp
 the mechanics are checked with tinygemma3 and its 1 MB projector: the image
 adds tokens, streams work, and a model without a projector is refused. Gemma
 4's GGUF projectors (about 1 GB for E2B and E4B) have not been run yet.
+
+### 5b. Memory budget and `estia recommend`
+
+**Why.** A model holds gigabytes of unified memory. With no notion of the
+machine, Estia loaded whatever was asked for and held it 15 minutes, and
+MLX's default wired-memory limit (two thirds of RAM, 10.7 GB on a 16 GB Mac)
+stalled a fanless MacBook Air system-wide. ModelCaddy needs this before it
+moves onto Estia.
+
+**What.** A machine profile and tier (`constrained`, `standard`,
+`capable`); a memory budget per tier, enforced before every load by
+unloading the least recently used idle model; one generation model at a time
+on a constrained machine; a shorter idle window there; per-tier caps on MLX
+wired and cache memory; lazy MLX loading; `estia recommend` for role
+bindings that fit; the budget in `/engine/stats`.
+
+**Exit check.** With `ESTIA_FAKE_RAM_GB=16`, `estia serve` logs
+`tier=constrained memory_budget=8.0 GB`; a `fast` request then a `text`
+request leaves only E4B loaded, and the log says E2B was unloaded to make
+room. With `--memory-budget 3GB`, a `text` request answers 503
+`insufficient_memory`. `estia recommend` on an 8 GB machine binds E2B.
+
+**Status (2026-09-27): built, for 0.5.0.** Checked live on a 32 GB M1 Pro
+posing as a 16 GB machine: E2B then E4B left only E4B loaded, the runner
+started with a 4 GB wired cap (it capped a 20 GB request to 4 GB), and lazy
+loading cut E2B's footprint from 3.68 to 2.79 GB and E4B's from 5.20 to 4.31
+GB; an image then added 0.33 GB to E4B as its vision tower loaded. It has
+not yet run on an actual 16 GB fanless Air.
 
 ### 6. Role options and `embed` rebinding
 

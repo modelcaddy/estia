@@ -16,6 +16,7 @@
 //! launch — sessions, deadlines, respawn, cancel — is the same.
 
 use crate::backend::Backend;
+use crate::machine::MemoryPolicy;
 use crate::models::embed::{self, EmbedModel};
 use crate::models::registry::{self, Artifact, ResolveError};
 use crate::models::ModelStore;
@@ -123,6 +124,11 @@ pub struct EngineConfig {
     /// The llama.cpp runtime, under the same root as the Python runtime by
     /// default.
     pub llama_runtime: LlamaRuntime,
+    /// What resident models may hold on this machine
+    /// ([`MemoryPolicy::detect`] by default). The engine hands an MLX runner
+    /// its wired and cache caps; a host that keeps several sessions reads the
+    /// budget and idle window from here.
+    pub memory: MemoryPolicy,
 }
 
 impl EngineConfig {
@@ -140,6 +146,7 @@ impl EngineConfig {
             backend: Backend::MlxPython,
             llama: None,
             llama_runtime,
+            memory: MemoryPolicy::detect(),
         }
     }
 
@@ -169,6 +176,11 @@ impl EngineConfig {
     pub fn with_llama(mut self, launch: LlamaLaunch) -> Self {
         self.llama = Some(launch);
         self.backend = Backend::LlamaCpp;
+        self
+    }
+
+    pub fn with_memory(mut self, memory: MemoryPolicy) -> Self {
+        self.memory = memory;
         self
     }
 
@@ -333,7 +345,11 @@ impl Engine {
                 if !self.cfg.resident_runner.exists() {
                     return Err(EngineError::NoRunner(self.cfg.resident_runner.clone()));
                 }
-                Ok(Launch::new(self.interpreter()?).arg(self.cfg.resident_runner.clone()))
+                let mut launch = Launch::new(self.interpreter()?).arg(self.cfg.resident_runner.clone());
+                for (k, v) in self.cfg.memory.mlx_env() {
+                    launch = launch.env(k, v);
+                }
+                Ok(launch)
             }
             Backend::LlamaCpp => {
                 let l = self.cfg.llama.as_ref().ok_or(EngineError::NoLlamaAdapter)?;

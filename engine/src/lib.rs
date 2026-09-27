@@ -22,6 +22,9 @@
 //! - [`Roles`]: stable names a client asks for (`text`, `fast`, `embed`, …),
 //!   bound to model families.
 //! - [`structured`]: JSON output repair and JSON Schema validation.
+//! - [`machine`]: what this machine can hold ([`machine::MachineProfile`],
+//!   [`machine::DeviceTier`]) and the [`machine::MemoryPolicy`] that follows:
+//!   the budget for resident models, the idle window, the MLX caps.
 //! - [`procmem`]: a process's physical memory by pid ([`phys_footprint`]),
 //!   for per-runner memory figures.
 //! - [`Engine`]: one value owning the store, the runtime, the resident
@@ -36,6 +39,7 @@ pub mod engine;
 pub mod error;
 pub mod handles;
 pub mod location;
+pub mod machine;
 pub mod models;
 pub mod oneshot;
 pub mod procmem;
@@ -52,6 +56,7 @@ pub use error::SessionError;
 pub use estia_proto as proto;
 pub use handles::{EmbedHandle, GenHandle};
 pub use location::EngineLocation;
+pub use machine::{DeviceTier, MachineProfile, MemoryPolicy};
 pub use oneshot::{OneShot, OneShotConfig};
 pub use procmem::phys_footprint;
 pub use remote::{RemoteEmbed, RemoteEngine, RemoteGen};

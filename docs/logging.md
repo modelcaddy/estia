@@ -245,13 +245,17 @@ does not apply to the request is left out.
 
 | Event (message) | Level | Fields |
 |---|---|---|
-| `estia serving` | info | `version`, `commit`, `api_version`, `protocol_version`, `url`, `bind`, `auth`, `lan`, `advertise`, `idle_unload_s`, `allowed_hosts`, `data_dir`, `backend`, `runner`, `pid` |
+| `estia serving` | info | `version`, `commit`, `api_version`, `protocol_version`, `url`, `bind`, `auth`, `lan`, `advertise`, `idle_unload_s`, `tier`, `memory_budget`, `max_generation_models`, `mlx_wired_limit`, `allowed_hosts`, `data_dir`, `backend`, `runner`, `pid` |
 | `runner started` | info | `model`, `pid`, `program` |
 | `runner handshake` | info | `model`, `pid`, `runner`, `runner_version`, `protocol`, `capabilities` |
 | `model loaded` | info | `model`, `kind`, `load_ms` (the runner's own measure) |
 | `generation model ready`, `embedding model ready` | info | `model`, `family` or `dims`, `ready_ms` (start, handshake and load together) |
 | `model load failed` | warn | `model`, `kind`, `error` |
 | `released idle model` | info | `model`, `idle_s` (`serve --idle-unload-minutes`) |
+| `unloaded a model to make room` | info | `model`, `for_model`, `freed_bytes`, `idle_s`, `reason` (`memory budget` or `one generation model at a time`) |
+| `model is larger than the memory budget` | warn | `model`, `need_bytes`, `budget_bytes` (the request got a 503) |
+| `no idle model to unload; refusing the load` | warn | `model`, `need_bytes`, `used_bytes` (the request got a 503) |
+| `estia-runner: memory caps: …` | info | a runner's stderr line: the wired and cache caps it applied |
 | `runner failed; starting a new one` | warn | `model`, `pid`, `exit` (`code N` or `signal N`), `cause` |
 | `runner did not answer in time; stopping it`, `runner stream silent too long; stopping it` | warn | `model`, `pid`, `secs` |
 | `runner exited mid-stream` | warn | `model`, `pid`, `exit` |

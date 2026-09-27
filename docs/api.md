@@ -90,7 +90,7 @@ The server speaks HTTP/1.1 only.
 | GET | `/engine/models/{id}/progress` | `models:read` | Server-sent events for the running download of `id` |
 | POST | `/engine/generate` | `generate` | Generate from a prompt or messages, optionally against a JSON Schema |
 | POST | `/engine/embed` | `embed` | Embeddings with task prefixes and a fingerprint |
-| GET | `/engine/stats` | `models:read` | Uptime, loaded models with their runner's pid and memory, queue depth, job count |
+| GET | `/engine/stats` | `models:read` | Uptime, loaded models with their runner's pid and memory, the memory budget, queue depth, job count |
 | GET | `/engine/jobs` | `models:read` | All jobs |
 | GET | `/engine/jobs/{id}` | `models:read` | One job |
 | GET | `/engine/jobs/{id}/events` | `models:read` | Server-sent events for one job until it ends |
@@ -141,6 +141,7 @@ Every error uses OpenAI's shape, plus the request id (see
 | 422 | Structured output still invalid after the retry; embedding fingerprint mismatch |
 | 429 | `POST /engine/pair` while 24 requests are pending, or 4 from the same address (type `rate_limit_error`) |
 | 500 | Runner failure, including a request the model's chat template refuses (llama-server's message is passed on); the pairing store could not be read or written (details in the server's log, under the request id) |
+| 503 | `insufficient_memory`: the model is larger than the engine's whole memory budget; `engine_busy`: it fits only by unloading a model that is serving a request (see [Memory](../README.md#memory)) |
 
 A body that is not JSON, lacks `Content-Type: application/json`, or does not
 fit the route's fields is rejected before the handler runs, with a 400, 415 or
@@ -436,6 +437,9 @@ From an MLX engine with two models loaded (keys regrouped):
 {"uptime_s": 30, "loaded": ["embeddinggemma-300m-4bit", "gemma4-e2b-it-4bit-mlx"],
  "models": [{"id": "embeddinggemma-300m-4bit", "kind": "embedding", "pid": 19640, "memory_bytes": 530566784},
             {"id": "gemma4-e2b-it-4bit-mlx", "kind": "generation", "pid": 19564, "memory_bytes": 3961055488}],
+ "memory": {"tier": "capable", "ram_bytes": 34359738368, "fanless": false,
+            "budget_bytes": 24051816857, "used_bytes": 4491622272, "idle_unload_s": 900,
+            "max_generation_models": null, "mlx_wired_limit_bytes": null, "mlx_cache_limit_bytes": 1073741824},
  "queue": {"interactive": 0, "background": 0}, "jobs": 0}
 ```
 
@@ -451,6 +455,14 @@ leaves out swapped ones. For a llama.cpp model the figure includes the
 replaced. `memory_bytes` is `null` when the memory cannot be read (a runner
 that just died, or a platform other than macOS and Linux). Reading stats never
 waits for a generation in progress.
+
+`memory` is the memory policy (see [Memory](../README.md#memory) in the
+README): the machine's `tier`, the `budget_bytes` resident models may hold
+together (`null`: no budget), and `used_bytes`, what they hold now, each
+model counted as the larger of its `memory_bytes` and an estimate from its
+size on disk. `max_generation_models` is 1 on a constrained machine and
+`null` elsewhere. The two `mlx_*` caps are what each MLX runner is started
+with; `null` is MLX's own default.
 
 `queue` counts the generation calls waiting, by priority.
 

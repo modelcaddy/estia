@@ -834,15 +834,30 @@ pub async fn deny_pairing(State(state): State<Arc<AppState>>, Path(id): Path<Str
 /// Uptime, what is loaded, queue depths, jobs. `models` has one entry per
 /// resident model: `id`, `kind`, the runner's `pid` and `memory_bytes`, the
 /// physical memory that runner holds (with any process it started); either
-/// is null when it cannot be told.
+/// is null when it cannot be told. `memory` is the memory policy: the
+/// machine's tier, the budget for resident models and what they use (each
+/// counted as the larger of its measured footprint and its estimate).
 pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let (interactive, background) = state.queue_depths();
     let st = Arc::clone(&state);
-    let models = spawn_blocking_in_span(move || st.runners()).await?;
+    let (models, used) = spawn_blocking_in_span(move || (st.runners(), st.memory_in_use())).await?;
+    let policy = state.memory_policy();
+    let machine = estia_engine::machine::profile();
     Ok(Json(json!({
         "uptime_s": state.started.elapsed().as_secs(),
         "loaded": state.loaded(),
         "models": models,
+        "memory": {
+            "tier": policy.tier,
+            "ram_bytes": machine.ram_bytes,
+            "fanless": machine.fanless,
+            "budget_bytes": policy.budget_bytes,
+            "used_bytes": used,
+            "idle_unload_s": policy.idle_unload.map(|d| d.as_secs()),
+            "max_generation_models": policy.max_generation_models,
+            "mlx_wired_limit_bytes": policy.mlx_wired_limit_bytes,
+            "mlx_cache_limit_bytes": policy.mlx_cache_limit_bytes,
+        },
         "queue": {"interactive": interactive, "background": background},
         "jobs": state.jobs.list().len(),
     })))

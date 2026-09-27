@@ -145,6 +145,16 @@ enum Cmd {
     Rm { id: String },
     /// Data dir, runtime, runner, installed models.
     Status,
+    /// What this machine can hold: its memory tier, the budget for resident
+    /// models, and which models to bind to `text`, `fast` and `vision`.
+    Recommend {
+        /// Bind the recommended models to their roles (config.json).
+        #[arg(long)]
+        apply: bool,
+        /// Print the recommendation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show or change role → family bindings (persisted in config.json).
     Roles {
         #[command(subcommand)]
@@ -259,8 +269,18 @@ enum Cmd {
         #[arg(long)]
         no_auth: bool,
         /// Release a resident model after this many idle minutes (0 = never).
-        #[arg(long, default_value_t = 15)]
-        idle_unload_minutes: u64,
+        /// Default: 3 on a constrained machine (16 GB or less, or no fan),
+        /// else 15. See `estia recommend`.
+        #[arg(long, value_name = "MINUTES")]
+        idle_unload_minutes: Option<u64>,
+        /// Most memory resident models may hold together, such as `8GB`, or
+        /// `off`. Before a model loads, idle models are unloaded, least
+        /// recently used first, until it fits; one larger than the whole
+        /// budget is refused with a 503. Default: half of RAM on a
+        /// constrained machine, 60 % on a standard one, 70 % on a capable
+        /// one (`ESTIA_MEMORY_BUDGET` overrides).
+        #[arg(long, value_name = "SIZE", value_parser = parse_memory_budget)]
+        memory_budget: Option<MemoryBudget>,
         /// Also accept requests whose Host header names this host (repeatable,
         /// or comma-separated): a reverse proxy's name, or a LAN name such as
         /// `mac.lan`. IP literals, `localhost` and `<name>.local` are always
@@ -340,6 +360,14 @@ enum ServiceAction {
         /// service accepts, in bytes (default 32 MiB).
         #[arg(long, value_name = "BYTES", value_parser = clap::value_parser!(u64).range(1..))]
         max_body_bytes: Option<u64>,
+        /// Passed to `serve --memory-budget`: the most memory resident models
+        /// may hold (`8GB`, or `off`). Default: from this machine's tier.
+        #[arg(long, value_name = "SIZE", value_parser = parse_memory_budget_arg)]
+        memory_budget: Option<String>,
+        /// Passed to `serve --idle-unload-minutes`. Default: from this
+        /// machine's tier (3 when constrained, else 15).
+        #[arg(long, value_name = "MINUTES")]
+        idle_unload_minutes: Option<u64>,
         // `--backend` (global) is passed to `serve` too when given.
     },
     Uninstall,
@@ -900,6 +928,9 @@ fn status(ctx: &Ctx) -> Result<()> {
     println!("models   : {}", ctx.store.models_dir().display());
     println!("backend  : {} ({})", ctx.backend, ctx.backend_source);
     println!("llama.cpp: {}", llama_runtime_line(ctx));
+    let [machine, memory] = machine_lines();
+    println!("machine  : {machine}");
+    println!("memory   : {memory}");
     // The MLX lines only where MLX can run.
     if Backend::MlxPython.supported_here() {
         let rt = ctx.runtime.status();
@@ -1071,6 +1102,126 @@ fn lan_ips() -> Vec<String> {
         }
     }
     out
+}
+
+/// `--memory-budget`: a size, or `off` (`None`).
+#[derive(Debug, Clone, Copy)]
+struct MemoryBudget(Option<u64>);
+
+fn parse_memory_budget(raw: &str) -> std::result::Result<MemoryBudget, String> {
+    estia_engine::machine::parse_budget(raw).map(MemoryBudget)
+}
+
+/// `service install --memory-budget`: checked here, passed on as written.
+fn parse_memory_budget_arg(raw: &str) -> std::result::Result<String, String> {
+    estia_engine::machine::parse_budget(raw).map(|_| raw.to_string())
+}
+
+/// This machine and its memory policy, for `status` and `recommend`.
+fn machine_lines() -> [String; 2] {
+    use estia_engine::machine::{gb, profile, MemoryPolicy};
+    let p = profile();
+    let m = MemoryPolicy::detect();
+    let overrides = if p.overrides.is_empty() { String::new() } else { format!(" · overridden: {}", p.overrides.join(" ")) };
+    [
+        format!(
+            "{} ({}) · {} RAM · {} cores{} · tier {}{overrides}",
+            safe(&p.chip),
+            safe(&p.model_id),
+            gb(p.ram_bytes),
+            p.logical_cores,
+            if p.fanless { " · no fan" } else { "" },
+            p.tier
+        ),
+        format!(
+            "budget {} · idle unload {} · {}",
+            m.budget_bytes.map(gb).unwrap_or_else(|| "off".into()),
+            m.idle_unload.map(|d| format!("{} min", d.as_secs() / 60)).unwrap_or_else(|| "never".into()),
+            match m.max_generation_models {
+                Some(1) => "one generation model at a time".to_string(),
+                Some(n) => format!("{n} generation models at a time"),
+                None => "generation models as the budget allows".to_string(),
+            }
+        ),
+    ]
+}
+
+fn recommend(ctx: &mut Ctx, apply: bool, json: bool) -> Result<()> {
+    use estia_engine::machine::{self, gb};
+    let policy = machine::MemoryPolicy::detect();
+    let backend = ctx.backend;
+    let embed_reserve = ctx
+        .engine()
+        .ok()
+        .and_then(|e| e.resolve_embedding(None).ok().map(|(_, a)| machine::estimate_resident_bytes(a.required_disk_bytes, a.format)))
+        .unwrap_or(0);
+    let r = machine::recommend(&policy, backend, embed_reserve);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"machine": machine::profile(), "memory": policy, "recommendation": r}))?
+        );
+    } else {
+        let [m, p] = machine_lines();
+        println!("machine : {m}");
+        println!("memory  : {p}");
+        println!("backend : {backend}");
+        println!();
+        println!("  {:<18} {:>9}  fits", "family", "memory");
+        for f in &r.families {
+            println!(
+                "  {:<18} {:>9}  {}{}",
+                safe(f.family),
+                gb(f.estimate_bytes),
+                if f.fits { "yes" } else { "no" },
+                if f.vision { "  (reads images)" } else { "" }
+            );
+        }
+        if embed_reserve > 0 {
+            println!("  (each beside the embedding model, about {})", gb(embed_reserve));
+        }
+        println!();
+    }
+    let wanted: Vec<(&str, &str)> =
+        [("text", r.text), ("fast", r.fast), ("vision", r.vision)].into_iter().filter_map(|(role, f)| f.map(|f| (role, f))).collect();
+    let mut changes = Vec::new();
+    for (role, family) in &wanted {
+        let current = ctx.roles.get(role).map(|b| b.family.clone());
+        if current.as_deref() != Some(*family) {
+            changes.push((*role, *family, current));
+        }
+    }
+    if !json {
+        for (role, family) in &wanted {
+            println!("{role:<7} → {}", safe(family));
+        }
+        if r.families.iter().all(|f| !f.fits) {
+            println!("\nno model fits the budget beside the embedding model; raise it with `estia serve --memory-budget`");
+        }
+        if changes.is_empty() {
+            println!("\nthe roles already match");
+        } else if !apply {
+            println!();
+            for (role, family, current) in &changes {
+                println!(
+                    "  estia roles set {role} {}   # now {}",
+                    safe(family),
+                    current.as_deref().map(safe).unwrap_or_else(|| "unset".into())
+                );
+            }
+            println!("\nor run `estia recommend --apply`; then `estia pull` any family not yet installed");
+        }
+    }
+    if apply && !changes.is_empty() {
+        for (role, family, _) in &changes {
+            ctx.roles.bind(role, RoleBinding::family(*family)).map_err(|e| anyhow!("{e}"))?;
+        }
+        ctx.save_roles()?;
+        if !json {
+            println!("\nroles updated; a running engine picks them up on restart (estia service restart)");
+        }
+    }
+    Ok(())
 }
 
 fn roles(ctx: &mut Ctx, action: Option<RolesAction>) -> Result<()> {
@@ -1493,7 +1644,8 @@ async fn serve(
     no_advertise: bool,
     name: Option<String>,
     no_auth: bool,
-    idle_unload_minutes: u64,
+    idle_unload_minutes: Option<u64>,
+    memory_budget: Option<MemoryBudget>,
     allow_host: Vec<String>,
     max_body_bytes: Option<u64>,
 ) -> Result<()> {
@@ -1528,7 +1680,11 @@ async fn serve(
             "LAN mode: devices pair with `estia pair request --engine http://<this machine>:{port}`; approve with `estia pair approve <id>`"
         );
     }
-    let idle_unload = if idle_unload_minutes == 0 { None } else { Some(std::time::Duration::from_secs(idle_unload_minutes * 60)) };
+    if let Some(MemoryBudget(b)) = memory_budget {
+        state.set_memory_policy(state.memory_policy().with_budget(b));
+    }
+    // Some(ZERO) is "never"; None keeps the memory policy's window.
+    let idle_unload = idle_unload_minutes.map(|m| std::time::Duration::from_secs(m * 60));
     estia_server::serve(
         state,
         ctx.data_dir.clone(),
@@ -1822,12 +1978,18 @@ fn stage_install(data_dir: &Path, runner: &Path) -> Result<(PathBuf, PathBuf)> {
 fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
     let logs = ctx.data_dir.join("logs");
     match action {
-        ServiceAction::Install { port, local, allow_host, log_level, log_format, max_body_bytes } => {
+        ServiceAction::Install { port, local, allow_host, log_level, log_format, max_body_bytes, memory_budget, idle_unload_minutes } => {
             // Checked before anything is staged: every path below lives under it.
             service_path(&ctx.data_dir)?;
             let mut args = service_args(port, local, &allow_host, log_level.as_deref(), log_format, ctx.backend_flag)?;
             if let Some(n) = max_body_bytes {
                 args.extend(["--max-body-bytes".to_string(), n.to_string()]);
+            }
+            if let Some(b) = memory_budget {
+                args.extend(["--memory-budget".to_string(), b.trim().to_string()]);
+            }
+            if let Some(m) = idle_unload_minutes {
+                args.extend(["--idle-unload-minutes".to_string(), m.to_string()]);
             }
             std::fs::create_dir_all(&logs)?;
             let runner = ctx
@@ -2884,6 +3046,7 @@ async fn run_cli() -> Result<()> {
         // Blocking HTTP inside: must leave the async context.
         Cmd::Status => tokio::task::block_in_place(|| status(&ctx)),
         Cmd::Roles { action } => roles(&mut ctx, action),
+        Cmd::Recommend { apply, json } => recommend(&mut ctx, apply, json),
         Cmd::Run { model, max_tokens, temperature, schema, json, no_stream, background, cancel_after_ms } => {
             tokio::task::block_in_place(|| run(&ctx, &model, max_tokens, temperature, schema, json, no_stream, background, cancel_after_ms))
         }
@@ -2908,11 +3071,27 @@ async fn run_cli() -> Result<()> {
             name,
             no_auth,
             idle_unload_minutes,
+            memory_budget,
             allow_host,
             max_body_bytes,
             log_level: _,
             log_format: _,
-        } => serve(&ctx, port, bind.as_deref(), lan, no_advertise, name, no_auth, idle_unload_minutes, allow_host, max_body_bytes).await,
+        } => {
+            serve(
+                &ctx,
+                port,
+                bind.as_deref(),
+                lan,
+                no_advertise,
+                name,
+                no_auth,
+                idle_unload_minutes,
+                memory_budget,
+                allow_host,
+                max_body_bytes,
+            )
+            .await
+        }
         Cmd::Token { action } => token(&ctx, action),
         Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),

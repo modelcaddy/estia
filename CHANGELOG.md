@@ -34,6 +34,38 @@ and use today's names (the project took the name Estia in 0.3.0).
 - Protocol: `Message.images` (`{mime, data}` base64) and
   `capabilities.images`.
 
+### Memory budget
+
+- The engine classifies the machine: `constrained` (16 GB or less, no fan,
+  or 4 cores or fewer), `standard`, or `capable` (32 GB or more with a fan).
+  `ESTIA_DEVICE_TIER` and `ESTIA_FAKE_RAM_GB` override the detection, to try
+  a small machine's policy on a big one.
+- Resident models stay within a memory budget: 50, 60 or 70 % of RAM by
+  tier, or `serve --memory-budget` / `ESTIA_MEMORY_BUDGET` (`off` turns it
+  off). Before a model loads, idle models are unloaded, least recently used
+  first, until it fits. A model larger than the budget answers 503
+  `insufficient_memory`; one that fits only by unloading a model in use
+  answers 503 `engine_busy`. Loads are serialised so two never count the
+  same free memory.
+- A constrained machine keeps one generation model at a time and unloads an
+  idle model after 3 minutes instead of 15. `serve --idle-unload-minutes`
+  still wins, and now defaults to the tier's window.
+- MLX runner 2.5.0: loads models lazily, reading in only the language model,
+  so the Gemma 4 vision and audio towers stay on disk until an image arrives
+  (0.9 GB less for E2B and E4B); caps wired memory to the tier's limit (a
+  quarter of RAM on a constrained machine, instead of MLX's two thirds) and
+  its buffer cache (256 MB there), from `ESTIA_MLX_WIRED_LIMIT_BYTES` and
+  `ESTIA_MLX_CACHE_LIMIT_BYTES`, which the engine sets.
+- `estia recommend` prints the tier, the budget, which Gemma 4 families fit,
+  and the `text`, `fast` and `vision` bindings to use; `--apply` sets them.
+  `estia status` shows the machine and its policy.
+- `/engine/stats` has a `memory` object: tier, RAM, budget, what resident
+  models use, and the caps.
+- `service install` passes `--memory-budget` and `--idle-unload-minutes` on.
+- For hosts: `estia_engine::machine` (profile, tier, `MemoryPolicy`,
+  `recommend`), `EngineConfig::memory` / `with_memory`, `Launch::env`, and
+  `idle_for` on sessions. `MemoryPolicy::unlimited()` is the old behaviour.
+
 ## 0.4.0 — 2026-09-27
 
 The first tagged release.
