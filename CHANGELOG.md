@@ -4,12 +4,13 @@ Changes to Estia, newest first. [docs/versioning.md](docs/versioning.md) says
 what the numbers mean: before 1.0, a new minor version (0.4 to 0.5) may break
 things and a patch version (0.4.0 to 0.4.1) does not.
 
-Estia was developed by ModelCaddy and moved into this repository with its
-history. The 0.1.0, 0.2.0 and 0.3.0 sections are retroactive: those versions
-were never tagged or published, and builds made before 0.4.0 report version
-0.0.1 or 0.1.0 whatever they contain. The sections group that history by
-milestone, each dated by its last commit, and use today's names (the project
-took the name Estia in 0.3.0).
+Estia was developed by ModelCaddy inside its app and became a standalone
+repository in 0.3.0; this repository's history starts there, and the earlier
+commits stay in ModelCaddy's own repository. The 0.1.0, 0.2.0 and 0.3.0
+sections are retroactive: those versions were never tagged or published, and
+builds made before 0.4.0 report version 0.0.1 or 0.1.0 whatever they contain.
+The sections group that history by milestone, each dated by its last commit,
+and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
