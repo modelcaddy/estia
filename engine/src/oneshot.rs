@@ -171,6 +171,10 @@ impl OneShot {
                             on_token(&t);
                         }
                     }
+                    Some(StreamEvent::Refused(e)) => {
+                        let _ = child.kill();
+                        break Err(SessionError::Refused(e));
+                    }
                     Some(StreamEvent::Error(e)) => {
                         let _ = child.kill();
                         break Err(SessionError::Runner(e));

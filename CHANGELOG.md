@@ -14,6 +14,14 @@ and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
+### Refused requests answer 400
+
+- A chat the model's chat template refuses (roles that do not alternate, say)
+  used to surface as a 500 `server_error`. The refusal now travels from
+  llama-server through the adapter's error line (`"refused": true`), and the
+  API answers 400 `invalid_request_error` with the template's own message. A
+  crashed or unreachable llama-server stays a 500 (#25).
+
 ### Image input
 
 - Chat messages can carry images: OpenAI `image_url` parts with a `data:` URL
