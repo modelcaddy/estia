@@ -326,6 +326,11 @@ pub enum ProtoError {
     /// The runner answered with an error envelope.
     #[error("runner error: {0}")]
     Runner(String),
+    /// The runner refused the request as invalid (llama-server's chat template
+    /// rejecting the conversation, say). The client's request is at fault, not
+    /// the runner.
+    #[error("runner refused the request: {0}")]
+    Refused(String),
     /// The line was not JSON.
     #[error("runner returned invalid JSON: {0}")]
     Invalid(#[from] serde_json::Error),
@@ -346,6 +351,9 @@ pub fn check_error(line: &str) -> Result<Value, ProtoError> {
     let v: Value = serde_json::from_str(line.trim())?;
     if let Some(err) = v.get("error") {
         if !err.is_null() {
+            if v.get("refused").and_then(Value::as_bool) == Some(true) {
+                return Err(ProtoError::Refused(error_text(err)));
+            }
             return Err(ProtoError::Runner(error_text(err)));
         }
     }
@@ -367,6 +375,9 @@ pub enum StreamEvent {
     Cancelled,
     /// The runner failed. Tokens already delivered stand; nothing is retried.
     Error(String),
+    /// The runner refused the request as invalid. Tokens already delivered
+    /// stand; nothing else follows.
+    Refused(String),
     /// Heartbeat with no content.
     Keepalive,
     /// Token accounting for the generation, sent just before `Done`.
@@ -387,6 +398,9 @@ pub fn parse_stream_line(line: &str) -> Option<StreamEvent> {
     let v: Value = serde_json::from_str(trimmed).ok()?;
     if let Some(err) = v.get("error") {
         if !err.is_null() {
+            if v.get("refused").and_then(Value::as_bool) == Some(true) {
+                return Some(StreamEvent::Refused(error_text(err)));
+            }
             return Some(StreamEvent::Error(error_text(err)));
         }
     }
@@ -492,5 +506,20 @@ mod tests {
         assert_eq!(parse_stream_line(r#"{"ok":false,"error":"nope"}"#), Some(StreamEvent::Error("nope".into())));
         assert_eq!(parse_stream_line(r#"{"progress":0.5}"#), Some(StreamEvent::Other));
         assert!(matches!(parse_stream_line(r#"{"type":"meta","prompt_tokens":10,"cached_tokens":4}"#), Some(StreamEvent::Meta(_))));
+    }
+
+    #[test]
+    fn refused_error_envelopes_carry_their_kind() {
+        assert!(matches!(
+            check_error(r#"{"error":"template refuses","refused":true}"#),
+            Err(ProtoError::Refused(m)) if m == "template refuses"
+        ));
+        assert!(matches!(
+            parse_stream_line(r#"{"error":"template refuses","refused":true}"#),
+            Some(StreamEvent::Refused(m)) if m == "template refuses"
+        ));
+        // Without the flag the envelope stays a plain runner error.
+        assert!(matches!(check_error(r#"{"error":"nope"}"#), Err(ProtoError::Runner(m)) if m == "nope"));
+        assert_eq!(parse_stream_line(r#"{"error":"gpu fell over"}"#), Some(StreamEvent::Error("gpu fell over".into())));
     }
 }

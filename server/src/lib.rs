@@ -583,7 +583,13 @@ impl IntoResponse for ApiError {
 
 impl From<estia_engine::SessionError> for ApiError {
     fn from(e: estia_engine::SessionError) -> Self {
-        ApiError::internal(format!("runner: {e}"))
+        match e {
+            // The runner refused the request — llama-server's chat template
+            // rejecting the conversation, say. The client's request is wrong,
+            // not this server broken.
+            estia_engine::SessionError::Refused(m) => ApiError::bad_request(m),
+            other => ApiError::internal(format!("runner: {other}")),
+        }
     }
 }
 /// Engine failures as HTTP. Clients may be on another machine, so messages
@@ -2463,5 +2469,26 @@ mod single_flight_tests {
             let (s, _) = resident(&live, &loads, "m", || Ok(1)).unwrap();
             assert_eq!(*s, 1, "retried after the failure");
         }
+    }
+}
+
+#[cfg(test)]
+mod refused_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_request_maps_to_400_invalid_request() {
+        let e = ApiError::from(estia_engine::SessionError::Refused(
+            "llama-server HTTP 400: the chat template refused this conversation".into(),
+        ));
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.kind, "invalid_request_error");
+    }
+
+    #[test]
+    fn other_runner_failures_stay_500() {
+        let e = ApiError::from(estia_engine::SessionError::Runner("boom".into()));
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.kind, "server_error");
     }
 }

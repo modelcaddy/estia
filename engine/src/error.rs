@@ -23,6 +23,11 @@ pub enum SessionError {
     /// The runner answered with an error envelope.
     #[error("runner error: {0}")]
     Runner(String),
+    /// The runner — and behind it llama-server — refused the request as
+    /// invalid (e.g. the chat template rejecting the conversation). The
+    /// client's request is at fault, not the engine.
+    #[error("runner refused the request: {0}")]
+    Refused(String),
     #[error("serialize request: {0}")]
     Serialize(#[source] serde_json::Error),
     #[error("parse runner response: {0}")]
@@ -64,6 +69,7 @@ impl From<ProtoError> for SessionError {
     fn from(e: ProtoError) -> Self {
         match e {
             ProtoError::Runner(msg) => SessionError::Runner(msg),
+            ProtoError::Refused(msg) => SessionError::Refused(msg),
             ProtoError::Invalid(err) => SessionError::Parse(err),
         }
     }
