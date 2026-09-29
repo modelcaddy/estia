@@ -87,6 +87,13 @@ Two more fields say how to read what the runner returns:
   because the same weights give different vectors on different backends.
   Runners that predate the field omit it; the MLX Python runner does not send
   it yet.
+- `llama_build` (optional, the llama adapter only): the llama.cpp build
+  number the adapter drives — `llama-server --version` reporting
+  `(build 11146, …)` sends `11146`. The adapter reads it once at startup;
+  the field is absent when the build could not be read (a missing or hanging
+  binary, or a version line without a build number) and is never sent by
+  other runners. When someone reports a llama.cpp problem, this is the first
+  thing to know.
 
 `estia runner-check` performs this handshake and prints the result without
 loading a model.
