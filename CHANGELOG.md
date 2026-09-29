@@ -43,6 +43,9 @@ and use today's names (the project took the name Estia in 0.3.0).
   to type; asking again replaces the app's token.
 - For Rust hosts: `estia_engine::find_local_engine` and
   `LocalEngine::claim_token`, and `default_data_dir`.
+- `estia setup --json`: progress as JSON lines (steps, download and install
+  percentages, `done`) for an app that installs the engine for the user; mints
+  no admin token.
 - LAN discovery moved from `estia-server` into `estia-engine`
   (`discovery::discover`, feature `discovery`), so a host app can find engines
   without the server crate. `estia_server::discover` still works.

@@ -74,6 +74,10 @@ enum Cmd {
         /// `cuda-12`, `cuda-13`, `rocm`, …). Default: probe this machine.
         #[arg(long)]
         variant: Option<String>,
+        /// Progress as JSON lines on stdout, for an app driving the install.
+        /// Mints no admin token.
+        #[arg(long)]
+        json: bool,
     },
     /// Run the engine at login (launchd on macOS, systemd --user on Linux).
     Service {
@@ -772,7 +776,49 @@ fn gb(bytes: u64) -> String {
     format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
 }
 
+/// `estia setup --json`: progress as JSON lines on stdout, for an app driving
+/// the install (ModelCaddy's "install the engine on this Mac"). One object per
+/// line with `event`: `step` (`step`, `status`: `start` | `done`, `detail`),
+/// `progress` (`step`, `phase`, `percent`, `bytes`, `total`, `message`), or
+/// `done`. Download progress is sent when the whole percent changes.
+static JSON_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn json_mode() -> bool {
+    JSON_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A setup line: `human` for a person, `json` (an object with `event`) for an app.
+fn say(human: impl AsRef<str>, json: serde_json::Value) {
+    if json_mode() {
+        println!("{json}");
+    } else {
+        println!("{}", human.as_ref());
+    }
+}
+
+fn json_progress(step: &str, phase: &str, done: Option<u64>, total: Option<u64>, message: &str) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<(String, String, u64)>> = Mutex::new(None);
+    let percent = match (done, total) {
+        (Some(d), Some(t)) if t > 0 => Some(d.min(t) * 100 / t),
+        _ => None,
+    };
+    let key = (step.to_string(), phase.to_string(), percent.unwrap_or(u64::MAX));
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.as_ref() == Some(&key) {
+        return;
+    }
+    *last = Some(key);
+    println!(
+        "{}",
+        serde_json::json!({"event": "progress", "step": step, "phase": phase, "percent": percent, "bytes": done, "total": total, "message": message})
+    );
+}
+
 fn print_progress(p: estia_engine::models::DownloadProgress) {
+    if json_mode() {
+        return json_progress("model", p.phase, Some(p.bytes_downloaded), p.total_bytes, p.file_name.as_deref().unwrap_or(""));
+    }
     let pct = match p.total_bytes {
         Some(t) if t > 0 => format!("{:>3}%", p.bytes_downloaded * 100 / t),
         _ => "    ".to_string(),
@@ -1739,6 +1785,9 @@ fn local_url(bind: &str, port: u16) -> String {
 
 /// Progress of a runtime install on one line of stderr.
 fn print_setup_progress(p: &estia_engine::runtime::SetupProgress) {
+    if json_mode() {
+        return json_progress("runtime", p.phase, p.bytes_done, p.bytes_total, &p.message);
+    }
     let pct = match (p.bytes_done, p.bytes_total) {
         (Some(d), Some(t)) if t > 0 => format!("{:>3}%", d.min(t) * 100 / t),
         _ => "    ".to_string(),
@@ -1753,17 +1802,25 @@ async fn ensure_runtime(ctx: &Ctx, variant: Option<&str>) -> Result<()> {
         Backend::MlxPython => {
             if ctx.runtime.is_installed() {
                 let st = ctx.runtime.status();
-                println!(
-                    "✓ runtime  : installed (python {}, mlx-lm {})",
-                    st.python_version.unwrap_or_else(|| "?".into()),
-                    st.mlx_lm_version.unwrap_or_else(|| "?".into())
+                let (py, lm) = (st.python_version.unwrap_or_else(|| "?".into()), st.mlx_lm_version.unwrap_or_else(|| "?".into()));
+                say(
+                    format!("✓ runtime  : installed (python {py}, mlx-lm {lm})"),
+                    serde_json::json!({"event": "step", "step": "runtime", "status": "done", "detail": format!("python {py}, mlx-lm {lm}, already installed")}),
                 );
             } else {
-                println!("… runtime  : installing Python + MLX (~700 MB, several minutes)");
+                say(
+                    "… runtime  : installing Python + MLX (~700 MB, several minutes)",
+                    serde_json::json!({"event": "step", "step": "runtime", "status": "start", "detail": "Python + MLX, about 700 MB"}),
+                );
                 ctx.runtime.preflight(estia_engine::runtime::RUNTIME_APPROX_BYTES)?;
                 let summary = ctx.runtime.install(|p| print_setup_progress(&p)).await?;
-                eprintln!();
-                println!("✓ runtime  : python {} / mlx-lm {}", summary.python_version, summary.mlx_lm_version);
+                if !json_mode() {
+                    eprintln!();
+                }
+                say(
+                    format!("✓ runtime  : python {} / mlx-lm {}", summary.python_version, summary.mlx_lm_version),
+                    serde_json::json!({"event": "step", "step": "runtime", "status": "done", "detail": format!("python {}, mlx-lm {}", summary.python_version, summary.mlx_lm_version)}),
+                );
             }
         }
         Backend::LlamaCpp => {
@@ -1794,9 +1851,13 @@ async fn ensure_runtime(ctx: &Ctx, variant: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&str>) -> Result<()> {
+async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&str>, json: bool) -> Result<()> {
     use estia_server::tokens::{TokenStore, SCOPE_ADMIN};
-    println!("estia setup — data dir {}", ctx.data_dir.display());
+    JSON_PROGRESS.store(json, std::sync::atomic::Ordering::Relaxed);
+    say(
+        format!("estia setup — data dir {}", ctx.data_dir.display()),
+        serde_json::json!({"event": "start", "data_dir": ctx.data_dir, "version": env!("CARGO_PKG_VERSION")}),
+    );
     if !ctx.backend.supported_here() {
         return Err(anyhow!("the {} backend cannot run on this machine; use --backend llama-cpp", ctx.backend));
     }
@@ -1804,7 +1865,10 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
         return Err(anyhow!("--variant is for the llama-cpp backend"));
     }
     std::fs::create_dir_all(&ctx.data_dir)?;
-    println!("✓ backend  : {} ({})", ctx.backend, ctx.backend_source);
+    say(
+        format!("✓ backend  : {} ({})", ctx.backend, ctx.backend_source),
+        serde_json::json!({"event": "step", "step": "backend", "status": "done", "detail": ctx.backend.to_string()}),
+    );
 
     // 1. Runtime.
     ensure_runtime(ctx, variant).await?;
@@ -1821,7 +1885,10 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
             };
             match found {
                 Ok(a) => wanted.push(a),
-                Err(e) => println!("! role `{}`: {} — skipped", safe(role), safe(&e.to_string())),
+                Err(e) => say(
+                    format!("! role `{}`: {} — skipped", safe(role), safe(&e.to_string())),
+                    serde_json::json!({"event": "warning", "detail": format!("role `{role}`: {e}")}),
+                ),
             }
         }
         wanted.dedup_by(|a, b| a.id == b.id);
@@ -1833,15 +1900,31 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
                 } else {
                     (ctx.store.bytes_on_disk(a.id).unwrap_or(0), "")
                 };
-                println!("✓ model    : {} ({}{how})", a.id, gb(bytes));
+                say(
+                    format!("✓ model    : {} ({}{how})", a.id, gb(bytes)),
+                    serde_json::json!({"event": "step", "step": "model", "model": a.id, "status": "done", "detail": "already installed"}),
+                );
             } else if a.repo_id.is_empty() {
-                println!("! model    : {} is imported but its file is missing (moved?) — `estia import` it again", safe(a.id));
+                say(
+                    format!("! model    : {} is imported but its file is missing (moved?) — `estia import` it again", safe(a.id)),
+                    serde_json::json!({"event": "warning", "detail": format!("model {} is imported but its file is missing", a.id)}),
+                );
             } else {
                 let spec = DownloadSpec::from(a);
-                println!("… model    : pulling {} ({} required)", spec.id, gb(spec.required_disk_bytes));
-                println!("  licence  : {}", license_text(a));
+                say(
+                    format!(
+                        "… model    : pulling {} ({} required)\n  licence  : {}",
+                        spec.id,
+                        gb(spec.required_disk_bytes),
+                        license_text(a)
+                    ),
+                    serde_json::json!({"event": "step", "step": "model", "model": spec.id, "status": "start", "bytes": spec.required_disk_bytes, "licence": license_text(a)}),
+                );
                 ctx.store.download(&spec, print_progress).await?;
-                println!("✓ model    : {}", spec.id);
+                say(
+                    format!("✓ model    : {}", spec.id),
+                    serde_json::json!({"event": "step", "step": "model", "model": spec.id, "status": "done"}),
+                );
             }
         }
     }
@@ -1853,16 +1936,28 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
     // and a later default change still applies.
     let pin = if ctx.backend_source == BACKEND_SOURCE_DEFAULT { None } else { Some(ctx.backend) };
     ctx.save_config(pin)?;
-    println!("✓ config   : {} config.json (backend {})", if had_config { "updated" } else { "wrote" }, ctx.backend);
+    say(
+        format!("✓ config   : {} config.json (backend {})", if had_config { "updated" } else { "wrote" }, ctx.backend),
+        serde_json::json!({"event": "step", "step": "config", "status": "done"}),
+    );
     let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
-    if tokens.is_empty() {
+    if tokens.is_empty() && !json {
         let t = tokens.mint("local", &[SCOPE_ADMIN])?;
         println!("✓ token    : admin token `local` minted — shown once, keep it:\n\n    {t}\n");
-    } else {
+    } else if !json {
         println!("✓ token    : {} token(s) in tokens.json (estia token new <name> for another)", tokens.list().len());
     }
     if ctx.backend == Backend::MlxPython && ctx.runner().is_none() {
-        println!("! runner   : estia-runner.py not found — pass --runner or set ESTIA_RUNNER");
+        say(
+            "! runner   : estia-runner.py not found — pass --runner or set ESTIA_RUNNER",
+            serde_json::json!({"event": "warning", "detail": "estia-runner.py not found"}),
+        );
+    }
+    if json {
+        // An app joins through the same-user secret; no admin token is minted
+        // or printed where it would land in the app's logs.
+        println!("{}", serde_json::json!({"event": "done"}));
+        return Ok(());
     }
     println!(
         "\nnext:
@@ -3055,7 +3150,7 @@ async fn run_cli() -> Result<()> {
             chat(&ctx, &model, system.as_deref(), cache_key.as_deref(), tools, max_tokens, temperature, two_turns, &images)
         }),
         Cmd::Tokens { model } => tokio::task::block_in_place(|| tokens(&ctx, &model)),
-        Cmd::Setup { roles, no_models, variant } => setup(&ctx, &roles, no_models, variant.as_deref()).await,
+        Cmd::Setup { roles, no_models, variant, json } => setup(&ctx, &roles, no_models, variant.as_deref(), json).await,
         Cmd::Service { action } => service(&ctx, action),
         Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
         Cmd::Serve {
