@@ -34,6 +34,16 @@ and use today's names (the project took the name Estia in 0.3.0).
 - Protocol: `Message.images` (`{mime, data}` base64) and
   `capabilities.images`.
 
+### Fixed
+
+- The Rust remote client (`RemoteEngine`) panicked when built, used or
+  dropped on a Tokio worker thread, which is where a host's async code calls
+  it. It now moves its blocking HTTP work to a plain thread when called
+  inside a runtime.
+- `/engine/generate` dropped images sent in the protocol's own message form
+  (`images: [{mime, data}]`, what `RemoteEngine` sends), so the model answered
+  as if there were none. They are taken and checked like `image_url` parts.
+
 ### Memory budget
 
 - The engine classifies the machine: `constrained` (16 GB or less, no fan,
