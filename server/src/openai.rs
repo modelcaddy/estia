@@ -36,6 +36,11 @@ pub struct OaiMessage {
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<Value>>,
+    /// The protocol's own form (`[{"mime", "data"}]`, base64), which
+    /// `RemoteEngine` sends on `/engine/*`. Checked exactly like `image_url`
+    /// parts; the declared `mime` is not trusted, the bytes say what it is.
+    #[serde(default)]
+    pub images: Option<Vec<ImageData>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +115,6 @@ fn content_parts(v: &Option<Value>) -> Result<(String, Vec<ImageData>), ApiError
 /// A `data:image/...;base64,...` URL as an image the runner can take. The
 /// format is read from the bytes, not trusted from the URL.
 pub(crate) fn image_from_data_url(url: &str) -> Result<ImageData, ApiError> {
-    use base64::Engine as _;
     let url = url.trim();
     let Some(rest) = url.strip_prefix("data:") else {
         let shown: String = url.chars().take(40).collect();
@@ -127,6 +131,13 @@ pub(crate) fn image_from_data_url(url: &str) -> Result<ImageData, ApiError> {
     if !["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"].contains(&declared.as_str()) {
         return Err(ApiError::bad_request(format!("image type `{declared}` is not supported; send PNG, JPEG, WebP or GIF")));
     }
+    image_from_base64(payload)
+}
+
+/// Base64 image data as an image the runner can take: size-checked, decoded,
+/// and its format read from the bytes.
+fn image_from_base64(payload: &str) -> Result<ImageData, ApiError> {
+    use base64::Engine as _;
     let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     // Rough size check before decoding: base64 is 4 characters per 3 bytes.
     if compact.len() / 4 * 3 > MAX_IMAGE_BYTES + 3 {
@@ -177,7 +188,10 @@ pub(crate) fn to_messages(msgs: &[OaiMessage]) -> Result<Vec<Message>, ApiError>
     let mut total = 0usize;
     let mut out = Vec::with_capacity(msgs.len());
     for m in msgs {
-        let (content, images) = content_parts(&m.content)?;
+        let (content, mut images) = content_parts(&m.content)?;
+        for native in m.images.iter().flatten() {
+            images.push(image_from_base64(&native.data)?);
+        }
         if !images.is_empty() && m.role != "user" {
             return Err(ApiError::bad_request(format!("images are accepted in user messages only, not in a `{}` message", m.role)));
         }
@@ -783,7 +797,7 @@ mod image_tests {
     }
 
     fn user(content: Value) -> OaiMessage {
-        OaiMessage { role: "user".into(), content: Some(content), name: None, tool_call_id: None, tool_calls: None }
+        OaiMessage { role: "user".into(), content: Some(content), name: None, tool_call_id: None, tool_calls: None, images: None }
     }
 
     #[test]
@@ -842,6 +856,34 @@ mod image_tests {
         // Plain strings stay plain.
         let out = to_messages(&[user(json!("hi"))]).unwrap();
         assert!(out[0].images.is_none());
+    }
+
+    /// The bug this guards: `/engine/generate` took `images` in the protocol's
+    /// own form (what `RemoteEngine` sends) as an unknown field and dropped
+    /// them, so a remote client's picture never reached the model, which
+    /// answered as if there were none.
+    #[test]
+    fn protocol_form_images_are_taken_and_checked() {
+        let png = base64::engine::general_purpose::STANDARD.encode(PNG);
+        // Exactly what a proto `Message` serializes to.
+        let wire = serde_json::to_value(
+            Message::new("user", "what is this?")
+                .with_images(vec![ImageData { mime: "application/octet-stream".into(), data: png.clone() }]),
+        )
+        .unwrap();
+        let m: OaiMessage = serde_json::from_value(wire).unwrap();
+        let out = to_messages(&[m]).unwrap();
+        let img = &out[0].images.as_ref().expect("the image survives")[0];
+        assert_eq!(img.mime, "image/png", "the bytes decide the type, not the declared mime");
+        assert_eq!(out[0].content, "what is this?");
+
+        let bad: OaiMessage =
+            serde_json::from_value(json!({"role": "user", "content": "x", "images": [{"mime": "image/png", "data": "bm90IGFuIGltYWdl"}]}))
+                .unwrap();
+        assert_eq!(to_messages(&[bad]).unwrap_err().status.as_u16(), 400, "not an image");
+        let sys: OaiMessage =
+            serde_json::from_value(json!({"role": "system", "content": "x", "images": [{"mime": "image/png", "data": png}]})).unwrap();
+        assert_eq!(to_messages(&[sys]).unwrap_err().status.as_u16(), 400, "user turns only");
     }
 
     #[test]
