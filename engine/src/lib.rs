@@ -37,6 +37,8 @@
 //! The wire types live in [`proto`] (re-exported `estia-proto`).
 
 pub mod backend;
+#[cfg(feature = "discovery")]
+pub mod discovery;
 pub mod engine;
 pub mod error;
 pub mod handles;

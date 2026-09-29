@@ -31,6 +31,8 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # not download executable code (for example a sandboxed, store-distributed app)
 # contains none of it.
 flate2 = { version = "1", optional = true }
+# Finding engines on the LAN (discovery): Bonjour/mDNS browse.
+mdns-sd = { workspace = true, optional = true }
 tar = { version = "0.4", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -39,6 +41,8 @@ libc = "0.2"
 
 [features]
 default = []
+# `discovery::discover`: engines advertising `_estia._tcp` on the LAN.
+discovery = ["dep:mdns-sd"]
 # The downloaded-Python + mlx runtime installer.
 python-mlx = ["dep:flate2", "dep:tar"]
 # The llama.cpp runtime installer (runtime::llama): downloads upstream's

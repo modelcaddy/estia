@@ -13,7 +13,7 @@ categories = ["artificial-intelligence", "web-programming::http-server"]
 [dependencies]
 # Image data URLs in chat messages.
 base64 = "0.22"
-estia-engine = { path = "../engine", version = "0.4.0" }
+estia-engine = { path = "../engine", version = "0.4.0", features = ["discovery"] }
 anyhow.workspace = true
 axum.workspace = true
 getrandom.workspace = true
