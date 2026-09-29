@@ -26,7 +26,35 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+
+/// The llama.cpp build this adapter drives, read from `llama-server
+/// --version` once at adapter start. `None` until then, or when the binary
+/// could not be asked (missing, hanging, or a version line without a build
+/// number); the hello reply then simply omits the field.
+pub(crate) static LLAMA_BUILD: OnceLock<Option<u32>> = OnceLock::new();
+
+/// Ask `llama-server --version` for its build number. `--version` prints and
+/// exits without loading a model, so no timeout is applied: a binary that
+/// hangs or is missing leaves the build unreported instead of failing the
+/// adapter (#28).
+pub(crate) fn probe_llama_build(server_bin: &Path) -> Option<u32> {
+    let out = Command::new(server_bin).arg("--version").output().ok()?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let line = text.lines().map(str::trim).find(|l| l.starts_with("version:"))?;
+    parse_build(line)
+}
+
+/// The build number in a `--version` line:
+/// `version: 0.5.0-dev (build 11146, commit 7fe450e19)` → 11146.
+pub(crate) fn parse_build(version_line: &str) -> Option<u32> {
+    let rest = &version_line[version_line.find("build ")? + 6..];
+    rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
+}
 use std::time::{Duration, Instant};
 
 /// `-c` for generation models when the command line gives no `--ctx`.
@@ -693,6 +721,20 @@ pub(crate) fn health(endpoint: &Endpoint) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_numbers_come_out_of_version_lines() {
+        assert_eq!(
+            parse_build("version: 0.5.0-dev (build 11146, commit 7fe450e19)"),
+            Some(11146)
+        );
+        assert_eq!(parse_build("version: 0.5.0 (build 42)"), Some(42));
+        assert_eq!(parse_build("version: 0.5.0-dev"), None);
+        assert_eq!(parse_build(""), None);
+        // A commit hash after "build " is not digits, so it reads as absent
+        // rather than as a wrong number.
+        assert_eq!(parse_build("version: 0.5.0-dev (build x, commit 7fe450e19)"), None);
+    }
 
     fn strs(v: &[OsString]) -> Vec<String> {
         v.iter().map(|s| s.to_string_lossy().into_owned()).collect()

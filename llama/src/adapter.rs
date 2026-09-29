@@ -135,13 +135,19 @@ pub fn capabilities() -> estia_proto::Capabilities {
 }
 
 pub(crate) fn hello() -> Value {
-    json!({
+    let mut v = json!({
         "ok": true,
         "runner": RUNNER,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": estia_proto::PROTOCOL_VERSION,
         "capabilities": capabilities(),
-    })
+    });
+    // The llama.cpp build this adapter drives (#28). Absent when the build
+    // could not be read at startup.
+    if let Some(build) = crate::server::LLAMA_BUILD.get().copied().flatten() {
+        v["llama_build"] = json!(build);
+    }
+    v
 }
 
 pub(crate) struct Adapter {
@@ -965,6 +971,15 @@ mod tests {
         let out = Out::new(Box::new(sink.clone()));
         assert!(matches!(a.handle(1, &req, &out).unwrap(), Flow::Continue));
         sink.lines()
+    }
+
+    #[test]
+    fn hello_names_the_llama_build_when_known() {
+        // The OnceLock is process-wide; whichever test sets it first, both
+        // this and the contract test above stay valid (the field is optional).
+        let _ = crate::server::LLAMA_BUILD.set(Some(11146));
+        let v = hello();
+        assert_eq!(v["llama_build"], json!(11146));
     }
 
     #[test]

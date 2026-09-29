@@ -914,7 +914,19 @@ fn models(ctx: &Ctx) -> Result<()> {
 /// installed pinned build, or how to install it.
 fn llama_runtime_line(ctx: &Ctx) -> String {
     if let LlamaServer::Path(p) = LlamaServer::from_env() {
-        return format!("ESTIA_LLAMA_SERVER={}{}", safe(&p.display().to_string()), if p.is_file() { "" } else { " (missing!)" });
+        // Which build the operator's own binary actually is — the pinned-build
+        // line below cannot answer for a binary from elsewhere (#28).
+        let driven = p
+            .is_file()
+            .then(|| {
+                estia_engine::runtime::llama::server_version(&p, std::time::Duration::from_secs(10))
+                    .ok()
+                    .and_then(|l| estia_engine::runtime::llama::parse_build(&l))
+            })
+            .flatten()
+            .map(|b| format!(" · llama.cpp b{b}"))
+            .unwrap_or_default();
+        return format!("ESTIA_LLAMA_SERVER={}{}{}", safe(&p.display().to_string()), if p.is_file() { "" } else { " (missing!)" }, driven);
     }
     let st = ctx.llama_runtime.status();
     match (&st.variant, &st.server_path) {
@@ -1506,6 +1518,12 @@ fn runner_check(ctx: &Ctx) -> Result<()> {
     match hello {
         Some(h) => {
             println!("protocol : v{} ({} {})", h.protocol, safe(&h.runner), safe(&h.version));
+            // Which llama.cpp build the adapter actually drives, from the
+            // hello handshake (#28) — also true for an engine on another
+            // machine, where the local `--version` probe above cannot reach.
+            if let Some(b) = h.llama_build {
+                println!("llama.cpp : b{b}");
+            }
             println!("{}", serde_json::to_string_pretty(&h.capabilities)?);
             if h.protocol > estia_engine::proto::PROTOCOL_VERSION {
                 eprintln!(

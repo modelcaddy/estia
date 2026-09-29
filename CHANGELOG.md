@@ -14,6 +14,18 @@ and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
+### The llama build travels with the handshake
+
+- `estia runner-check --backend llama` and `estia status` now show which
+  llama.cpp build is actually driven, not only the adapter's own version:
+  the adapter reads `llama-server --version` once at startup and adds an
+  optional `llama_build` field to its hello reply (documented in
+  docs/protocol.md), which `runner-check` prints as `llama.cpp b<N>`. This
+  holds for an engine on another machine too, where a local `--version`
+  probe cannot reach. `estia status` also shows the build for a binary set
+  through `ESTIA_LLAMA_SERVER`, which previously displayed only its path
+  (#28).
+
 ### Image input
 
 - Chat messages can carry images: OpenAI `image_url` parts with a `data:` URL

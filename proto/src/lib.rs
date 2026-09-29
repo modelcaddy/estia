@@ -305,6 +305,10 @@ pub struct HelloResp {
     pub protocol: u32,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// The llama.cpp build the runner drives (`b11146` sends `11146`). The
+    /// llama adapter only, and absent when the build could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llama_build: Option<u32>,
 }
 
 /// Answer to `load`.
@@ -492,5 +496,23 @@ mod tests {
         assert_eq!(parse_stream_line(r#"{"ok":false,"error":"nope"}"#), Some(StreamEvent::Error("nope".into())));
         assert_eq!(parse_stream_line(r#"{"progress":0.5}"#), Some(StreamEvent::Other));
         assert!(matches!(parse_stream_line(r#"{"type":"meta","prompt_tokens":10,"cached_tokens":4}"#), Some(StreamEvent::Meta(_))));
+    }
+
+    #[test]
+    fn hello_carries_the_llama_build_only_when_present() {
+        let h: HelloResp = serde_json::from_str(
+            r#"{"ok":true,"runner":"estia-llama","version":"0.4.0","protocol":2,"llama_build":11146}"#,
+        )
+        .unwrap();
+        assert_eq!(h.llama_build, Some(11146));
+
+        // A runner that omits the field is read conservatively, like any
+        // other optional part of the handshake.
+        let h: HelloResp = serde_json::from_str(
+            r#"{"ok":true,"runner":"mlx-python","version":"2.5.0","protocol":2}"#,
+        )
+        .unwrap();
+        assert_eq!(h.llama_build, None);
+        let _ = serde_json::to_string(&h).unwrap();
     }
 }

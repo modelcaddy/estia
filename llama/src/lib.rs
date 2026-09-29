@@ -99,6 +99,10 @@ impl AdapterOptions {
 /// else. Nothing but protocol lines is written to stdout; logs, including
 /// `llama-server`'s output (prefixed `[llama-server <pid>]`), go to stderr.
 pub fn run_stdio(opts: AdapterOptions) -> anyhow::Result<()> {
+    // Which llama.cpp build this adapter drives, for the hello handshake
+    // (#28): read once here, so a hanging or missing binary cannot stall a
+    // request later; `None` simply leaves the field out of the reply.
+    let _ = server::LLAMA_BUILD.set(server::probe_llama_build(&opts.server_bin));
     let shared = Arc::new(server::Shared::default());
     lifecycle::install_signal_handlers();
     lifecycle::spawn_watchdog(Arc::clone(&shared));
