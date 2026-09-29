@@ -60,7 +60,7 @@ pub use engine::{Engine, EngineConfig, EngineError, LlamaLaunch, LlamaServer, Re
 pub use error::SessionError;
 pub use estia_proto as proto;
 pub use handles::{EmbedHandle, GenHandle};
-pub use local::{default_data_dir, find_local_engine, LocalEngine};
+pub use local::{configured_data_dir, default_data_dir, find_local_engine, LocalEngine};
 pub use location::EngineLocation;
 pub use machine::{DeviceTier, MachineProfile, MemoryPolicy};
 pub use oneshot::{OneShot, OneShotConfig};

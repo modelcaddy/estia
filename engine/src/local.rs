@@ -26,6 +26,13 @@ pub fn default_data_dir() -> PathBuf {
     }
 }
 
+/// The data directory `estia` uses when not given one on the command line:
+/// `ESTIA_DATA_DIR` when set, else [`default_data_dir`]. What an app should
+/// look in to find the engine the user runs.
+pub fn configured_data_dir() -> PathBuf {
+    std::env::var_os("ESTIA_DATA_DIR").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(default_data_dir)
+}
+
 /// A running engine found through its data directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEngine {
@@ -43,11 +50,11 @@ struct Record {
     bind: String,
 }
 
-/// The engine recorded in `data_dir` (default: [`default_data_dir`]), when
+/// The engine recorded in `data_dir` (default: [`configured_data_dir`]), when
 /// something answers on its port. `None` when there is no record, or the
 /// engine that wrote it has gone.
 pub fn find_local_engine(data_dir: Option<&Path>) -> Option<LocalEngine> {
-    let data_dir = data_dir.map(Path::to_path_buf).unwrap_or_else(default_data_dir);
+    let data_dir = data_dir.map(Path::to_path_buf).unwrap_or_else(configured_data_dir);
     let text = std::fs::read_to_string(data_dir.join("engine.json")).ok()?;
     let rec: Record = serde_json::from_str(&text).ok()?;
     let ip: IpAddr = rec.bind.trim_start_matches('[').trim_end_matches(']').parse().ok()?;
