@@ -27,6 +27,7 @@ pub mod access;
 pub mod catalog;
 pub mod engine_api;
 pub mod jobs;
+pub mod local_access;
 pub mod openai;
 pub mod pairing;
 pub mod tokens;
@@ -95,6 +96,9 @@ pub struct AppState {
     /// Held while a model loads, so two loads never both count the same
     /// free memory.
     load_gate: Mutex<()>,
+    /// The secret a same-user app on this machine trades for a token
+    /// ([`local_access`]); `None` until [`serve`] publishes one.
+    local_secret: RwLock<Option<String>>,
 }
 
 /// Default cap on a request body: 32 MiB, room for a full embed batch
@@ -239,7 +243,17 @@ impl AppState {
             max_body: std::sync::atomic::AtomicUsize::new(max_body_from_env().unwrap_or(DEFAULT_MAX_BODY_BYTES)),
             memory: RwLock::new(engine_memory),
             load_gate: Mutex::new(()),
+            local_secret: RwLock::new(None),
         }
+    }
+
+    /// Accept `secret` on `POST /engine/local-token` ([`local_access`]).
+    pub fn set_local_secret(&self, secret: Option<String>) {
+        *self.local_secret.write().unwrap_or_else(|e| e.into_inner()) = secret;
+    }
+
+    pub(crate) fn local_secret(&self) -> Option<String> {
+        self.local_secret.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The memory policy in force: the engine's ([`EngineConfig::memory`](estia_engine::EngineConfig))
@@ -644,6 +658,8 @@ pub fn required_scope(method: &Method, path: &str) -> Option<&'static str> {
         (_, "/engine/runtime/install") => Some(tokens::SCOPE_ADMIN),
         // Pairing is how a client *gets* a token; it cannot require one.
         (_, p) if p == "/engine/pair" || p.starts_with("/engine/pair/") => None,
+        // Neither can the same-user handshake: the secret file is the proof.
+        (_, "/engine/local-token") => None,
         // Deciding pairings is the operator's job: a paired admin client may do it remotely.
         (_, p) if p.starts_with("/engine/pairings") => Some(tokens::SCOPE_ADMIN),
         (_, "/v1/chat/completions") | (_, "/engine/generate") => Some(tokens::SCOPE_GENERATE),
@@ -1037,6 +1053,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/engine/embed", post(engine_api::embed))
         .route("/engine/stats", get(engine_api::stats))
         .route("/engine/pair", post(engine_api::pair_request))
+        .route("/engine/local-token", post(engine_api::local_token))
         .route("/engine/pair/:id", get(engine_api::pair_poll))
         .route("/engine/pairings", get(engine_api::list_pairings))
         .route("/engine/pairings/:id/approve", post(engine_api::approve_pairing))
@@ -1635,9 +1652,17 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
             }
         });
     }
+    match local_access::publish(&data_dir) {
+        Ok(secret) => {
+            state.set_local_secret(Some(secret));
+            tracing::info!(file = %local_access::secret_path(&data_dir).display(), "apps on this machine can connect without a token (same-user secret)");
+        }
+        Err(e) => tracing::warn!(error = %e, "could not write the local access secret; local apps must pair or use a token"),
+    }
     let app = router(Arc::clone(&state));
     let result = serve_router(listener, app, ConnLimits::default(), shutdown_signal()).await;
     let loaded = state.loaded();
+    local_access::withdraw(&data_dir);
     let _ = std::fs::remove_file(engine_record_path(&data_dir));
     if let Some(t) = advert_task {
         t.abort();

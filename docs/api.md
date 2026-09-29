@@ -96,6 +96,7 @@ The server speaks HTTP/1.1 only.
 | GET | `/engine/jobs/{id}/events` | `models:read` | Server-sent events for one job until it ends |
 | POST | `/engine/runtime/install` | `admin` | Install a backend's runtime as a job: Python and MLX, or the pinned llama.cpp build |
 | POST | `/engine/pair` | none | Ask for a token (pairing request) |
+| POST | `/engine/local-token` | none (loopback + same-user secret) | An app on this machine gets a token without typing one |
 | GET | `/engine/pair/{id}` | none | Poll a pairing request; returns the token once |
 | GET | `/engine/pairings` | `admin` | Pending and recent pairing requests |
 | POST | `/engine/pairings/{id}/approve` | `admin` | Approve: mint a token with the requested scopes |
@@ -530,6 +531,32 @@ Either way the server then enforces JSON after generation:
 
 A streaming chat completion with JSON output gets no retry: if the output
 cannot be used, the stream ends with an error event and `data: [DONE]`.
+
+## Local apps: `POST /engine/local-token`
+
+An app on the engine's own machine, run by the same user, can get a token
+without pairing or typing. When `serve` starts it writes a fresh secret to
+`local-access.secret` in its data directory, readable by its owner only
+(0600), and removes it on a clean exit. The app reads the file and sends it
+from loopback:
+
+```json
+{"secret": "<contents of local-access.secret>", "name": "modelcaddy", "scopes": ["generate", "embed"]}
+```
+
+The answer is `{"token": "estia_…", "name": "local-modelcaddy", "scopes": [...]}`.
+
+- Loopback only (403 otherwise); a wrong secret is 403; an engine that could not
+  write the file answers 404.
+- `name`: 1 to 40 of `a-z`, `0-9`, `.`, `_`, `-`; the token is `local-<name>`.
+- `scopes`: any of `generate`, `embed`, `models:read`; default `generate` and
+  `embed`. Anything wider is 400: a local app never becomes admin this way.
+- Asking again replaces the app's earlier token, so an app that lost its token
+  asks again. List and revoke these like any token (`estia token list`).
+
+The Rust crate does both steps: `estia_engine::find_local_engine(None)` reads
+`engine.json` in the default data directory and checks something answers,
+and `LocalEngine::claim_token("myapp", None)` reads the secret and asks.
 
 ## Pairing
 

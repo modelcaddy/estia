@@ -378,6 +378,14 @@ estia serve --lan --allow-host studio.lan          # repeatable, or comma-separa
 estia service install --allow-host studio.lan
 ```
 
+### Apps on the same Mac
+
+An app on the engine's machine, run by the same user, does not need a token
+from you: it reads the secret `serve` writes to `local-access.secret` in the
+data directory (readable by your user only, new on every start) and trades it
+for a token with `generate` and `embed` (`POST /engine/local-token`, see
+[docs/api.md](docs/api.md)). ModelCaddy connects this way.
+
 ### Pair a device
 
 A device asks for a token and names the scopes it wants. You approve the
@@ -754,6 +762,7 @@ directory answers.
 | `pairings.json` | Recent pairing requests |
 | `tokens.lock`, `pairings.lock` | Empty lock files that keep the server and the CLI from writing those two files at the same time |
 | `engine.json` | PID, address and port of the running server; removed when it exits cleanly |
+| `local-access.secret` | Mode 0600. The secret an app on this machine trades for a token; new on every start, removed on a clean exit |
 | `engine/` | The copy of the binary and runner scripts that the service runs |
 | `logs/` | `estia.err.log` (the log) and `estia.out.log` (normally empty) from the launchd service |
 

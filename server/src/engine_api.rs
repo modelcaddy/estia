@@ -781,6 +781,46 @@ pub async fn pair_request(
         .into_response())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LocalTokenBody {
+    /// The contents of `local-access.secret` in the engine's data directory.
+    pub secret: String,
+    /// The app, for the token's name (`local-<name>`).
+    pub name: String,
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
+}
+
+/// An app on this machine, run by the engine's user, trades the secret only
+/// that user can read for a token (see [`crate::local_access`]). Loopback only.
+pub async fn local_token(
+    State(state): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Json(body): Json<LocalTokenBody>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::local_access;
+    if !peer.ip().is_loopback() {
+        return Err(ApiError::forbidden("local tokens are for apps on this machine; from another device, pair instead"));
+    }
+    let Some(expected) = state.local_secret() else {
+        return Err(ApiError::not_found("this engine does not offer local tokens; pair or use a token instead"));
+    };
+    if !local_access::same_secret(body.secret.trim(), &expected) {
+        tracing::warn!(app = %body.name, "a local token request had the wrong secret");
+        return Err(ApiError::forbidden("wrong local access secret: read it again from the engine's data directory"));
+    }
+    let name = local_access::token_name(&body.name).map_err(ApiError::bad_request)?;
+    let scopes = local_access::scopes(body.scopes.as_deref()).map_err(ApiError::bad_request)?;
+    let st = Arc::clone(&state);
+    let (n, sc) = (name.clone(), scopes.clone());
+    // The store takes a file lock (the CLI edits the same file): off the runtime.
+    let (token, replaced) = spawn_blocking_in_span(move || st.tokens.replace(&n, &sc))
+        .await?
+        .map_err(|e| ApiError::internal(format!("could not store the token: {e}")))?;
+    tracing::info!(name = %name, scopes = %scopes.join(","), replaced = replaced.is_some(), "granted a local app a token");
+    Ok(Json(json!({"token": token, "name": name, "scopes": scopes})))
+}
+
 /// The client polls; the token is returned exactly once when approved.
 pub async fn pair_poll(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     if let Some(a) = Access::current() {

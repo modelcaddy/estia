@@ -29,6 +29,8 @@
 //!   for per-runner memory figures.
 //! - [`Engine`]: one value owning the store, the runtime, the resident
 //!   sessions and the role table.
+//! - [`local`]: the engine on this machine as another app finds it
+//!   ([`find_local_engine`]) and joins it without a typed token.
 //! - [`RemoteEngine`], [`GenHandle`] / [`EmbedHandle`]: the same shapes over
 //!   HTTP, for a model served by an `estia serve` daemon on another machine.
 //!
@@ -38,6 +40,7 @@ pub mod backend;
 pub mod engine;
 pub mod error;
 pub mod handles;
+pub mod local;
 pub mod location;
 pub mod machine;
 pub mod models;
@@ -55,6 +58,7 @@ pub use engine::{Engine, EngineConfig, EngineError, LlamaLaunch, LlamaServer, Re
 pub use error::SessionError;
 pub use estia_proto as proto;
 pub use handles::{EmbedHandle, GenHandle};
+pub use local::{default_data_dir, find_local_engine, LocalEngine};
 pub use location::EngineLocation;
 pub use machine::{DeviceTier, MachineProfile, MemoryPolicy};
 pub use oneshot::{OneShot, OneShotConfig};

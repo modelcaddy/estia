@@ -662,3 +662,44 @@ async fn one_generation_model_at_a_time_when_the_policy_says_so() {
     assert_eq!(loaded(&v), ["embeddinggemma-300m-4bit", "gemma4-e4b-it-4bit-mlx"], "{v}");
     assert_eq!(v["memory"]["max_generation_models"], 1, "{v}");
 }
+
+/// local-F1: an app on this machine trades the same-user secret for a token
+/// named `local-<app>` with narrow scopes; a wrong secret, a bad name or a
+/// wider scope is refused, and asking again replaces the earlier token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_app_trades_the_secret_for_a_narrow_token() {
+    if !python3_available() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let h = start_with(|s| s.set_local_secret(Some("s3cret".into()))).await;
+    let client = reqwest::Client::new();
+    let ask = |body: Value| {
+        let (client, url) = (client.clone(), format!("{}/engine/local-token", h.base));
+        async move {
+            let r = client.post(url).json(&body).send().await.unwrap();
+            (r.status().as_u16(), r.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let (s, v) = ask(json!({"secret": "nope", "name": "modelcaddy"})).await;
+    assert_eq!(s, 403, "{v}");
+    let (s, _) = ask(json!({"secret": "s3cret", "name": "Model Caddy"})).await;
+    assert_eq!(s, 400);
+    let (s, _) = ask(json!({"secret": "s3cret", "name": "modelcaddy", "scopes": ["admin"]})).await;
+    assert_eq!(s, 400);
+    let (s, v) = ask(json!({"secret": "s3cret", "name": "modelcaddy"})).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["name"], "local-modelcaddy");
+    assert_eq!(v["scopes"], json!(["generate", "embed"]));
+    let token = v["token"].as_str().unwrap().to_string();
+    let embed = client.post(format!("{}/engine/embed", h.base)).bearer_auth(&token).json(&json!({"inputs": ["x"]})).send().await.unwrap();
+    assert_eq!(embed.status().as_u16(), 200, "the token embeds");
+    let admin = client.get(format!("{}/engine/pairings", h.base)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(admin.status().as_u16(), 403, "and is not admin");
+    // Asking again replaces it: the first token stops working.
+    let (s, v) = ask(json!({"secret": "s3cret", "name": "modelcaddy"})).await;
+    assert_eq!(s, 200);
+    assert_ne!(v["token"].as_str().unwrap(), token);
+    let old = client.post(format!("{}/engine/embed", h.base)).bearer_auth(&token).json(&json!({"inputs": ["x"]})).send().await.unwrap();
+    assert_eq!(old.status().as_u16(), 401);
+}

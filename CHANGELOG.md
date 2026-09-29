@@ -34,6 +34,16 @@ and use today's names (the project took the name Estia in 0.3.0).
 - Protocol: `Message.images` (`{mime, data}` base64) and
   `capabilities.images`.
 
+### Local apps connect without a token
+
+- `serve` writes a same-user secret (`local-access.secret`, 0600, new on every
+  start) and `POST /engine/local-token` trades it, from loopback only, for a
+  token named `local-<app>` with `generate` and `embed` (at most
+  `models:read` besides). An app on the engine's machine joins it with nothing
+  to type; asking again replaces the app's token.
+- For Rust hosts: `estia_engine::find_local_engine` and
+  `LocalEngine::claim_token`, and `default_data_dir`.
+
 ### Fixed
 
 - The Rust remote client (`RemoteEngine`) panicked when built, used or

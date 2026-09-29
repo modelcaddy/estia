@@ -248,6 +248,19 @@ impl RemoteEngine {
         })
     }
 
+    /// Trade the same-user secret (`local-access.secret`) for a token named
+    /// `local-<app>`. The daemon accepts this from loopback only; see
+    /// [`crate::local::LocalEngine::claim_token`].
+    pub fn local_token(&self, secret: &str, app: &str, scopes: Option<&[&str]>) -> Result<String> {
+        off_reactor(|| {
+            let body = json!({"secret": secret, "name": app, "scopes": scopes});
+            let resp = self.client().post(format!("{}/engine/local-token", self.base_url)).json(&body).send();
+            let resp = resp.map_err(|e| err(format!("local token: {e}")))?;
+            let v: Value = Self::check(resp)?.json().map_err(|e| err(format!("local token: {e}")))?;
+            v["token"].as_str().map(str::to_string).ok_or_else(|| err("local token: no token in the answer"))
+        })
+    }
+
     /// Ask a daemon for a token: the first half of pairing. Needs no token.
     /// Returns the pairing id to poll with [`RemoteEngine::pair_poll`].
     pub fn pair_request(&self, name: &str, scopes: &[&str]) -> Result<String> {
