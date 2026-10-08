@@ -65,3 +65,45 @@ license = "MIT"
 [[num-cmp.clarify.files]]
 path = "LICENSE.txt"
 checksum = "3bb1e548250b3acc43febde65a5cdba9f2e0a3288018aa41f009a3c59ffab51a"
+
+# ring's LICENSE only points at the files holding the texts, so cargo-about
+# cannot identify it. The texts: LICENSE-other-bits (ISC, ring's own code) and
+# LICENSE-BoringSSL (Apache-2.0, code from BoringSSL).
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+# rustls-webpki's ISC text is wrapped in a sentence about other files, which
+# can lower cargo-about's confidence below its threshold.
+[rustls-webpki.clarify]
+license = "ISC"
+[[rustls-webpki.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"
+
+# rcgen (the engine's certificate) puts a preamble, the MIT text and the
+# Apache-2.0 text in one file that cargo-about cannot identify, so it would
+# print the bare MIT template. Reproduce the crate's own file instead, as for
+# num-cmp.
+[rcgen.clarify]
+license = "MIT"
+[[rcgen.clarify.files]]
+path = "LICENSE"
+checksum = "debe6fed7ac143217c7f533759c54b14f18cd01d5fe195c51d83c2ae2d136cb4"
+
+# untrusted (under ring) has its ISC text as `//` comment lines, which can
+# lower cargo-about's confidence below its threshold.
+[untrusted.clarify]
+license = "ISC"
+[[untrusted.clarify.files]]
+path = "LICENSE.txt"
+license = "ISC"
+checksum = "7abd9b6960dcf7d4d0a48606a5b71bfe37d472db68d70637f3a58a56785f1621"

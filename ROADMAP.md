@@ -21,7 +21,7 @@ depending on it. Each limit below was checked against the code or a live run.
 | Tools | Tool calls are parsed from Gemma's own syntax on MLX and by `llama-server` on llama.cpp. `{"role": "tool"}` results reach the model through its chat template. Gemma 4's tool calls on llama.cpp are untested. |
 | Structured output | llama.cpp constrains decoding to the JSON Schema. On MLX the engine puts the schema in the system prompt. Both then validate, repair and retry. |
 | Roles | `temperature`, `max_tokens` and `pin` are stored with a role and not applied. `embed` can be bound to any embedding model; unbound it means EmbeddingGemma 300M. |
-| Network | Plain HTTP. On the LAN, tokens, prompts and outputs are unencrypted. No CORS headers; cross-origin writes get 403. |
+| Network | On the LAN, HTTPS with the engine's own certificate, which each device pins when it pairs (one 6-digit code, shown on both screens and confirmed on both sides, proves which certificate each end used); plain HTTP on loopback only, on the same port. Browsers accept the certificate by hand. No CORS headers; cross-origin writes get 403. |
 | Memory | Resident models stay within a budget set by the machine's tier (half of RAM on a 16 GB or fanless Mac); idle models are unloaded, least recently used first, to make room. MLX runners load lazily and cap wired memory. Loads are refused rather than queued when the only way to fit is to unload a model in use. |
 | Scheduling | One call at a time per loaded model. Waiting calls go interactive first, then background, and otherwise in arrival order. There is no per-client queue, quota or rate limit. |
 | Request lifetime | A non-streaming request runs to the end after its client disconnects, and the next call waits for it. In a live run, a 600-token request abandoned after 1 s kept the model for 8.3 s, and a 5-token request behind it took 7.4 s. Request headers must arrive within 10 s, but a request body has no time limit: a connection that sent headers and then stalled was still open after 40 s. |
@@ -151,10 +151,27 @@ tunnel.
 
 **What.** On a LAN bind, the engine makes a self-signed certificate and serves
 HTTPS. Pairing hands the device the certificate's SHA-256 fingerprint with
-its token, and the device pins it from then on. The operator sees a short code
-derived from the fingerprint in `estia pair list` and the device shows the
-same code, so a swapped certificate during pairing can be caught. Loopback
-stays plain HTTP.
+its token, and the device pins it from then on. Each pairing has one 6-digit
+code, computed by both ends from the fingerprint each of them used and two
+nonces (the device commits to its nonce before it sees the engine's), and
+compared the way Bluetooth's numeric comparison is: the device shows its
+code, `estia pair approve <id>` shows the engine's and asks whether the
+device shows the same, and the operator's yes approves with that code (a
+script passes `--code`, which must match), so a swapped certificate during
+pairing is caught on the engine's side. Once approved, the device asks
+whether the engine shows its code and pins the certificate only on a yes, so
+an interceptor that answers the device's polls itself is caught on the
+device's side. Neither end sends its code to the other. A request over HTTPS
+with no code (a browser, curl, or a commitment stripped on the way) is
+approved only with an explicit `--no-code`. A code taken from the
+fingerprint alone was rejected: the certificate is public and long-lived, so
+an interceptor could grind a look-alike offline. What is left is a person
+who confirms without looking, or code that answers for them; device names
+cannot carry a run of digits that could pass for the code, pairing ids are
+letters that cannot either, and a yes on the device counts only from a
+terminal (a script gives the engine's six digits). Look-alike letters in a
+name and a sender-chosen IPv6 address are documented, not blocked.
+Loopback stays plain HTTP.
 
 **Exit check.** `estia serve --lan` answers HTTPS on the LAN address. A packet
 capture of a chat from a paired device shows no token, prompt or output in
@@ -162,6 +179,53 @@ clear text. A device that paired with one engine refuses a server with a
 different certificate at the same address. `estia remote-check`,
 `remote_client.rs` and the Python examples work with the pinned certificate,
 and the guide shows how.
+
+**Status (2026-10-08): built, for 0.5.0.** Each line of the exit check has a
+test in `server/tests/tls.rs`: the engine answers HTTPS and a pinned client and
+a probe see its certificate; a pairing and a streamed chat through a relay
+that records every byte show no token, prompt or output in clear; a device
+pinned to one engine refuses another engine at the same address before
+sending its token; `pair.py` shows the engine's code (computed the same in
+Python as in Rust), keeps the token when given the engine's six digits and
+nothing on a no or a piped "y", and `no_sdk.py` chats with the pin and
+refuses a wrong one; an interceptor with its own certificate is caught
+whether it relays the exchange (two different codes; an approval without the
+code is refused on every path), answers the device's polls itself, strips
+the commitment, or answers with a code-like pairing id (refused by the Rust
+client and `pair.py` before they reveal); and no answer the engine sends a
+device carries its code. The pairing became compare-and-confirm on
+2026-10-08, after the live run below, which used the earlier exchange (the
+operator typed the device's code; the user typed a second code into the
+device). The new exchange was then run live on the same Mac (macOS 15.7),
+against a scratch engine on its LAN address, device and operator both on that
+Mac: both sides answering at a terminal (`script(1)`) paired and pinned; a
+script driving `estia pair request --json` got the `request` and `confirm`
+events, approved with `--code`, and pinned when it wrote the digits `estia
+pair list` showed, while a piped `y` and a wrong code kept nothing; and the
+engine refused the names `phone 482 913`, `phone 482ㅡ913`, `phone 482ꞏ913`
+and one with a Hangul filler. Not yet with two machines.
+Run live on one Mac (macOS 15, curl 8.7.1 with SecureTransport), with the
+two typed codes and the 820-day certificate, `estia serve --lan` on the LAN address and a
+stand-in runner: `curl -k --pinnedpubkey` with the pin `estia tls
+fingerprint` prints got an answer and a wrong pin was refused, the
+certificate `openssl s_client` saw was the one on disk, plain HTTP from the
+LAN address got `https_required` (and `/client` a redirect), and loopback
+stayed plain. `estia pair request` paired through a relay on the LAN address
+that recorded every byte (a wrong code, `--no-code` and a wrong confirmation
+code were refused); then `estia remote-check --pin`, `remote_client.rs` and
+`no_sdk.py` chatted and embedded through it, and the recording held none of
+the token, prompts, outputs, paths or headers, where a plain HTTP request
+through the same relay showed in clear. After `estia tls rotate` and a
+restart at the same address, all three refused the engine before sending the
+token. Bonjour carried `tls=1` and `fp`, and `estia status`, `estia
+dashboard` and `scripts/smoke-test.sh --pinnedpubkey` worked. Not yet run: two
+machines, a capture on the wire itself, Safari and Chrome on `/client`, and
+the OpenAI SDK examples (the pin goes through `httpx`, which the test does not
+install). Certificates are valid for 820 days: Apple's
+`SecTrustEvaluateWithError` (macOS 15, SSL policy, the certificate as the
+only anchor) refused the same profile at 826 days and more as "not standards
+compliant" and accepted it at 825 and 820, so a longer validity would have
+broken Safari and Apple apps that trust it rather than pin it.
 
 ### 5. Image input through `/v1`
 

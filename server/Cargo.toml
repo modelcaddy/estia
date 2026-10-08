@@ -24,6 +24,8 @@ getrandom.workspace = true
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
 tower-service = "0.3"
+# `map_request` marks each request with how its connection arrived (tls::Transport).
+tower = { version = "0.5", default-features = false, features = ["util"] }
 libc = "0.2"
 mdns-sd.workspace = true
 serde.workspace = true
@@ -36,8 +38,18 @@ tokio-stream.workspace = true
 # http-body wraps response bodies so a streamed response is logged when it ends.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 http-body = "1"
+# HTTPS on a LAN bind (tls): the engine's own certificate, made with rcgen,
+# served by rustls through tokio-rustls. All three with the ring provider only:
+# their defaults would bring aws-lc-rs.
+rustls.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [dev-dependencies]
+# tests/tls.rs pairs and connects as a device does: the pinned client.
+estia-engine = { path = "../engine", version = "0.4.0", features = ["discovery", "remote-tls"] }
 reqwest = { version = "0.12", features = ["json"] }
+# tests/tls.rs: a recording relay, and the Python examples run as child processes.
+tokio = { version = "1", features = ["io-util", "process"] }
 # Captures the access log in tests.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "std", "registry"] }

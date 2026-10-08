@@ -29,7 +29,7 @@ rustc    : 1.95.0 (59807616e 2026-04-14)
 api      : v1 (HTTP /engine/*)
 protocol : v2 (runners)
 backends : mlx-python (default on this machine), llama-cpp
-features : python-mlx, llama-runtime
+features : python-mlx, llama-runtime, remote-tls
 llama.cpp: b11146 (pinned for `estia runtime install --backend llama`)
 runner   : mlx-python 2.3.0 (compiled in)
 ```
@@ -47,7 +47,8 @@ runner   : mlx-python 2.3.0 (compiled in)
   The backend a data directory actually uses is in `estia status`.
 - `features`: the `estia-engine` features the binary is built with.
   `python-mlx` and `llama-runtime` are the runtime installers behind
-  `estia runtime install`.
+  `estia runtime install`; `remote-tls` is the client that pins an engine's
+  certificate (`--engine https://… --pin`, `estia pair request`).
 - `runner`: the version of the MLX runner script compiled into the binary.
   The runner on disk beside a release binary is the same file.
 
@@ -79,7 +80,8 @@ $ estia version --json
   },
   "features": [
     "python-mlx",
-    "llama-runtime"
+    "llama-runtime",
+    "remote-tls"
   ],
   "llama_cpp_build": "b11146",
   "mlx_runner_version": "2.3.0",
@@ -175,7 +177,9 @@ release from working. For Estia that covers:
   cannot handle is breaking and bumps the protocol version. A new optional
   field, or a new capability announced in `hello`, is not.
 - **Files in the data directory.** `config.json` (roles, backend),
-  `tokens.json` (token names, hashes, scopes), `pairings.json`, and the layout
+  `tokens.json` (token names, hashes, scopes), `pairings.json`, `tls/`
+  (`cert.pem` and `key.pem`, the certificate paired devices pin; a release
+  that replaced it would force every device to pair again), and the layout
   of `models/` and `runtime/`. A new release must read what an older release
   wrote, without the user editing anything. A change that leaves installed
   models or runtimes unusable is breaking.
@@ -194,7 +198,12 @@ release from working. For Estia that covers:
   model that already has one is breaking, because stored indexes stop matching
   `expect_fingerprint`.
 - **Discovery.** The Bonjour service type `_estia._tcp` and the keys of its
-  record (`api_version`, `engine_version`, `protocol_version`).
+  record (`api_version`, `engine_version`, `protocol_version`, and on an
+  engine serving HTTPS `tls` and `fp`).
+- **Pairing codes and pins.** The commitment and pairing code definitions in
+  [api.md](api.md#pairing) (their labels end in `v1`; a change is a new
+  label), and the fingerprint format devices store (the SHA-256 of the
+  certificate's DER bytes, 64 hex digits).
 - **The Rust API** of the library crates: their public items, under
   [Cargo's SemVer rules](https://doc.rust-lang.org/cargo/reference/semver.html).
 - **The model registry.** Models may be added in any release. Removing one,
@@ -211,7 +220,17 @@ them rather than the Estia version.
 `/engine/health` reports it without a token, and the Bonjour record carries
 it, so a client can check an engine before it pairs. It goes up by one when an
 `/engine/*` change is breaking in the sense above. Additions do not change it.
-Raising it always means a minor (or, after 1.0, major) Estia release. The
+Raising it always means a minor (or, after 1.0, major) Estia release.
+
+Two kinds of breaking change are deliberately not counted, and are listed as
+breaking in the CHANGELOG instead: the transport, and the certificate checks
+of pairing. From 0.5 a LAN engine refuses plain HTTP from other devices
+(`https_required`), and an approval needs the pairing code for a request that
+carried a commitment, and `no_code` for a request over HTTPS that carried
+none. A client meets either before it could act on `api_version`, and the
+error it gets says what to do; a client on loopback, which sends no
+commitment, sees no difference at all, and a new `api_version` would tell it
+that everything had changed. The
 `/v1/*` routes follow OpenAI's shapes and have no number of their own; a
 breaking change to them, or to Estia's additions such as `x_estia`, also needs
 a minor release.

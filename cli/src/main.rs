@@ -31,7 +31,7 @@ const VERSION_LINE: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("ESTIA_
 
 /// The `estia-engine` features this binary is built with, as cli/Cargo.toml
 /// lists them (a test keeps the two in step).
-const ENGINE_FEATURES: &[&str] = &["python-mlx", "llama-runtime"];
+const ENGINE_FEATURES: &[&str] = &["python-mlx", "llama-runtime", "remote-tls"];
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +92,11 @@ enum Cmd {
         /// Token for the engine (health works without one; stats need `models:read`, pairings need `admin`).
         #[arg(long)]
         token: Option<String>,
+        /// The engine's certificate fingerprint, for an `https://` --engine
+        /// (from pairing, or `estia tls fingerprint` on its machine). Default:
+        /// ESTIA_PIN, which an `http://` engine ignores.
+        #[arg(long, value_name = "SHA256")]
+        pin: Option<String>,
         #[arg(long, default_value_t = 2)]
         interval: u64,
         /// Print once and exit.
@@ -319,10 +324,17 @@ enum Cmd {
     /// Talk to a daemon as a client: health, a generation and an embed through
     /// the same remote path a host uses.
     RemoteCheck {
+        /// `https://<host>:27200` for an engine on another machine, or
+        /// `http://127.0.0.1:27200` for the one on this machine.
         #[arg(long)]
         engine: String,
         #[arg(long)]
         token: Option<String>,
+        /// The engine's certificate fingerprint, for an `https://` engine: what
+        /// `estia pair request` printed, or `estia tls fingerprint` on its
+        /// machine. Default: ESTIA_PIN, which an `http://` engine ignores.
+        #[arg(long, value_name = "SHA256")]
+        pin: Option<String>,
         #[arg(long, default_value = "fast")]
         model: String,
     },
@@ -330,6 +342,11 @@ enum Cmd {
     Token {
         #[command(subcommand)]
         action: TokenAction,
+    },
+    /// The engine's TLS certificate, which devices on the LAN pin when they pair.
+    Tls {
+        #[command(subcommand)]
+        action: TlsAction,
     },
     /// This build: version, commit, date, target, API and protocol versions,
     /// backends, features and the pinned llama.cpp build.
@@ -393,25 +410,49 @@ enum ServiceAction {
 enum PairAction {
     /// Pending and recent pairing requests (locally, or on a remote engine with --engine/--token).
     List {
-        /// Ask a running engine (`http://host:port`) instead of reading this
-        /// machine's data directory. Needs --token.
+        /// Ask a running engine (`https://host:port`) instead of reading this
+        /// machine's data directory. Needs --token, and --pin for https.
         #[arg(long, value_name = "URL")]
         engine: Option<String>,
         /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
+        /// The certificate fingerprint of the engine given with --engine.
+        /// Default: ESTIA_PIN, which an `http://` engine ignores.
+        #[arg(long, value_name = "SHA256")]
+        pin: Option<String>,
     },
     /// Approve a request: mints a token with the requested scopes for the client to collect.
+    /// For a request with a code (a device pairing over https), it shows this
+    /// engine's code and asks whether the device shows the same.
     Approve {
         /// The pairing id, as the client and `estia pair list` show it.
         id: String,
-        /// Decide on a running engine (`http://host:port`) instead of in this
-        /// machine's data directory. Needs --token.
+        /// For a script, where nobody can answer the question: the 6-digit
+        /// code read off the device's screen (or out of its `estia pair
+        /// request --json` events). The engine approves only if it equals its
+        /// own, computed from its certificate; they match only when the device
+        /// saw that certificate. Never take it from `estia pair list`: that is
+        /// the engine's own code, and passing it back approves without
+        /// comparing anything. In a terminal, leave it out and compare.
+        #[arg(long, value_name = "CODE")]
+        code: Option<String>,
+        /// Approve a request that has no code (a browser, or curl): compare
+        /// the certificate fingerprint the device shows with `estia tls
+        /// fingerprint` first.
+        #[arg(long, conflicts_with = "code")]
+        no_code: bool,
+        /// Decide on a running engine (`https://host:port`) instead of in this
+        /// machine's data directory. Needs --token, and --pin for https.
         #[arg(long, value_name = "URL")]
         engine: Option<String>,
         /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
+        /// The certificate fingerprint of the engine given with --engine.
+        /// Default: ESTIA_PIN, which an `http://` engine ignores.
+        #[arg(long, value_name = "SHA256")]
+        pin: Option<String>,
         /// Approve a request that asks for the `admin` scope (full control of
         /// the engine). Without it such a request is refused.
         #[arg(long)]
@@ -422,21 +463,34 @@ enum PairAction {
     Deny {
         /// The pairing id, as the client and `estia pair list` show it.
         id: String,
-        /// Decide on a running engine (`http://host:port`) instead of in this
-        /// machine's data directory. Needs --token.
+        /// Decide on a running engine (`https://host:port`) instead of in this
+        /// machine's data directory. Needs --token, and --pin for https.
         #[arg(long, value_name = "URL")]
         engine: Option<String>,
         /// An `admin` token for the engine given with --engine.
         #[arg(long)]
         token: Option<String>,
+        /// The certificate fingerprint of the engine given with --engine.
+        /// Default: ESTIA_PIN, which an `http://` engine ignores.
+        #[arg(long, value_name = "SHA256")]
+        pin: Option<String>,
     },
     /// Client side: ask an engine for a token and wait for the operator's approval.
+    /// Over https it shows a 6-digit code, which the engine shows too; once
+    /// approved it asks whether the engine shows the same, and prints the
+    /// certificate fingerprint to pin from then on only on a yes. When stdin
+    /// is not a terminal, "y" is not an answer: give the six digits the
+    /// engine shows for the request (`estia pair list` on its machine) on
+    /// stdin instead, and the device pins only if they equal its own code.
     Request {
-        /// `http://host:port` of the engine.
+        /// `https://host:port` of the engine (`http://127.0.0.1:port` for the
+        /// one on this machine).
         #[arg(long)]
         engine: String,
         /// How the operator sees this device: up to 64 letters, digits, single
-        /// spaces and `. _ - ' ( )`.
+        /// spaces and `. _ - ' ( )`, with at most 4 digits in a row (only a
+        /// letter such as a-z ends a row), so that no name passes for a
+        /// pairing code.
         #[arg(long, default_value = "estia-cli")]
         name: String,
         /// Scopes to ask for, comma-separated. Ask for the least you need.
@@ -447,6 +501,32 @@ enum PairAction {
         /// the default stops just before that.
         #[arg(long, default_value_t = PAIR_WAIT_DEFAULT_S)]
         wait_seconds: u64,
+        /// Print the result as one JSON object on stdout ({url, name, scopes,
+        /// token, pin}) instead of the bare token, and the steps as one JSON
+        /// object per line on stderr instead of prose: `request` (id, code,
+        /// certificate, approve command), `retry`, and `confirm` once
+        /// approved, when it reads the answer from stdin.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TlsAction {
+    /// The certificate's SHA-256 fingerprint (what a device pins), its short
+    /// form (what people compare), and curl's --pinnedpubkey value.
+    Fingerprint {
+        /// One JSON object, for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make a new certificate. Every paired device must then pair again (its
+    /// pin names the old one); a running engine keeps the old certificate
+    /// until it restarts.
+    Rotate {
+        /// Replace an existing certificate.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -712,22 +792,12 @@ impl Ctx {
 /// True for characters that can steer a terminal or hide what it shows: C0
 /// and C1 controls (ESC opens every escape sequence, CR rewrites the line),
 /// bidi embeddings, overrides and isolates, zero-width and other invisible
-/// format characters, the Unicode line and paragraph separators, and tag
-/// characters.
+/// format characters, the Unicode line and paragraph separators, tag
+/// characters, and every other default-ignorable code point, the Hangul
+/// fillers (letters that print as a blank) among them: the list pairing
+/// names are checked against (`pairing::is_format_char`).
 fn is_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{E0000}'..='\u{E007F}'
-        )
+    c.is_control() || estia_server::pairing::is_format_char(c)
 }
 
 /// `s` with each unsafe character (see [`is_unsafe_char`]) written as a
@@ -1002,10 +1072,8 @@ fn status(ctx: &Ctx) -> Result<()> {
     }
     match estia_server::another_engine_running(&ctx.data_dir) {
         Some(rec) => {
-            let health = reqwest_blocking()
-                .ok()
-                .and_then(|c| c.get(format!("{}/engine/health", local_url(&rec.bind, rec.port))).send().ok())
-                .and_then(|r| r.json::<serde_json::Value>().ok());
+            // `health` checks the status: an error answer is not health.
+            let health = local_client(ctx, &rec, None).ok().and_then(|c| c.health().ok());
             let up = health
                 .as_ref()
                 .and_then(|h| h["uptime_s"].as_u64())
@@ -1023,13 +1091,19 @@ fn status(ctx: &Ctx) -> Result<()> {
                 host_port(&rec.bind, rec.port)
             );
             if rec.bind.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+                let scheme = if rec.tls { "https" } else { "http" };
                 for ip in lan_ips() {
-                    let url = http_url(&ip, rec.port);
+                    let url = url_for(scheme, &ip, rec.port);
                     println!("  reach it: {url}   (clients: estia pair request --engine {url})");
                 }
             }
         }
         None => println!("daemon   : not running  (estia serve: this machine only · estia serve --lan: let other devices pair)"),
+    }
+    match estia_server::tls::load(&ctx.data_dir) {
+        Ok(Some(id)) => println!("tls      : {} · devices on the LAN pin it (estia tls fingerprint)", id.fingerprint().short()),
+        Ok(None) => println!("tls      : none yet: made on the first `estia serve --lan`"),
+        Err(e) => println!("tls      : unreadable: {}", safe(&e.to_string())),
     }
     let pending: Vec<_> = estia_server::pairing::PairingStore::new(&ctx.data_dir)
         .list()
@@ -1127,22 +1201,9 @@ fn import(
     Ok(())
 }
 
-/// Non-loopback IPv4 addresses of this machine.
+/// This machine's LAN IPv4 addresses (`ifconfig`, or `ip` where there is none).
 fn lan_ips() -> Vec<String> {
-    let mut out = Vec::new();
-    if let Ok(o) = std::process::Command::new("ifconfig").output() {
-        let text = String::from_utf8_lossy(&o.stdout);
-        for line in text.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix("inet ") {
-                let ip = rest.split_whitespace().next().unwrap_or("");
-                if !ip.starts_with("127.") && !ip.is_empty() && !ip.starts_with("169.254.") {
-                    out.push(ip.to_string());
-                }
-            }
-        }
-    }
-    out
+    estia_server::lan_ipv4_addresses().iter().map(ToString::to_string).collect()
 }
 
 /// `--memory-budget`: a size, or `off` (`None`).
@@ -1718,7 +1779,9 @@ async fn serve(
     }
     if lan {
         tracing::info!(
-            "LAN mode: devices pair with `estia pair request --engine http://<this machine>:{port}`; approve with `estia pair approve <id>`"
+            "LAN mode: other devices use https with this engine's own certificate. They pair with \
+             `estia pair request --engine https://<this machine>:{port}` and show a code; `estia pair approve <id>` \
+             shows this engine's code for it: approve when the two are the same"
         );
     }
     if let Some(MemoryBudget(b)) = memory_budget {
@@ -1769,8 +1832,77 @@ fn host_port(host: &str, port: u16) -> String {
     }
 }
 
+fn url_for(scheme: &str, host: &str, port: u16) -> String {
+    format!("{scheme}://{}", host_port(host, port))
+}
+
 fn http_url(host: &str, port: u16) -> String {
-    format!("http://{}", host_port(host, port))
+    url_for("http", host, port)
+}
+
+/// The pin for `--engine`: `--pin` as given (an error with an `http://`
+/// engine, which has no certificate), else `ESTIA_PIN` for an `https://`
+/// engine. An `ESTIA_PIN` exported for a LAN engine is ignored for an
+/// `http://` one, such as the engine on this machine, rather than breaking
+/// every command aimed at it.
+fn pin_for(engine: &str, flag: Option<&str>, env: Option<&str>) -> Result<Option<estia_engine::Fingerprint>> {
+    fn given(p: Option<&str>) -> Option<&str> {
+        p.map(str::trim).filter(|p| !p.is_empty())
+    }
+    let https = engine.trim().to_ascii_lowercase().starts_with("https://");
+    let (text, from) = match (given(flag), given(env)) {
+        (Some(p), _) => (p, "--pin"),
+        (None, Some(p)) if https => (p, "ESTIA_PIN"),
+        _ => return Ok(None),
+    };
+    estia_engine::Fingerprint::parse(text).map(Some).map_err(|e| anyhow!("{from}: {e}"))
+}
+
+/// A client for `--engine`: pinned (`--pin`, else `ESTIA_PIN`) for an
+/// `https://` engine, plain for `http://` (the engine on this machine). An
+/// https engine without a pin is refused here rather than trusted blindly,
+/// and so is a token over plain http to another machine.
+fn remote_client(engine: &str, token: Option<String>, pin: Option<&str>) -> Result<estia_engine::RemoteEngine> {
+    let env = std::env::var("ESTIA_PIN").ok();
+    remote_client_with(engine, token, pin, env.as_deref())
+}
+
+fn remote_client_with(engine: &str, token: Option<String>, pin: Option<&str>, env_pin: Option<&str>) -> Result<estia_engine::RemoteEngine> {
+    let engine = engine.trim().trim_end_matches('/');
+    let pin = pin_for(engine, pin, env_pin)?;
+    if engine.to_ascii_lowercase().starts_with("https://") && pin.is_none() {
+        return Err(anyhow!(
+            "{} serves https with its own certificate: give its fingerprint with --pin (or ESTIA_PIN). \
+             `estia pair request` prints it when this device pairs; `estia tls fingerprint` prints it on the engine's machine",
+            safe(engine)
+        ));
+    }
+    Ok(estia_engine::RemoteEngine::connect(engine, token, pin)?)
+}
+
+/// Where this machine reaches the engine its data directory runs, and the
+/// pin to hold it to. A wildcard or loopback bind answers plain HTTP on
+/// loopback. A specific LAN address has nothing on loopback, and the engine
+/// refuses plain HTTP from that address (it is not loopback, even from this
+/// machine), so it is reached over https there, pinned to the certificate in
+/// this data directory (`fingerprint`, when the record says it serves TLS).
+fn local_target(bind: &str, port: u16, fingerprint: Option<estia_engine::Fingerprint>) -> (String, Option<estia_engine::Fingerprint>) {
+    let bare = bind.split('%').next().unwrap_or(bind);
+    let specific = bare.parse::<std::net::IpAddr>().is_ok_and(|ip| !ip.is_unspecified() && !ip.to_canonical().is_loopback());
+    match fingerprint {
+        Some(fp) if specific => (url_for("https", bind, port), Some(fp)),
+        _ => (local_url(bind, port), None),
+    }
+}
+
+/// A client for the engine this data directory runs ([`local_target`]).
+fn local_client(ctx: &Ctx, rec: &estia_server::EngineRecord, token: Option<String>) -> Result<estia_engine::RemoteEngine> {
+    let fingerprint = match rec.tls {
+        true => estia_server::tls::load(&ctx.data_dir)?.map(|id| id.fingerprint()),
+        false => None,
+    };
+    let (url, pin) = local_target(&rec.bind, rec.port, fingerprint);
+    Ok(estia_engine::RemoteEngine::connect(url, token, pin)?)
 }
 
 /// The URL that reaches, from this machine, a daemon bound to `bind`:
@@ -1965,9 +2097,11 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
   estia service install --local  or run it at login, loopback only
   estia status · estia dashboard
 
-  to let other devices on your network use it (plain HTTP; each device pairs for a token):
+  to let other devices on your network use it (HTTPS with this engine's own certificate;
+  each device pairs for a token and pins the certificate):
   estia serve --lan              or: estia service install
-  from the other device: estia discover · estia pair request --engine http://<this machine>:27200"
+  from the other device: estia discover · estia pair request --engine https://<this machine>:27200
+  it shows a code; here, estia pair approve <id> shows the engine's: approve if they are the same"
     );
     Ok(())
 }
@@ -2071,6 +2205,9 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
         ServiceAction::Install { port, local, allow_host, log_level, log_format, max_body_bytes, memory_budget, idle_unload_minutes } => {
             // Checked before anything is staged: every path below lives under it.
             service_path(&ctx.data_dir)?;
+            // A LAN service serves HTTPS. Make the certificate now, before the
+            // service starts, so the fingerprint printed here is the one it serves.
+            let certificate = if local { None } else { Some(estia_server::tls::load_or_create(&ctx.data_dir)?) };
             let mut args = service_args(port, local, &allow_host, log_level.as_deref(), log_format, ctx.backend_flag)?;
             if let Some(n) = max_body_bytes {
                 args.extend(["--max-body-bytes".to_string(), n.to_string()]);
@@ -2148,6 +2285,7 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
                 }
                 println!("installed {} and started it: {}", LAUNCHD_LABEL, service_status_line());
                 println!("logs: {}", logs.join("estia.err.log").display());
+                print_lan_pairing(certificate.as_ref(), port);
             } else {
                 let unit = systemd_unit_path();
                 std::fs::create_dir_all(unit.parent().unwrap())?;
@@ -2155,6 +2293,7 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
                 sh("systemctl", &["--user", "daemon-reload"])?;
                 sh("systemctl", &["--user", "enable", "--now", "estia"])?;
                 println!("installed estia.service and started it");
+                print_lan_pairing(certificate.as_ref(), port);
             }
         }
         ServiceAction::Uninstall => {
@@ -2243,6 +2382,15 @@ fn service(ctx: &Ctx, action: ServiceAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// After a LAN install: the certificate devices will pin, and how they pair.
+fn print_lan_pairing(certificate: Option<&estia_server::tls::TlsIdentity>, port: u16) {
+    let Some(id) = certificate else { return };
+    println!("certificate: {} (devices pin it when they pair; `estia tls fingerprint` shows all of it)", id.fingerprint().short());
+    for ip in lan_ips() {
+        println!("pair a device: estia pair request --engine {}", url_for("https", &ip, port));
+    }
 }
 
 /// Run a log viewer as this process (on Unix, `exec`), so Ctrl-C or a
@@ -2362,44 +2510,37 @@ fn systemd_unit(exe: &str, args: &[String], data_dir: &str, runner: &str) -> Res
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
-fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval: u64, once: bool) -> Result<()> {
-    let base = match engine {
-        Some(e) => e.trim_end_matches('/').to_string(),
+fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, pin: Option<String>, interval: u64, once: bool) -> Result<()> {
+    let client = match engine {
+        Some(e) => remote_client(&e, token, pin.as_deref())?,
         None => match estia_server::another_engine_running(&ctx.data_dir) {
-            Some(rec) => local_url(&rec.bind, rec.port),
+            Some(rec) => local_client(ctx, &rec, token)?,
             None => {
                 return Err(anyhow!("no running engine for {} — start one with `estia serve` or pass --engine", ctx.data_dir.display()))
             }
         },
     };
-    let client = reqwest_blocking()?;
-    let get = |path: &str, auth: bool| -> Option<serde_json::Value> {
-        let mut r = client.get(format!("{base}{path}"));
-        if auth {
-            if let Some(t) = &token {
-                r = r.bearer_auth(t);
-            }
-        }
-        r.send().ok().filter(|r| r.status().is_success()).and_then(|r| r.json().ok())
-    };
+    let base = client.base_url().to_string();
+    let get = |path: &str| -> Option<serde_json::Value> { client.get_json(path).ok() };
     loop {
-        let health = get("/engine/health", false);
-        let stats = get("/engine/stats", true);
-        let models = get("/engine/models", true);
-        let pairings = get("/engine/pairings", true);
+        let health = get("/engine/health");
+        let stats = get("/engine/stats");
+        let models = get("/engine/models");
+        let pairings = get("/engine/pairings");
         if !once {
             print!("\x1b[2J\x1b[H");
         }
         println!("estia dashboard · {} · {}", safe(&base), clock_now());
         match &health {
             Some(h) => println!(
-                "engine   : v{} api v{} · backend {} · up {}s · bind {} · auth {}",
+                "engine   : v{} api v{} · backend {} · up {}s · bind {} · auth {} · tls {}",
                 jtext(&h["version"]),
                 jtext(&h["api_version"]),
                 jtext(&h["backend"]),
                 jtext(&h["uptime_s"]),
                 jtext(&h["bind"]),
-                if h["auth_required"].as_bool().unwrap_or(true) { "required" } else { "OFF" }
+                if h["auth_required"].as_bool().unwrap_or(true) { "required" } else { "OFF" },
+                if h["tls"].is_object() { jtext(&h["tls"]["short"]) } else { "off (this machine only)".to_string() }
             ),
             None => println!("engine   : unreachable"),
         }
@@ -2433,11 +2574,16 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, interval:
                 println!(
                     "pairings : {} pending{}",
                     pending.len(),
-                    if pending.is_empty() { "".to_string() } else { "  — approve with: estia pair approve <id>".to_string() }
+                    if pending.is_empty() {
+                        "".to_string()
+                    } else {
+                        "  — estia pair approve <id> when the device shows the same code".to_string()
+                    }
                 );
                 for x in pending {
                     let scopes = jlist(&x["scopes"]);
-                    println!("  {:<18} {:<28} from {:<16} {}", jtext(&x["id"]), scopes.join(","), jtext(&x["from"]), jtext(&x["name"]));
+                    let row = PairRow::remote(x);
+                    println!("  {:<18} code {:<9} {:<28} from {:<16} {}", row.id, row.code, scopes.join(","), row.from, row.name);
                     if let Some(w) = scope_warning(&scopes) {
                         println!("  {:<18} ! {w}", "");
                     }
@@ -2486,9 +2632,27 @@ struct PairRow {
     id: String,
     status: String,
     pending: bool,
+    /// The CODE column: the engine's code (`482 913`), `waiting`, `none`, or
+    /// `-` for plain HTTP from the engine's machine.
+    code: String,
+    /// The engine's code for the request, once the device has revealed.
+    pairing_code: Option<estia_engine::PairingCode>,
+    /// The check by name (`code`, `waiting`, `none`, `plain`; `?` from an
+    /// engine older than 0.5).
+    check: String,
     scopes: Vec<String>,
     from: String,
     name: String,
+}
+
+/// The CODE column for a check and its code.
+fn code_column(check: &str, code: Option<estia_engine::PairingCode>) -> String {
+    match check {
+        "code" => code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+        "waiting" => "waiting".into(),
+        "none" => "none".into(),
+        _ => "-".into(),
+    }
 }
 
 impl PairRow {
@@ -2507,6 +2671,9 @@ impl PairRow {
                 }
             ),
             pending: p.status == estia_server::pairing::PairingStatus::Pending,
+            code: code_column(p.check().as_str(), p.pairing_code()),
+            pairing_code: p.pairing_code(),
+            check: p.check().as_str().to_string(),
             scopes: p.scopes.iter().map(|s| safe(s)).collect(),
             from: safe(p.from.as_deref().unwrap_or("?")),
             name: safe(&p.name),
@@ -2528,6 +2695,9 @@ impl PairRow {
                 }
             ),
             pending: p["status"] == "pending",
+            code: code_column(p["check"].as_str().unwrap_or("?"), p["code"].as_str().and_then(estia_engine::PairingCode::parse)),
+            pairing_code: p["code"].as_str().and_then(estia_engine::PairingCode::parse),
+            check: safe(p["check"].as_str().unwrap_or("?")),
             scopes: jlist(&p["scopes"]),
             from: jtext(&p["from"]),
             name: jtext(&p["name"]),
@@ -2542,9 +2712,9 @@ fn pairing_lines(rows: &[PairRow]) -> Vec<String> {
     if rows.is_empty() {
         return vec!["no pairing requests".into()];
     }
-    let mut out = vec![format!("{:<18} {:<22} {:<28} {:<16} NAME", "ID", "STATUS", "SCOPES", "FROM")];
+    let mut out = vec![format!("{:<18} {:<22} {:<9} {:<28} {:<16} NAME", "ID", "STATUS", "CODE", "SCOPES", "FROM")];
     for r in rows {
-        out.push(format!("{:<18} {:<22} {:<28} {:<16} {}", r.id, r.status, r.scopes.join(","), r.from, r.name));
+        out.push(format!("{:<18} {:<22} {:<9} {:<28} {:<16} {}", r.id, r.status, r.code, r.scopes.join(","), r.from, r.name));
         if r.pending {
             if let Some(w) = scope_warning(&r.scopes) {
                 out.push(format!("{:<18} ! {w}", ""));
@@ -2552,6 +2722,109 @@ fn pairing_lines(rows: &[PairRow]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The line above `pair list`: the engine's certificate in its short form,
+/// which a device without a pairing exchange (a browser, a pasted token)
+/// compares by eye.
+fn certificate_line(fp: Option<estia_engine::Fingerprint>) -> String {
+    match fp {
+        Some(fp) => format!("engine certificate  {}  (estia tls fingerprint shows all of it)", fp.short()),
+        None => "engine certificate  none: this engine serves this machine only".to_string(),
+    }
+}
+
+/// Puts a yes/no question to the operator; `None` where nobody can answer it
+/// (stdin is not a terminal).
+type Ask<'a> = Option<&'a mut dyn FnMut(&str) -> Result<bool>>;
+
+/// Ask `question` on stderr and read the answer from `input`: yes only for
+/// `y` or `yes`; anything else, or nothing at all, is no.
+fn ask_yes_no(question: &str, input: &mut impl std::io::BufRead) -> Result<bool> {
+    eprint!("{question} [y/N] ");
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        eprintln!();
+        return Ok(false);
+    }
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// What `pair approve` sends for this request: its code, or nothing; or why
+/// it refuses. A request with a code is approved with `--code` (a script,
+/// which read the device's code: the engine compares it with its own), or,
+/// where someone can answer (`ask`), by showing the engine's code and asking
+/// whether the device shows the same: a yes sends that code back. The engine
+/// applies the same rules; this says which flag to use before anything is
+/// sent.
+fn approve_code(row: &PairRow, given: Option<&str>, no_code: bool, ask: Ask<'_>) -> Result<Option<String>> {
+    let given = match given {
+        Some(c) => Some(
+            estia_engine::PairingCode::parse(c)
+                .ok_or_else(|| anyhow!("--code takes the six digits the device shows, such as 482913"))?
+                .digits(),
+        ),
+        None => None,
+    };
+    match (row.check.as_str(), given, no_code) {
+        ("code", Some(c), _) => Ok(Some(c)),
+        ("code", None, true) => Err(anyhow!(
+            "this request has a code, so --no-code does not apply: approve it once the device shows the same code as this \
+             engine (`estia pair approve {}` in a terminal shows it and asks)",
+            row.id
+        )),
+        ("code", None, false) => {
+            let Some(code) = row.pairing_code else {
+                return Err(anyhow!("the engine lists no code for this request yet; try again in a moment"));
+            };
+            let Some(ask) = ask else {
+                return Err(anyhow!(
+                    "this request has a code: run `estia pair approve {}` in a terminal, which shows this engine's code and asks \
+                     whether the device shows the same; a script passes --code <the six digits the device shows>",
+                    row.id
+                ));
+            };
+            let question = format!(
+                "pairing {} asks for scopes [{}] from {}, under the name `{}`\n\n    code: {code}\n\nDoes the device show {code}?",
+                row.id,
+                row.scopes.join(","),
+                row.from,
+                row.name
+            );
+            if ask(&question)? {
+                return Ok(Some(code.digits()));
+            }
+            Err(anyhow!(
+                "not approved. If the device shows another code than {code}, something between it and this engine presented \
+                 its own certificate: deny the request (estia pair deny {}) and cancel on the device",
+                row.id
+            ))
+        }
+        ("waiting", _, _) => Err(anyhow!("the device has not finished the certificate check; try again in a moment")),
+        ("none" | "plain", Some(_), _) => Err(anyhow!(
+            "this request has no code, but you gave one: the device you are looking at made a different request; deny this one"
+        )),
+        ("none", None, false) => Err(anyhow!(
+            "this request came over https with no code: a browser or curl cannot show one. If the device you are pairing \
+             shows a 6-digit code, deny this request (estia pair deny <id>): something between it and this engine removed \
+             the code. Otherwise compare the certificate fingerprint the device shows with `estia tls fingerprint`, then run \
+             the same command with --no-code"
+        )),
+        // An engine older than 0.5 has no check; pass along what was given.
+        (_, code, _) => Ok(code),
+    }
+}
+
+/// After approving a request with a code: the device's half. It shows the
+/// same code and asks whether this engine shows it; it pins this engine's
+/// certificate only on a yes. Nothing is sent to it from here.
+fn print_device_step(row: &PairRow, sent: Option<&str>) {
+    if row.check != "code" {
+        return;
+    }
+    if let Some(c) = sent.and_then(estia_engine::PairingCode::parse) {
+        println!("\non the device, confirm that this engine shows {c}: the device trusts this engine only after that");
+    }
 }
 
 /// What a pending request's scopes allow beyond inference, if anything.
@@ -2584,28 +2857,40 @@ fn check_approval(id: &str, scopes: &[String], from: &str, name: &str, allow_adm
     Ok(())
 }
 
-fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
+/// `estia pair …`. `ask` puts the approve question to the operator, where
+/// someone can answer it.
+fn pair(ctx: &Ctx, action: PairAction, ask: Ask<'_>) -> Result<()> {
     use estia_server::pairing::PairingStore;
     use estia_server::tokens::TokenStore;
     let store = PairingStore::new(&ctx.data_dir);
-    let remote = |engine: &Option<String>, token: &Option<String>| -> Result<Option<estia_engine::RemoteEngine>> {
+    let remote = |engine: &Option<String>, token: &Option<String>, pin: &Option<String>| -> Result<Option<estia_engine::RemoteEngine>> {
         match engine {
-            Some(e) => Ok(Some(estia_engine::RemoteEngine::new(e.clone(), token.clone())?)),
+            Some(e) => Ok(Some(remote_client(e, token.clone(), pin.as_deref())?)),
             None => Ok(None),
         }
     };
     match action {
-        PairAction::List { engine, token } => {
-            let rows: Vec<PairRow> = match remote(&engine, &token)? {
-                Some(r) => r.pairings()?["pairings"].as_array().into_iter().flatten().map(PairRow::remote).collect(),
-                None => store.list().iter().map(PairRow::local).collect(),
+        PairAction::List { engine, token, pin } => {
+            let (fp, rows): (Option<estia_engine::Fingerprint>, Vec<PairRow>) = match remote(&engine, &token, &pin)? {
+                Some(r) => (r.pin(), r.pairings()?["pairings"].as_array().into_iter().flatten().map(PairRow::remote).collect()),
+                None => {
+                    let fp = match estia_server::tls::load(&ctx.data_dir) {
+                        Ok(id) => id.map(|id| id.fingerprint()),
+                        Err(e) => {
+                            eprintln!("engine certificate unreadable: {}", safe(&e.to_string()));
+                            None
+                        }
+                    };
+                    (fp, store.list().iter().map(PairRow::local).collect())
+                }
             };
+            println!("{}", certificate_line(fp));
             for line in pairing_lines(&rows) {
                 println!("{line}");
             }
         }
-        PairAction::Approve { id, engine, token, allow_admin } => {
-            if let Some(r) = remote(&engine, &token)? {
+        PairAction::Approve { id, code, no_code, engine, token, pin, allow_admin } => {
+            if let Some(r) = remote(&engine, &token, &pin)? {
                 // Read the request first: the approve route takes no scopes, so
                 // this is the only place to see what is being granted.
                 let list = r.pairings()?;
@@ -2617,37 +2902,46 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                     .ok_or_else(|| anyhow!("no pairing `{}` on {} (expired?)", safe(&id), safe(r.base_url())))?;
                 let row = PairRow::remote(p);
                 // Only a pending request can be approved; the engine says why otherwise.
+                let mut send = code.clone();
                 if row.pending {
                     check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
+                    send = approve_code(&row, code.as_deref(), no_code, ask)?;
                 }
-                let v = r.decide_pairing(&id, true)?;
+                let v = if no_code { r.approve_pairing_without_code(&id)? } else { r.approve_pairing(&id, send.as_deref())? };
                 println!(
-                    "approved {} with scopes [{}] from {}, name `{}`, on {} — the client collects its token on its next poll",
+                    "approved {} with scopes [{}] from {}, name `{}`, on {}{} — the client collects its token on its next poll",
                     jtext(&v["id"]),
                     jlist(&v["scopes"]).join(","),
                     row.from,
                     jtext(&v["name"]),
-                    safe(r.base_url())
+                    safe(r.base_url()),
+                    if send.is_some() { ", the codes match" } else { "" }
                 );
+                print_device_step(&row, send.as_deref());
                 return Ok(());
             }
             let pending = store.list().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("no pairing `{}` (expired?)", safe(&id)))?;
             let row = PairRow::local(&pending);
+            let mut send = code.clone();
             if row.pending {
                 check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
+                send = approve_code(&row, code.as_deref(), no_code, ask)?;
             }
             let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
-            let p = PairRow::local(&store.approve(&id, &tokens)?);
+            let approved = store.approve_with_code(&id, &tokens, send.as_deref(), no_code)?;
+            let p = PairRow::local(&approved);
             println!(
-                "approved {} with scopes [{}] from {}, name `{}` — the client collects its token on its next poll",
+                "approved {} with scopes [{}] from {}, name `{}`{} — the client collects its token on its next poll",
                 p.id,
                 p.scopes.join(","),
                 p.from,
-                p.name
+                p.name,
+                if send.is_some() { ", the codes match" } else { "" }
             );
+            print_device_step(&row, send.as_deref());
         }
-        PairAction::Deny { id, engine, token } => {
-            if let Some(r) = remote(&engine, &token)? {
+        PairAction::Deny { id, engine, token, pin } => {
+            if let Some(r) = remote(&engine, &token, &pin)? {
                 let v = r.decide_pairing(&id, false)?;
                 let revoked = if v["revoked"].as_bool() == Some(true) {
                     format!("; its token {} was revoked", jtext(&v["token_name"]))
@@ -2666,75 +2960,183 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
             let row = PairRow::local(&p);
             println!("denied {} (name `{}`){revoked}", row.id, row.name);
         }
-        PairAction::Request { engine, name, scopes, wait_seconds } => {
-            let client = reqwest_blocking()?;
-            let base = engine.trim_end_matches('/');
-            let r: serde_json::Value = client
-                .post(format!("{base}/engine/pair"))
-                .json(&serde_json::json!({"name": name, "scopes": scopes}))
-                .send()
-                .context("reach the engine")?
-                .error_for_status()
-                .context("pairing request refused")?
-                .json()?;
-            let id = r["id"].as_str().ok_or_else(|| anyhow!("no pairing id in response"))?.to_string();
-            // The id goes into a URL path below and in front of the operator.
-            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                return Err(anyhow!("the engine returned a malformed pairing id `{}`", safe(&id)));
-            }
-            eprintln!(
-                "pairing request `{id}` sent as `{}` — waiting up to {wait_seconds}s for the operator to run: estia pair approve {id}",
-                safe(&name)
-            );
-            let deadline = Instant::now() + std::time::Duration::from_secs(wait_seconds);
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                // A 5xx (the engine could not read or write pairings.json) or a
-                // dropped connection is worth another poll: the token is only
-                // handed out once its claim is saved, so nothing is lost. A 4xx
-                // (unknown or expired id) is final.
-                let v: Option<serde_json::Value> = match client.get(format!("{base}/engine/pair/{id}")).send() {
-                    Ok(r) if r.status().is_server_error() => {
-                        eprintln!("the engine answered {} while polling; retrying", r.status());
-                        None
-                    }
-                    Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-                        return Err(anyhow!(
-                            "pairing request `{id}` has expired: the engine drops a request {PAIR_EXPIRY_S} s after it was made; \
-                             run `estia pair request` again"
-                        ));
-                    }
-                    Ok(r) => Some(r.error_for_status()?.json()?),
-                    Err(e) if e.is_connect() || e.is_timeout() => {
-                        eprintln!("could not reach the engine while polling ({}); retrying", safe(&e.to_string()));
-                        None
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let v = v.unwrap_or(serde_json::Value::Null);
-                match v["status"].as_str() {
-                    Some("approved") => {
-                        let token = v["token"].as_str().ok_or_else(|| anyhow!("approved but the token was already collected"))?;
-                        println!("{}", safe(token));
-                        return Ok(());
-                    }
-                    Some("denied") => return Err(anyhow!("pairing denied by the operator")),
-                    _ => {}
-                }
-                if Instant::now() >= deadline {
-                    return Err(anyhow!(
-                        "no decision on pairing request `{id}` within {wait_seconds} s; the engine drops a request \
-                         {PAIR_EXPIRY_S} s after it was made, so run `estia pair request` again"
-                    ));
-                }
-            }
+        // Someone at a terminal can answer the device's question with a yes;
+        // anything else must give the engine's code (see `confirm_pairing`).
+        PairAction::Request { engine, name, scopes, wait_seconds, json } => {
+            pair_request(&engine, &name, &scopes, wait_seconds, json, ask.is_some())?
         }
     }
     Ok(())
 }
 
-fn reqwest_blocking() -> Result<reqwest::blocking::Client> {
-    Ok(reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).build()?)
+/// What `estia pair request --json` prints once approved: everything a script
+/// needs to connect from then on.
+fn pair_request_json(url: &str, name: &str, scopes: &[String], token: &str, pin: Option<estia_engine::Fingerprint>) -> serde_json::Value {
+    serde_json::json!({"url": url, "name": name, "scopes": scopes, "token": token, "pin": pin})
+}
+
+/// `estia pair request`: the device side, through [`estia_engine::begin_pairing`].
+/// The token goes to stdout (or the JSON object with `--json`); everything
+/// else to stderr (one JSON event per line with `--json`). `interactive`:
+/// stdin is a terminal, so a person can answer the question with a yes.
+fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, json: bool, interactive: bool) -> Result<()> {
+    use estia_engine::{PairingOutcome, SessionError};
+    let base = engine.trim().trim_end_matches('/').to_string();
+    let refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
+    let pending = estia_engine::begin_pairing(&base, name, &refs).context("pairing request refused")?;
+    let id = pending.id().to_string();
+    if json {
+        eprintln!("{}", request_event(&pending));
+    } else {
+        if let Some(cert) = pending.certificate() {
+            eprintln!("engine certificate {} (not trusted yet: the code checks it)", cert.short());
+        }
+        match pending.code() {
+            Some(code) => eprintln!(
+                "pairing request `{id}` sent as `{}`.\n\n    code: {code}\n\non the engine's machine, the operator runs:\n  {}\n\
+                 which shows the engine's code for this request: they approve only if it is {code} too. If the engine shows \
+                 another code, stop: something between this device and the engine answered in its place.\n\
+                 waiting up to {wait_seconds}s …",
+                safe(name),
+                pending.approve_command()
+            ),
+            None => eprintln!(
+                "pairing request `{id}` sent as `{}` — waiting up to {wait_seconds}s for the operator to run: {}",
+                safe(name),
+                pending.approve_command()
+            ),
+        }
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(wait_seconds);
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // An unreachable engine or a 5xx (it could not read or write
+        // pairings.json) is worth another poll: the token is only handed out
+        // once its claim is saved, so nothing is lost. A different
+        // certificate is final.
+        match pending.poll() {
+            Ok(PairingOutcome::Approved { token }) => {
+                // Over https the answer alone proves nothing: whatever
+                // answered the request could answer the polls too.
+                let pin = confirm_pairing(pending.clone(), &mut std::io::stdin().lock(), interactive, json)?;
+                if json {
+                    println!("{}", pair_request_json(&base, name, scopes, &token, pin));
+                } else {
+                    println!("{}", safe(&token));
+                    if let Some(p) = pin {
+                        eprintln!("pin: {p}\n  (this engine's certificate: pass it as --pin or ESTIA_PIN to remote-check, dashboard and pair --engine)");
+                    }
+                }
+                return Ok(());
+            }
+            Ok(PairingOutcome::AlreadyCollected) => return Err(anyhow!("approved but the token was already collected")),
+            Ok(PairingOutcome::Denied) => return Err(anyhow!("pairing denied by the operator")),
+            Ok(PairingOutcome::Expired) => {
+                return Err(anyhow!(
+                    "pairing request `{id}` has expired: the engine drops a request {PAIR_EXPIRY_S} s after it was made; \
+                     run `estia pair request` again"
+                ))
+            }
+            Ok(PairingOutcome::Pending) => {}
+            Err(e @ SessionError::CertificateMismatch { .. }) => return Err(e.into()),
+            Err(e) if json => eprintln!("{}", serde_json::json!({"event": "retry", "id": id, "detail": e.to_string()})),
+            Err(e) => eprintln!("could not poll the engine ({}); retrying", safe(&e.to_string())),
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "no decision on pairing request `{id}` within {wait_seconds} s; the engine drops a request \
+                 {PAIR_EXPIRY_S} s after it was made, so run `estia pair request` again"
+            ));
+        }
+    }
+}
+
+/// `estia pair request --json`'s first event: what the device shows, for an
+/// app that wraps the command to show it. The code is this device's own
+/// (null over loopback http, which has none).
+fn request_event(pending: &estia_engine::PendingPairing) -> serde_json::Value {
+    serde_json::json!({
+        "event": "request",
+        "id": pending.id(),
+        "code": pending.code().map(|c| c.digits()),
+        "certificate": pending.certificate().map(|c| c.short()),
+        "approve": pending.approve_command(),
+        "expires_unix": pending.expires_unix(),
+    })
+}
+
+/// Once approved, over https: ask on stderr whether the engine shows this
+/// device's code, and read the answer from `input`; return the pin when the
+/// answer holds. Nothing is printed to stdout before that. A loopback
+/// `http://` pairing has no code: no question, no pin.
+///
+/// What holds: the six digits the engine shows, equal to this device's code;
+/// or, only where a person is at a terminal (`interactive`), `y`. A `y` that
+/// is not typed at a terminal is refused: a script can write it without
+/// anyone comparing anything, which would pin whatever answered the polls.
+/// A script that has the engine's code (`estia pair list` on its machine)
+/// writes that instead; the device compares it with its own. With `json`
+/// the question is a `confirm` event on stderr.
+fn confirm_pairing(
+    pending: estia_engine::PendingPairing,
+    input: &mut impl std::io::BufRead,
+    interactive: bool,
+    json: bool,
+) -> Result<Option<estia_engine::Fingerprint>> {
+    let Some(code) = pending.code().copied() else {
+        return Ok(pending.confirm_match());
+    };
+    let id = safe(pending.id());
+    if json {
+        eprintln!("{}", confirm_event(&pending, interactive));
+    } else if interactive {
+        eprint!("approved. Does the engine show {code} for this request? [y/N] ");
+    } else {
+        eprint!("approved. The six digits the engine shows for request {id} (estia pair list on its machine): ");
+    }
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 && !json {
+        eprintln!();
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    let differ = |shown: &str| {
+        anyhow!(
+            "pairing not confirmed; the token is not kept. The engine shows {shown}, this device {code}: something between \
+             this device and the engine answered in its place. Deny the request there (estia pair deny {id}) and pair again"
+        )
+    };
+    match estia_engine::PairingCode::parse(&answer) {
+        Some(given) if given == code => return Ok(pending.confirm_match()),
+        Some(given) => return Err(differ(&given.to_string())),
+        None => {}
+    }
+    match answer.as_str() {
+        "y" | "yes" if interactive => Ok(pending.confirm_match()),
+        "y" | "yes" => Err(anyhow!(
+            "pairing not confirmed; the token is not kept. stdin is not a terminal, so `y` is not an answer: a script \
+             could write it without anyone comparing the codes. Write the six digits the engine shows for request {id} \
+             (`estia pair list` on its machine) instead"
+        )),
+        _ => Err(anyhow!(
+            "pairing not confirmed; the token is not kept. If the engine shows another code than {code}, or none, something \
+             between this device and the engine answered in its place: deny the request there (estia pair deny {id}) and pair again"
+        )),
+    }
+}
+
+/// The `confirm` event of `estia pair request --json`: the device was told
+/// "approved", and reads its answer from stdin next.
+fn confirm_event(pending: &estia_engine::PendingPairing, interactive: bool) -> serde_json::Value {
+    serde_json::json!({
+        "event": "confirm",
+        "id": pending.id(),
+        "code": pending.code().map(|c| c.digits()),
+        "answer": if interactive {
+            "y if the engine shows this code, or the six digits it shows"
+        } else {
+            "the six digits the engine shows for this request (y is not an answer when stdin is not a terminal)"
+        },
+    })
 }
 
 fn discover(seconds: u64) -> Result<()> {
@@ -2743,30 +3145,38 @@ fn discover(seconds: u64) -> Result<()> {
         println!("no engines advertising {} within {seconds}s", estia_server::MDNS_SERVICE_TYPE);
         return Ok(());
     }
-    println!("{:<20} {:<28} {:<30} {:<8} ENGINE", "NAME", "HOST", "URL", "API");
+    println!("{:<20} {:<28} {:<32} {:<8} {:<20} ENGINE", "NAME", "HOST", "URL", "API", "CERT (UNVERIFIED)");
     for d in found {
         // The list is ordered by what a client can dial, so the head is the
         // address to hand to another device; the rest are loopback and IPv6
         // spellings of the same engine and only add noise here.
-        // Everything here came off the network from whoever answered.
-        let url = safe(&http_url(d.addresses.first().unwrap_or(&d.host), d.port));
+        // Everything here came off the network from whoever answered: the
+        // certificate is what the advertisement claims, for comparing, not
+        // for trusting (pairing checks the real one).
+        let url = safe(&d.url().unwrap_or_else(|| "?".into()));
+        let cert = d.fingerprint.map(|f| f.short()).unwrap_or_else(|| if d.tls { "?".into() } else { "none (http)".into() });
         println!(
-            "{:<20} {:<28} {:<30} v{:<7} {}",
+            "{:<20} {:<28} {:<32} v{:<7} {:<20} {}",
             safe(&d.name),
             safe(&d.host),
             url,
             safe(d.api_version.as_deref().unwrap_or("?")),
+            cert,
             safe(d.engine_version.as_deref().unwrap_or("?"))
         );
     }
     Ok(())
 }
 
-fn remote_check(engine: &str, token: Option<String>, model: &str) -> Result<()> {
-    use estia_engine::{Priority, RemoteEmbed, RemoteEngine, RemoteGen};
-    let remote = std::sync::Arc::new(RemoteEngine::new(engine, token)?);
+fn remote_check(engine: &str, token: Option<String>, pin: Option<&str>, model: &str) -> Result<()> {
+    use estia_engine::{Priority, RemoteEmbed, RemoteGen};
+    let remote = std::sync::Arc::new(remote_client(engine, token, pin)?);
     let health = remote.health()?;
-    println!("health   : api v{} engine {} bind {}", jtext(&health["api_version"]), jtext(&health["version"]), jtext(&health["bind"]));
+    let tls = match remote.pin() {
+        Some(p) => format!(" · certificate {} (pinned)", p.short()),
+        None => " · plain http".to_string(),
+    };
+    println!("health   : api v{} engine {} bind {}{tls}", jtext(&health["api_version"]), jtext(&health["version"]), jtext(&health["bind"]));
     let gen = RemoteGen::new(std::sync::Arc::clone(&remote), model);
     let t0 = Instant::now();
     let mut pieces = 0;
@@ -2820,6 +3230,13 @@ fn token(ctx: &Ctx, action: TokenAction) -> Result<()> {
                 })?
             };
             println!("{t}");
+            // stderr: scripts capture the token from stdout.
+            if let Ok(Some(id)) = estia_server::tls::load(&ctx.data_dir) {
+                eprintln!(
+                    "a device on the LAN also needs this engine's certificate fingerprint, to pin it (--pin, ESTIA_PIN):\n  {}",
+                    id.fingerprint()
+                );
+            }
         }
         TokenAction::List => {
             let list = store.list();
@@ -2856,6 +3273,75 @@ fn token(ctx: &Ctx, action: TokenAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `estia tls fingerprint` and `estia tls rotate`.
+fn tls_command(ctx: &Ctx, action: TlsAction) -> Result<()> {
+    use estia_server::tls;
+    match action {
+        TlsAction::Fingerprint { json } => {
+            let id = tls::load(&ctx.data_dir)?.ok_or_else(|| {
+                anyhow!("no certificate yet: `estia serve --lan` (or `estia service install`) makes one; `estia tls rotate` makes one now")
+            })?;
+            let fp = id.fingerprint();
+            let file = tls::cert_path(&ctx.data_dir);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "fingerprint": fp.to_hex(), "short": fp.short(), "grouped": fp.grouped(), "curl_pin": id.curl_pin(),
+                        "file": file, "created_unix": id.created_unix(),
+                    })
+                );
+                return Ok(());
+            }
+            println!("fingerprint : {}", fp.to_hex());
+            println!("short       : {}   (what people compare by eye)", fp.short());
+            println!("in full     : {}", fp.grouped());
+            println!("curl        : curl -k --pinnedpubkey {} https://…", id.curl_pin());
+            println!("file        : {}", file.display());
+            println!("created     : {}", utc_date(id.created_unix()));
+        }
+        TlsAction::Rotate { yes } => {
+            if let Some(old) = tls::load(&ctx.data_dir)? {
+                if !yes {
+                    return Err(anyhow!(
+                        "this engine already has a certificate ({}). A new one breaks every paired device: each must pair \
+                         again, because its pin names the old certificate (their tokens stay valid until you revoke them). \
+                         Run `estia tls rotate --yes` to go ahead.",
+                        old.fingerprint().short()
+                    ));
+                }
+            }
+            let id = tls::rotate(&ctx.data_dir)?;
+            println!("new certificate {}", id.fingerprint().to_hex());
+            println!("short           {}", id.fingerprint().short());
+            if estia_server::another_engine_running(&ctx.data_dir).is_some() {
+                println!(
+                    "the running engine keeps the old certificate until it restarts: `estia service restart`, or restart `estia serve`"
+                );
+            }
+            println!(
+                "every paired device must pair again (estia pair request); revoke the tokens of devices that will not (estia token list)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `YYYY-MM-DD` (UTC) for a Unix time.
+fn utc_date(unix_secs: u64) -> String {
+    // Howard Hinnant's days-from-civil, inverted.
+    let z = (unix_secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 async fn runtime(ctx: &Ctx, action: RuntimeAction) -> Result<()> {
@@ -3152,7 +3638,9 @@ async fn run_cli() -> Result<()> {
         Cmd::Tokens { model } => tokio::task::block_in_place(|| tokens(&ctx, &model)),
         Cmd::Setup { roles, no_models, variant, json } => setup(&ctx, &roles, no_models, variant.as_deref(), json).await,
         Cmd::Service { action } => service(&ctx, action),
-        Cmd::Dashboard { engine, token, interval, once } => tokio::task::block_in_place(|| dashboard(&ctx, engine, token, interval, once)),
+        Cmd::Dashboard { engine, token, pin, interval, once } => {
+            tokio::task::block_in_place(|| dashboard(&ctx, engine, token, pin, interval, once))
+        }
         Cmd::Serve {
             port,
             bind,
@@ -3183,9 +3671,18 @@ async fn run_cli() -> Result<()> {
             .await
         }
         Cmd::Token { action } => token(&ctx, action),
-        Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
+        Cmd::Pair { action } => tokio::task::block_in_place(|| {
+            // The approve question needs someone at a terminal; a script
+            // passes --code instead (piping "y" in is not an answer).
+            let mut ask = |question: &str| ask_yes_no(question, &mut std::io::stdin().lock());
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            pair(&ctx, action, if interactive { Some(&mut ask) } else { None })
+        }),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),
-        Cmd::RemoteCheck { engine, token, model } => tokio::task::block_in_place(|| remote_check(&engine, token, &model)),
+        Cmd::RemoteCheck { engine, token, pin, model } => {
+            tokio::task::block_in_place(|| remote_check(&engine, token, pin.as_deref(), &model))
+        }
+        Cmd::Tls { action } => tls_command(&ctx, action),
         Cmd::Version { .. } => unreachable!("handled above"),
     }
 }
@@ -3297,7 +3794,7 @@ mod tests {
     #[test]
     fn pair_list_puts_scopes_before_the_name_and_flags_admin() {
         let row = PairRow::remote(&serde_json::json!({
-            "id": "6de47a30928f4f15", "status": "pending", "from": "127.0.0.1",
+            "id": "hwkrcmatyfendpux", "status": "pending", "from": "127.0.0.1",
             "name": "ipad                 generate   Pending\u{1b}[8m", "scopes": ["admin"],
         }));
         let lines = pairing_lines(&[row]);
@@ -3326,22 +3823,336 @@ mod tests {
         let text = std::fs::read_to_string(&file).unwrap().replace("\"ipad\"", "\"ipad\\u001b[8m\"");
         std::fs::write(&file, text).unwrap();
         assert_eq!(store.list()[0].name, "ipad\x1b[8m");
-        let err = pair(&ctx, PairAction::Approve { id: admin.id.clone(), engine: None, token: None, allow_admin: false }).unwrap_err();
+        let approve = |id: &str, allow_admin: bool| PairAction::Approve {
+            id: id.to_string(),
+            code: None,
+            no_code: false,
+            engine: None,
+            token: None,
+            pin: None,
+            allow_admin,
+        };
+        let err = pair(&ctx, approve(&admin.id, false), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("[admin]") && msg.contains("10.0.0.9") && msg.contains("--allow-admin"), "{msg}");
         assert!(!msg.contains('\x1b'), "{msg}");
         let still = store.list().into_iter().find(|p| p.id == admin.id).unwrap();
         assert_eq!(still.status, PairingStatus::Pending, "refused means nothing was minted");
         assert!(estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().is_empty());
-        pair(&ctx, PairAction::Approve { id: admin.id.clone(), engine: None, token: None, allow_admin: true }).unwrap();
+        pair(&ctx, approve(&admin.id, true), None).unwrap();
         assert_eq!(store.list().into_iter().find(|p| p.id == admin.id).unwrap().status, PairingStatus::Approved);
         let tokens = || estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().list();
         assert_eq!(tokens().len(), 1);
-        pair(&ctx, PairAction::Deny { id: admin.id.clone(), engine: None, token: None }).unwrap();
+        pair(&ctx, PairAction::Deny { id: admin.id.clone(), engine: None, token: None, pin: None }, None).unwrap();
         assert!(tokens().is_empty(), "deny after approve revokes the minted token");
         // models:write is approved with a warning; plain scopes need nothing.
         assert!(check_approval("x", &["models:write".into()], "?", "n", false).is_ok());
         assert!(check_approval("x", &["generate".into(), "embed".into()], "?", "n", false).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn row(check: &str, code: Option<&str>) -> PairRow {
+        PairRow::remote(&serde_json::json!({
+            "id": "hwkrcmatyfendpux", "status": "pending", "check": check, "code": code,
+            "scopes": ["generate"], "from": "10.0.0.4", "name": "phone",
+        }))
+    }
+
+    /// `pair approve` asks for the right flag before anything is sent, by the
+    /// request's check, and in a terminal asks whether the codes match.
+    #[test]
+    fn approve_needs_the_code_the_request_has() {
+        let coded = row("code", Some("482913"));
+        // A script: --code, which the engine compares with its own.
+        assert_eq!(approve_code(&coded, Some("482 913"), false, None).unwrap().as_deref(), Some("482913"));
+        assert!(approve_code(&coded, Some("48291"), false, None).unwrap_err().to_string().contains("six digits"));
+        // No terminal and no --code: refused, and says what to do.
+        let e = approve_code(&coded, None, false, None).unwrap_err().to_string();
+        assert!(e.contains("in a terminal") && e.contains("--code"), "{e}");
+        assert!(!e.contains("482"), "the refusal does not hand a script the engine's code: {e}");
+        // --no-code never stands in for a code.
+        let mut never = |_: &str| -> Result<bool> { panic!("no question for --no-code") };
+        assert!(approve_code(&coded, None, true, Some(&mut never)).unwrap_err().to_string().contains("--no-code does not apply"));
+        // A terminal: the engine's code is shown and a yes sends it back.
+        let mut asked = String::new();
+        let mut yes = |q: &str| -> Result<bool> {
+            asked = q.to_string();
+            Ok(true)
+        };
+        assert_eq!(approve_code(&coded, None, false, Some(&mut yes)).unwrap().as_deref(), Some("482913"));
+        assert!(asked.contains("code: 482 913") && asked.ends_with("Does the device show 482 913?"), "{asked}");
+        assert!(asked.contains("[generate]") && asked.contains("10.0.0.4") && asked.contains("`phone`"), "{asked}");
+        assert!(asked.find("phone").unwrap() < asked.find("code:").unwrap(), "the code is not on the name's line: {asked}");
+        let mut no = |_: &str| -> Result<bool> { Ok(false) };
+        let e = approve_code(&coded, None, false, Some(&mut no)).unwrap_err().to_string();
+        assert!(e.contains("not approved") && e.contains("estia pair deny hwkrcmatyfendpux"), "{e}");
+        // The question and the answer, as the terminal sees them.
+        assert!(ask_yes_no("q", &mut std::io::Cursor::new("y\n")).unwrap());
+        assert!(ask_yes_no("q", &mut std::io::Cursor::new(" YES \n")).unwrap());
+        for answer in ["n\n", "\n", "482913\n", "yy\n", ""] {
+            assert!(!ask_yes_no("q", &mut std::io::Cursor::new(answer)).unwrap(), "{answer:?}");
+        }
+
+        let mut never = |_: &str| -> Result<bool> { panic!("nothing to compare") };
+        assert!(approve_code(&row("waiting", None), Some("482913"), false, None).unwrap_err().to_string().contains("try again"));
+        assert!(approve_code(&row("waiting", None), None, false, Some(&mut never)).unwrap_err().to_string().contains("try again"));
+        assert!(approve_code(&row("none", None), None, false, None).unwrap_err().to_string().contains("--no-code"));
+        assert_eq!(approve_code(&row("none", None), None, true, Some(&mut never)).unwrap(), None);
+        assert!(approve_code(&row("none", None), Some("482913"), false, None).unwrap_err().to_string().contains("different request"));
+        assert!(approve_code(&row("plain", None), Some("482913"), false, None).is_err());
+        assert_eq!(approve_code(&row("plain", None), None, false, Some(&mut never)).unwrap(), None);
+        let old = PairRow::remote(&serde_json::json!({"id": "a", "status": "pending", "scopes": ["generate"], "name": "phone"}));
+        assert_eq!(
+            approve_code(&old, Some("482913"), false, None).unwrap().as_deref(),
+            Some("482913"),
+            "an older engine gets what was given"
+        );
+        assert!(Cli::try_parse_from(["estia", "pair", "approve", "x", "--code", "1", "--no-code"]).is_err(), "one or the other");
+    }
+
+    /// A request over https with a code, approved on the engine's machine:
+    /// a no at the prompt, a wrong --code and no code at all are refused and
+    /// mint nothing; a yes approves with the engine's code.
+    #[test]
+    fn approve_checks_the_code_locally() {
+        use estia_engine::tls as etls;
+        use estia_server::pairing::{PairingStatus, PairingStore};
+        let dir = scratch("approve-code");
+        let ctx = ctx_for(&dir);
+        let store = PairingStore::new(&dir);
+        let fp = estia_engine::Fingerprint::of_certificate(b"engine");
+        let nonce = [3u8; 32];
+        let p = store.request_tls("phone", &["generate".into()], Some("10.0.0.4".into()), Some(&etls::pairing_commitment(&nonce))).unwrap();
+        let p = store.reveal(&p.id, &etls::nonce_hex(&nonce), &fp).unwrap();
+        let good = p.code.clone().unwrap();
+        let bad = if good == "000000" { "000001".to_string() } else { "000000".to_string() };
+        let approve = |code: Option<&str>| PairAction::Approve {
+            id: p.id.clone(),
+            code: code.map(str::to_string),
+            no_code: false,
+            engine: None,
+            token: None,
+            pin: None,
+            allow_admin: false,
+        };
+        let minted = || estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().list().len();
+        assert!(pair(&ctx, approve(None), None).unwrap_err().to_string().contains("--code"), "no terminal, no --code");
+        let mut no = |_: &str| -> Result<bool> { Ok(false) };
+        assert!(pair(&ctx, approve(None), Some(&mut no)).unwrap_err().to_string().contains("not approved"));
+        assert!(pair(&ctx, approve(Some(&bad)), None).unwrap_err().to_string().contains("does not match"));
+        assert_eq!(minted(), 0, "refused means nothing was minted");
+        let mut shown = String::new();
+        let mut yes = |q: &str| -> Result<bool> {
+            shown = q.to_string();
+            Ok(true)
+        };
+        pair(&ctx, approve(None), Some(&mut yes)).unwrap();
+        assert!(shown.contains(&p.code_shown().unwrap()), "the prompt showed the engine's code: {shown}");
+        assert_eq!(store.list().into_iter().find(|q| q.id == p.id).unwrap().status, PairingStatus::Approved);
+        assert_eq!(minted(), 1);
+        // --code, the scripted way, approves another request the same way.
+        let q =
+            store.request_tls("tablet", &["generate".into()], Some("10.0.0.5".into()), Some(&etls::pairing_commitment(&nonce))).unwrap();
+        let q = store.reveal(&q.id, &etls::nonce_hex(&nonce), &fp).unwrap();
+        let script = PairAction::Approve {
+            id: q.id.clone(),
+            code: q.code.clone(),
+            no_code: false,
+            engine: None,
+            token: None,
+            pin: None,
+            allow_admin: false,
+        };
+        pair(&ctx, script, None).unwrap();
+        assert_eq!(store.list().into_iter().find(|r| r.id == q.id).unwrap().status, PairingStatus::Approved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pair_list_shows_each_requests_code() {
+        let rows: Vec<PairRow> = [
+            serde_json::json!({"id": "a1", "status": "pending", "check": "code", "code": "042913", "scopes": ["generate"], "name": "phone"}),
+            serde_json::json!({"id": "b2", "status": "pending", "check": "waiting", "scopes": ["generate"], "name": "tablet"}),
+            serde_json::json!({"id": "c3", "status": "pending", "check": "none", "scopes": ["generate"], "name": "browser"}),
+            serde_json::json!({"id": "d4", "status": "approved", "check": "plain", "scopes": ["generate"], "name": "local"}),
+            serde_json::json!({"id": "e5", "status": "pending", "scopes": ["generate"], "name": "old engine"}),
+        ]
+        .iter()
+        .map(PairRow::remote)
+        .collect();
+        let lines = pairing_lines(&rows);
+        assert!(lines[0].contains("STATUS") && lines[0].contains("CODE"), "{}", lines[0]);
+        assert!(lines[0].find("CODE").unwrap() < lines[0].find("SCOPES").unwrap());
+        let code_of = |i: usize| lines[i].split_whitespace().nth(2).unwrap().to_string();
+        assert!(lines[1].contains("042 913"), "{}", lines[1]);
+        assert_eq!((code_of(2), code_of(3), code_of(5)), ("waiting".to_string(), "none".to_string(), "-".to_string()));
+        assert!(lines[4].contains(" - "), "{}", lines[4]);
+        let fp = estia_engine::Fingerprint::from_bytes([0xab; 32]);
+        assert_eq!(certificate_line(Some(fp)), "engine certificate  abab abab abab abab  (estia tls fingerprint shows all of it)");
+        assert!(certificate_line(None).contains("this machine only"));
+    }
+
+    #[test]
+    fn pair_request_takes_json_and_prints_url_token_and_pin() {
+        let cli = Cli::try_parse_from(["estia", "pair", "request", "--engine", "https://10.0.0.5:27200", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Pair { action: PairAction::Request { json: true, .. } }));
+        let pin = estia_engine::Fingerprint::from_bytes([1; 32]);
+        let v = pair_request_json("https://10.0.0.5:27200", "laptop", &["generate".into()], "estia_x", Some(pin));
+        assert_eq!(v["url"], "https://10.0.0.5:27200");
+        assert_eq!(v["token"], "estia_x");
+        assert_eq!(v["pin"], pin.to_hex());
+        assert_eq!(v["scopes"], serde_json::json!(["generate"]));
+        assert!(pair_request_json("http://127.0.0.1:1", "x", &[], "t", None)["pin"].is_null());
+        // The help says what a script answers, and what a name may hold.
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let pair = cmd.find_subcommand_mut("pair").unwrap();
+        let request = pair.find_subcommand_mut("request").unwrap().render_long_help().to_string();
+        assert!(request.contains("not a terminal") && request.contains("4 digits in a row"), "{request}");
+        assert!(request.contains("`confirm`") && request.contains("`request`"), "{request}");
+        let approve = pair.find_subcommand_mut("approve").unwrap().render_long_help().to_string();
+        assert!(approve.contains("Never take it from `estia pair list`"), "{approve}");
+    }
+
+    /// `--engine https://…` needs a pin, and says where to get one; plain
+    /// loopback needs none. `--pin` also comes from ESTIA_PIN.
+    #[test]
+    fn remote_engines_over_https_need_a_pin() {
+        let e = remote_client_with("https://10.0.0.5:27200", None, None, None).unwrap_err().to_string();
+        assert!(e.contains("--pin") && e.contains("estia tls fingerprint"), "{e}");
+        assert!(remote_client_with("https://10.0.0.5:27200", None, Some("nonsense"), None).is_err());
+        let fp = estia_engine::Fingerprint::from_bytes([2; 32]);
+        assert_eq!(remote_client_with("https://10.0.0.5:27200/", None, Some(&fp.to_hex()), None).unwrap().pin(), Some(fp));
+        assert!(remote_client_with("http://127.0.0.1:27200", None, None, None).unwrap().pin().is_none());
+        // A token over plain http to another machine is refused.
+        let e = remote_client_with("http://10.0.0.5:27200", Some("estia_t".into()), None, None).unwrap_err().to_string();
+        assert!(e.contains("in clear"), "{e}");
+        let cli = Cli::try_parse_from(["estia", "remote-check", "--engine", "https://h:1", "--pin", "ab"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::RemoteCheck { pin: Some(ref p), .. } if p == "ab"));
+        assert_eq!(url_for("https", "fe80::1%en0", 1), "https://[fe80::1%25en0]:1");
+        assert_eq!(url_for("https", "192.168.1.7", 27200), "https://192.168.1.7:27200");
+    }
+
+    /// An ESTIA_PIN exported for a LAN engine does not break commands aimed at
+    /// the engine on this machine over http; `--pin` given there still is an
+    /// error, and ESTIA_PIN still pins an https engine.
+    #[test]
+    fn an_exported_pin_is_ignored_for_http() {
+        let fp = estia_engine::Fingerprint::from_bytes([3; 32]);
+        let hex = fp.to_hex();
+        let env = Some(hex.as_str());
+        assert_eq!(pin_for("http://127.0.0.1:27200", None, env).unwrap(), None);
+        assert!(remote_client_with("http://127.0.0.1:27200", Some("estia_t".into()), None, env).unwrap().pin().is_none());
+        assert_eq!(pin_for("https://10.0.0.5:27200", None, env).unwrap(), Some(fp));
+        assert_eq!(remote_client_with("https://10.0.0.5:27200", None, None, env).unwrap().pin(), Some(fp));
+        assert_eq!(pin_for("http://127.0.0.1:27200", Some(&hex), None).unwrap(), Some(fp), "--pin is taken as given");
+        assert!(remote_client_with("http://127.0.0.1:27200", None, Some(&hex), None).unwrap_err().to_string().contains("https"));
+        assert!(pin_for("https://h:1", None, Some("nonsense")).unwrap_err().to_string().contains("ESTIA_PIN"));
+        assert!(pin_for("https://h:1", Some("nonsense"), env).unwrap_err().to_string().contains("--pin"), "--pin wins");
+        assert_eq!(pin_for("https://h:1", Some("  "), None).unwrap(), None);
+    }
+
+    /// Where `status` and `dashboard` reach this data directory's engine: a
+    /// specific LAN bind (where nothing answers on loopback, and plain HTTP
+    /// from the machine's own LAN address is refused) over https, pinned.
+    #[test]
+    fn the_local_engine_is_reached_where_it_listens() {
+        let fp = estia_engine::Fingerprint::from_bytes([4; 32]);
+        assert_eq!(local_target("0.0.0.0", 27200, Some(fp)), ("http://127.0.0.1:27200".to_string(), None));
+        assert_eq!(local_target("::", 27200, Some(fp)), ("http://[::1]:27200".to_string(), None));
+        assert_eq!(local_target("127.0.0.1", 27200, None), ("http://127.0.0.1:27200".to_string(), None));
+        assert_eq!(local_target("192.168.1.5", 27200, Some(fp)), ("https://192.168.1.5:27200".to_string(), Some(fp)));
+        assert_eq!(local_target("100.64.0.7", 1, Some(fp)), ("https://100.64.0.7:1".to_string(), Some(fp)), "a Tailscale address");
+        assert_eq!(local_target("fe80::1%en0", 1, Some(fp)), ("https://[fe80::1%25en0]:1".to_string(), Some(fp)));
+        // A record from an engine without TLS (loopback only) stays plain.
+        assert_eq!(local_target("192.168.1.5", 27200, None), ("http://192.168.1.5:27200".to_string(), None));
+    }
+
+    /// `estia pair request` keeps the token back until the user says the
+    /// engine shows the same code; anything but a yes keeps it back. A yes
+    /// counts only from a terminal: piped in, it is refused, and a script
+    /// gives the engine's six digits instead, which must equal the device's.
+    #[test]
+    fn pair_request_asks_whether_the_engine_shows_the_same_code() {
+        use estia_engine::tls as etls;
+        let seen = estia_engine::Fingerprint::from_bytes([5; 32]);
+        let (d, e) = ([6u8; 32], [7u8; 32]);
+        let code = etls::pairing_code(&seen, &d, &e);
+        let other = estia_engine::PairingCode::parse(if code.digits() == "000000" { "000001" } else { "000000" }).unwrap();
+        let pending: estia_engine::PendingPairing = serde_json::from_value(serde_json::json!({
+            "base_url": "https://10.0.0.5:27200", "id": "abc", "expires_unix": 0,
+            "codes": {"certificate": seen, "code": code},
+        }))
+        .unwrap();
+        let confirm = |answer: &str, interactive: bool| {
+            confirm_pairing(pending.clone(), &mut std::io::Cursor::new(answer.to_string()), interactive, false)
+        };
+        // At a terminal: a yes, or the engine's six digits.
+        for answer in ["y\n", " YES \n", &format!("{}\n", code.digits()), &format!("{code}\n")] {
+            assert_eq!(confirm(answer, true).unwrap(), Some(seen), "{answer:?}");
+        }
+        // Not at a terminal: only the engine's six digits; a piped `y` is not
+        // an answer, since a script writes it without comparing anything.
+        assert_eq!(confirm(&format!("{}\n", code.digits()), false).unwrap(), Some(seen));
+        for answer in ["y\n", "yes\n"] {
+            let e = confirm(answer, false).unwrap_err().to_string();
+            assert!(e.contains("not a terminal") && e.contains("six digits") && e.contains("estia pair list"), "{answer:?}: {e}");
+        }
+        // Anything else keeps the token back, either way.
+        for interactive in [true, false] {
+            for answer in ["n\n", "", "\n", "yy\n", "48291\n"] {
+                let e = confirm(answer, interactive).unwrap_err().to_string();
+                assert!(e.contains("not confirmed") && e.contains("estia pair deny abc"), "{answer:?}: {e}");
+            }
+            // Another code: the engine saw another exchange (an interceptor).
+            let e = confirm(&format!("{}\n", other.digits()), interactive).unwrap_err().to_string();
+            assert!(e.contains(&format!("The engine shows {other}, this device {code}")), "{e}");
+        }
+        let plain: estia_engine::PendingPairing =
+            serde_json::from_value(serde_json::json!({"base_url": "http://127.0.0.1:1", "id": "ab", "expires_unix": 0})).unwrap();
+        assert_eq!(
+            confirm_pairing(plain.clone(), &mut std::io::Cursor::new(""), false, false).unwrap(),
+            None,
+            "loopback http: nothing asked, nothing pinned"
+        );
+
+        // --json: the steps as events an app can show.
+        let ev = request_event(&pending);
+        assert_eq!(
+            (ev["event"].as_str(), ev["id"].as_str(), ev["code"].as_str()),
+            (Some("request"), Some("abc"), Some(code.digits().as_str()))
+        );
+        assert_eq!(ev["approve"], "estia pair approve abc");
+        assert_eq!(ev["certificate"], seen.short());
+        assert!(request_event(&plain)["code"].is_null());
+        let ev = confirm_event(&pending, false);
+        assert_eq!((ev["event"].as_str(), ev["code"].as_str()), (Some("confirm"), Some(code.digits().as_str())));
+        assert!(ev["answer"].as_str().unwrap().contains("six digits"), "{ev}");
+        assert!(confirm_event(&pending, true)["answer"].as_str().unwrap().starts_with("y if"));
+        assert_eq!(
+            confirm_pairing(pending.clone(), &mut std::io::Cursor::new(format!("{}\n", code.digits())), false, true).unwrap(),
+            Some(seen)
+        );
+    }
+
+    /// `estia tls fingerprint` before and after a certificate exists, and
+    /// `rotate` refusing to replace one without --yes.
+    #[test]
+    fn tls_fingerprint_and_rotate() {
+        let dir = scratch("tls");
+        let ctx = ctx_for(&dir);
+        let e = tls_command(&ctx, TlsAction::Fingerprint { json: false }).unwrap_err().to_string();
+        assert!(e.contains("no certificate yet") && e.contains("estia serve --lan"), "{e}");
+        tls_command(&ctx, TlsAction::Rotate { yes: false }).unwrap();
+        let first = estia_server::tls::load(&dir).unwrap().unwrap().fingerprint();
+        tls_command(&ctx, TlsAction::Fingerprint { json: true }).unwrap();
+        let e = tls_command(&ctx, TlsAction::Rotate { yes: false }).unwrap_err().to_string();
+        assert!(e.contains("pair") && e.contains("--yes"), "{e}");
+        assert_eq!(estia_server::tls::load(&dir).unwrap().unwrap().fingerprint(), first, "refused means unchanged");
+        tls_command(&ctx, TlsAction::Rotate { yes: true }).unwrap();
+        assert_ne!(estia_server::tls::load(&dir).unwrap().unwrap().fingerprint(), first);
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(1_791_417_600), "2026-10-08");
+        assert_eq!(utc_date(951_782_400), "2000-02-29");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3368,7 +4179,7 @@ mod tests {
 
         assert!(token(&ctx, TokenAction::Revoke { name: "nosuch".into() }).is_err());
         // A device-chosen name with escapes is revocable as `token list` shows it.
-        let raw = "pair:ipad\x1b[8m:6de47a30928f4f15";
+        let raw = "pair:ipad\x1b[8m:hwkrcmatyfendpux";
         TokenStore::open(dir.join("tokens.json")).unwrap().mint(raw, &["admin"]).unwrap();
         token(&ctx, TokenAction::Revoke { name: safe(raw) }).unwrap();
         assert!(TokenStore::open(dir.join("tokens.json")).unwrap().list().iter().all(|r| r.name != raw));

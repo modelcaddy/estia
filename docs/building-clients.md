@@ -129,26 +129,89 @@ message when `ESTIA_TOKEN` is missing, unknown or lacks a scope.
 
 An app on a phone, tablet or another computer cannot run `estia token new`.
 It pairs instead: it asks for a token, the operator approves on the engine's
-machine, and the app collects the token once.
+machine, and the app collects the token once, together with the certificate
+to pin (see [Pinning the engine's certificate](#pinning-the-engines-certificate)).
+
+An engine on the LAN serves HTTPS with its own certificate, and the first
+connection has nothing to check that certificate against. So a pairing proves,
+in both directions, which certificate each end used, the way Bluetooth's
+numeric comparison does: the device commits to a random nonce, the engine
+answers with its own, and both compute one 6-digit code from the certificate
+fingerprint each of them used and the two nonces. The device shows its code;
+the engine shows its own (`estia pair approve`, `estia pair list`, an admin
+app). A person checks the two are the same and says so on both ends: the
+operator approves only then, and the device pins the certificate only when
+its user says the engine shows the device's code. Neither end ever sends its
+code to the other.
 
 ```text
-POST /engine/pair {"name": "kitchen tablet", "scopes": ["generate"]}
-  → 202 {"id": "bb706d7dccbe7777", "status": "pending", "expires_in": 300, ...}
-GET /engine/pair/bb706d7dccbe7777 → {"status": "pending", "token": null}
-        operator: estia pair approve bb706d7dccbe7777
-GET /engine/pair/bb706d7dccbe7777 → {"status": "approved", "token": "estia_..."}   (once)
-GET /engine/pair/bb706d7dccbe7777 → {"status": "approved", "token": null}
+device: nonce_d = 32 random bytes; it connects without trusting the
+        certificate yet and notes its fingerprint F
+POST /engine/pair {"name": "kitchen tablet", "scopes": ["generate"], "commitment": sha256(label ‖ nonce_d)}
+  → 202 {"id": "pftcdyercxjcduud", "status": "pending", "check": "waiting", "engine_nonce": "<64 hex>",
+         "tls": {"fingerprint": "<64 hex>", "short": "3f2a 9c41 7b0e d512"}, ...}
+POST /engine/pair/pftcdyercxjcduud/reveal {"nonce": "<nonce_d, 64 hex>"}   → 200
+device: code = pairing_code(F, nonce_d, engine_nonce) → shows "482 913"
+GET /engine/pair/pftcdyercxjcduud → {"status": "pending", "token": null}
+        operator: estia pair approve pftcdyercxjcduud
+        it shows the engine's code and asks: Does the device show 482 913? [y/N] y
+GET /engine/pair/pftcdyercxjcduud → {"status": "approved", "token": "estia_..."}   (once)
+device: asks "Does the engine show 482 913?"; the user looks at the engine's
+        screen and taps yes; then pin F
 ```
+
+The exact definitions of the commitment and the code, with a known-answer
+vector, are in [api.md](api.md#pairing). You need not write them: the Rust
+client does all of it in `begin_pairing` and `PendingPairing::confirm_match`,
+and [`python/estia_tls.py`](../examples/python/estia_tls.py) has the
+functions in the standard library.
 
 What your app should do:
 
 - Ask for the smallest set of scopes. The operator sees them before approving,
   and `estia pair approve` refuses `admin` without `--allow-admin`.
 - Use a name the operator will recognise: at most 64 letters, digits, single
-  spaces and `. _ - ' ’ ( )`. Anything else is a 400.
-- Show the pairing id and the approve command, then poll every 2 seconds or so.
-- Save the token the moment it arrives. It is handed out exactly once. Store it
-  in the keychain, or in a file created with mode 0600.
+  spaces and `. _ - ' ’ ( )`, with at most 4 digits in a row (a run that
+  could pass for a pairing code is refused, and only a letter with case,
+  such as a-z, α-ω or а-я, ends a run). Anything else is a 400. Derive it
+  from something like the device's model without its year or size
+  ("MacBook Pro 2023 16" holds six digits in a row and is refused).
+- Over `https://`, check the id in the answer before going on: an engine's
+  ids are 16 letters of `acdefhjkmnprtuvwxy`, none that passes for a digit.
+  Refuse anything else (`tls::is_pairing_id` in Rust; `begin_pairing` does
+  it): you show the id next to your code, and whatever answered chose it.
+- Commit before you see the engine's nonce, reveal once it has answered, and
+  show the code large, with the approve command (`estia pair approve <id>`).
+  Keep using the connection's certificate for every later call of the
+  pairing, and refuse any other.
+- Show the code you computed, never one you were sent. The engine never sends
+  its code, so anything that claims to be it came from something else.
+- Tell the user: approve on the engine only if it shows the same code. If it
+  shows another code, cancel: something between the device and the engine
+  answered with its own certificate, and whatever token it hands you belongs
+  to it.
+- Poll every 2 seconds or so, over the same connection. An `approved` answer
+  with a token proves nothing by itself over `https://`: whatever answered
+  your request could answer your polls too. Ask the user, with your code on
+  screen, "Does the engine show 482 913?", with "It matches" and "It doesn't"
+  as the answers, and pin the fingerprint you saw only on "It matches". That
+  is the device's half of the check. On "It doesn't", tell the user not to
+  trust the pairing, discard the token, and ask them to deny the request on
+  the engine.
+- Ask the question every time, and do not default it to yes: a user who
+  confirms without looking at the engine's screen is the one way through.
+  Keep showing the code while you ask, and ask the user to compare it with
+  the code the engine labels as such, not with digits elsewhere on its
+  screen.
+- Never answer the question in code. A program with nobody to ask (a
+  provisioning script) gets the six digits the engine shows through a
+  channel it trusts (`estia pair list` over ssh, say), compares them with
+  `code()`, and calls `confirm_match` only when they are equal. `estia pair
+  request` does that when its stdin is not a terminal: it refuses a piped
+  `y` and reads the digits instead.
+- Keep the token the moment it arrives (it is handed out exactly once), but
+  use it only once the user confirmed. Store it in the keychain, or in a
+  file created with mode 0600.
 - Handle the outcomes: `denied`; a 404 once the request has expired, 5
   minutes after it was made; 429 when 24 requests are pending, or 4 from your
   address; 500 when the engine could not read or write its pairing file (poll
@@ -158,30 +221,222 @@ What your app should do:
   seconds.
 
 If the operator later denies the pairing, the token is revoked and your app
-gets 401. Treat 401 as "pair again".
+gets 401. Treat 401 as "pair again", and treat a certificate mismatch as
+"pair again, if the operator says the engine's certificate changed".
+
+Over plain HTTP to the engine's own machine (`http://127.0.0.1:27200`) there
+is no certificate and no code: send no commitment, and the operator approves
+with `estia pair approve <id>`. A browser page cannot see its connection's
+certificate either, so it sends no commitment; the operator then approves
+explicitly with `--no-code` after comparing the fingerprint the browser shows.
+
+**Approving from an app.** An app that holds an `admin` token (a host that
+manages its engine) lists requests with `GET /engine/pairings` and shows each
+one's `check` and `code`. For `code`, show the code large, next to the
+device's name, with a button that says what the operator checks: "The device
+shows this code — approve". On a press, send that code back as
+`{"code": "…"}`. The engine refuses an approval of such a request without its
+code, which ties the approval to the request whose code you showed and stops
+a codeless one; it cannot tell whether anyone compared, so never send the
+code without the operator's press (an app that approves every listed request
+with its listed code approves without looking). Keep showing the code after
+the approval: the user at the device compares against it before confirming
+there. For `none`, warn that the device cannot show a code (a
+browser or curl) and that a device which does show one means something in
+between removed it, and send `{"no_code": true}` only after the operator
+confirms. For `plain`, send no body. In Rust:
+`RemoteEngine::approve_pairing(id, Some(code))`,
+`approve_pairing_without_code(id)` and `approve_pairing(id, None)`.
+`decide_pairing(id, true)` sends no code, so the engine accepts it for a
+`plain` request only.
 
 Examples: [`python/pair.py`](../examples/python/pair.py) (standard library
 only), [`remote_client.rs`](../engine/examples/remote_client.rs) with
 `--pair`.
 
+## Pinning the engine's certificate
+
+On a LAN bind the engine serves HTTPS with a self-signed certificate (ECDSA
+P-256) that it made on its first LAN start. No authority vouches for it, so a
+client trusts exactly the certificate it pinned: the SHA-256 of the
+certificate's DER bytes, 64 hex digits. It checks nothing else about the
+certificate (not its names, dates or issuer) but the TLS library still checks
+that the server signs the handshake with that certificate's key, so only the
+engine can present it. Loopback (`http://127.0.0.1:27200`) stays plain HTTP.
+
+Where the pin comes from:
+
+- **Pairing**, which proves it with the code compared on both ends (above).
+  The pin is the certificate the device saw, once its user said the engine
+  shows the same code.
+- **The operator**, for an app given a token by hand: `estia tls fingerprint`
+  on the engine's machine prints it, and `estia token new` prints it under
+  the token. Let the user paste it, connect, and check that the certificate
+  presented matches before saving it.
+- **Comparing by eye**, if the user has nothing to paste: show the short form
+  (`3f2a 9c41 7b0e d512`, the first 64 bits) of what the connection
+  presented, ask them to compare it with `estia tls fingerprint`, and pin it
+  only when they confirm. That is trust on first use: shown, never silent.
+
+Never pin what a response body says (`tls.fingerprint` in `/engine/health`, a
+pairing answer, the Bonjour `fp` key): something in between can rewrite a
+body, but cannot present the engine's certificate. Those fields are for
+display and cross-checks.
+
+When the certificate presented is not the pinned one, stop before sending the
+token: either the operator ran `estia tls rotate` (then every device pairs
+again) or something on the network is answering in the engine's place.
+
+**Rust.** The pinned client is behind the `remote-tls` feature of
+`estia-engine` (it brings rustls with the ring provider); without it, every
+call that needs it returns an error that names the feature:
+
+```toml
+estia-engine = { version = "0.5", default-features = false, features = ["discovery", "remote-tls"] }
+```
+
+rustls picks its crypto provider by itself only when exactly one is compiled
+in. If your app also links rustls with aws-lc-rs (rustls's default) and lets
+it choose (`ClientConfig::builder()`), install a provider at start-up, before
+any TLS: `rustls::crypto::aws_lc_rs::default_provider().install_default()`.
+Estia's own code always passes ring explicitly and is not affected.
+
+`RemoteEngine` has three trust modes: `http://` (plain, for this machine;
+`RemoteEngine::new` refuses a token over `http://` to any other host),
+`https://` with a pin (`RemoteEngine::with_pin`, or `connect` with
+`Some(pin)`), and `https://` without one, which uses the system's trust store
+and so refuses an engine's own certificate (use it behind a TLS-terminating
+proxy with a real certificate). `RemoteEngine::cleartext` reaches an engine
+older than 0.5 over plain HTTP, token and all; use it only on a network you
+trust.
+
+```rust
+use estia_engine::{begin_pairing, probe_certificate, EngineLocation, Fingerprint, PairingOutcome, RemoteEngine, SessionError};
+
+// Pairing.
+let pending = begin_pairing("https://192.168.1.20:27200", "kitchen tablet", &["generate", "embed"])?;
+show_large(pending.code().unwrap());                 // "482 913"
+println!("{}", pending.approve_command());           // estia pair approve <id>
+let token = loop {                                   // every 2 s
+    match pending.poll()? {
+        PairingOutcome::Approved { token } => break token,
+        PairingOutcome::Pending => std::thread::sleep(std::time::Duration::from_secs(2)),
+        other => return Err(format!("{other:?}").into()),
+    }
+};
+// "Approved" alone proves nothing: the user compares this device's code
+// with the engine's screen. Pin only on a yes; on a no, drop the token.
+// Never answer in code: with nobody to ask, compare `code()` with the six
+// digits read off the engine (`PairingCode::parse`, then `==`) instead.
+if let Some(code) = pending.code() {
+    if !ask_yes_no(&format!("Does the engine show {code}?")) {
+        return Err("the codes differ: deny the request on the engine".into());
+    }
+}
+let pin = pending.confirm_match();                   // None over http://127.0.0.1
+// Store base_url, token and pin together; connect through the location, which
+// cannot drop the pin.
+let location = EngineLocation::Remote { base_url: "https://192.168.1.20:27200".into(), token: Some(token), name: None, pin };
+let engine = location.connect()?.expect("a remote location");
+
+// A pasted token and fingerprint:
+let pasted = Fingerprint::parse(&user_input)?;       // accepts colons, spaces, any case
+let seen = probe_certificate("https://192.168.1.20:27200")?;
+if !seen.matches(&pasted) { /* refuse: not the engine's certificate */ }
+// Or with nothing pasted: show seen.short(), and after the user confirms,
+let pin = seen.confirmed();
+
+match engine.health() {
+    Err(SessionError::CertificateMismatch { pinned, presented, .. }) => { /* pair again, or alarm */ }
+    other => { /* … */ }
+}
+```
+
+`PendingPairing` serialises (it holds no secret: whatever stood between the
+device and the engine could compute the code in it), so an app can keep it
+between calls, poll from wherever and confirm later. `certificate()` is the
+certificate the device saw, an `UnverifiedFingerprint` until `confirm_match`
+returns it as the pin; `code()` is the same before and after the approval.
+`PairingOutcome::Expired` means the engine dropped the request;
+`AlreadyCollected` that another poll took the token.
+`RemoteEngine::pair_request` and `pair_poll` are deprecated: they send no
+commitment, so the request has no code. Discovery tells you an engine speaks TLS (`Discovered::tls`,
+`Discovered::url()`), and what certificate it claims (`Discovered::fingerprint`,
+an `UnverifiedFingerprint`: compare it with a stored pin to find your engine
+at a new address, never pin it).
+
+**Python, standard library.** [`estia_tls.py`](../examples/python/estia_tls.py)
+is a small module to copy (Python 3.9 or newer). `PinnedContext(pin)` is an
+`ssl.SSLContext` that skips the chain and name checks and, after every
+handshake, compares the certificate's SHA-256 with the pin and closes the
+connection on a mismatch. It refuses to be made without a pin; only
+`PinnedContext.learning()`, for pairing, starts without one.
+`context_for(url)` picks for you: pinned to `ESTIA_PIN` for `https://`
+(an error when it is not set), `None` for `http://` to this machine, and an
+error for `http://` to any other machine:
+
+```python
+import estia_tls, urllib.request
+ctx = estia_tls.context_for(URL)                     # reads ESTIA_PIN for https
+urllib.request.urlopen(request, context=ctx)
+```
+
+**Python, OpenAI SDK.** `openai_http_client(URL)` is the SDK's HTTP client
+with the same context (or `None`, the SDK's default, for `http://` to this
+machine):
+
+```python
+client = OpenAI(base_url="https://192.168.1.20:27200/v1", api_key=token,
+                http_client=estia_tls.openai_http_client("https://192.168.1.20:27200"))
+```
+
+**Node.** Node cannot pin by fingerprint without code of your own; the
+simplest correct setup trusts the engine's certificate as the only extra
+authority. Copy `tls/cert.pem` from the engine's machine (check its
+fingerprint with `openssl x509 -in cert.pem -noout -fingerprint -sha256`
+against `estia tls fingerprint`), then run with
+`NODE_EXTRA_CA_CERTS=cert.pem` and reach the engine by a name the certificate
+carries: `https://<hostname>.local:27200` (or a LAN address it had when the
+certificate was made: on Linux, the certificate carries them only when
+`ifconfig` or `ip` could list them). The certificate has no basic
+constraints, so OpenSSL accepts it as its own anchor. Unlike a pin, this
+checks dates: the certificate is valid for 820 days (Apple's limit is 825),
+after which Node refuses it until the operator runs `estia tls rotate`.
+
+**curl.** `-k --pinnedpubkey sha256//<base64>`, with the value from the `curl`
+line of `estia tls fingerprint`: `-k` skips the chain and name checks, and the
+pin still refuses any other key (curl checks it with `-k` too).
+
+```bash
+curl -k --pinnedpubkey 'sha256//KcRfPaV4WCo5XHv9YWvSNn/ZDixnWYjJSznFuOON8mk=' https://192.168.1.20:27200/engine/health
+```
+
+**A browser** cannot pin. The first visit shows a warning; open the
+certificate details, compare its SHA-256 fingerprint with `estia tls
+fingerprint`, and accept it only if they match. Safari, like every Apple TLS
+client, refuses a server certificate valid for more than 825 days even after
+it is accepted, so the engine's are valid for 820.
+
 ## Finding an engine on the network
 
 A LAN engine (`estia serve --lan` or `estia service install`) advertises the
 Bonjour service `_estia._tcp`. The instance name is the machine's short
-hostname, and the TXT record has three keys:
+hostname, and the TXT record has these keys:
 
 | Key | Meaning |
 |---|---|
 | `api_version` | Version of the `/engine/*` contract (`1`) |
-| `engine_version` | The server's version, as `version` in `/engine/health` (`0.4.0`) |
+| `engine_version` | The server's version, as `version` in `/engine/health` (`0.5.0`) |
 | `protocol_version` | Runner protocol version (`2`) |
+| `tls` | `1`: the engine serves HTTPS (use `https://`). Absent on an engine older than 0.5 |
+| `fp` | The SHA-256 fingerprint of its certificate, 64 hex digits. A claim, not a proof: compare it with a pin you hold; never pin it |
 
 ```text
 $ dns-sd -B _estia._tcp
   Add  ...  local.  _estia._tcp.  studio
 $ dns-sd -L studio _estia._tcp local.
   studio._estia._tcp.local. can be reached at studio.local.:27200
-  api_version=1 engine_version=0.4.0 protocol_version=2
+  api_version=1 engine_version=0.5.0 protocol_version=2 tls=1 fp=3f2a9c41…
 ```
 
 In an app, use the platform's browser for service type `_estia._tcp`: the
@@ -498,7 +753,7 @@ Errors use OpenAI's shape:
 
 | Status | Meaning | What your app does |
 |---|---|---|
-| 400 | Bad request: empty messages, over 256 inputs, bad pairing name | Fix the request |
+| 400 | Bad request: empty messages, over 256 inputs, bad pairing name. Type `https_required`: plain HTTP from another device to a LAN engine | Fix the request; for `https_required`, use `https://` and pair again |
 | 401 | Missing, unknown or revoked token | Ask for a new token or pair again |
 | 403 | Token lacks the scope, or the Host/Origin check refused the request | Mint a token with the scope; see below for Host and Origin |
 | 404 | Unknown role or model (``unknown model or role `…` ``), model not installed, expired pairing | Use a role; ask the operator to run the `estia pull` the message names |
@@ -596,10 +851,12 @@ estia status                     # prints the URL other devices should use
 ```
 
 - Authentication cannot be turned off on a LAN bind. Devices pair for a token.
-- Traffic is plain HTTP, tokens included. Serve the LAN only on a network you
-  trust. Otherwise keep the engine on loopback and reach it through a tunnel,
-  for example `ssh -N -L 27200:127.0.0.1:27200 you@studio.local`, then use
-  `http://127.0.0.1:27200` on the client.
+- Other devices use HTTPS, with the engine's own certificate, which they pin
+  (above). Plain HTTP is refused from them with `https_required`; programs on
+  the engine's machine keep `http://127.0.0.1:27200`.
+- An SSH tunnel still works and is an alternative to pinning:
+  `ssh -N -L 27200:127.0.0.1:27200 you@studio.local`, then use
+  `http://127.0.0.1:27200` on the client (the tunnel arrives from loopback).
 - Devices reach the engine by IP address or `<hostname>.local`; any other name
   needs `--allow-host`.
 - Only one engine runs per data directory, and one model call runs at a time
@@ -615,13 +872,16 @@ and returns the engine's own facts. It is blocking; call it from a thread or
 `spawn_blocking`.
 
 ```rust
-let engine = Arc::new(RemoteEngine::new("http://127.0.0.1:27200", Some(token))?);
+// The engine on this machine: plain HTTP. On the LAN: https:// and the pin
+// from pairing (see Pinning the engine's certificate).
+let engine = Arc::new(RemoteEngine::connect("https://192.168.1.20:27200", Some(token), Some(pin))?);
 let (text, meta) = engine.chat_stream("fast", &messages, None, Some("conv-1"), Some(200), None,
                                       Priority::Interactive, None, |piece| print!("{piece}"))?;
 ```
 
 HTTP failures come back as `SessionError::Runner` with text such as
-`remote engine 401 Unauthorized: unknown token`.
+`remote engine 401 Unauthorized: unknown token`. A certificate other than the
+pinned one is `SessionError::CertificateMismatch`, before anything is sent.
 
 For embeddings, ask for the role `embed`, as in any other client. The first
 response reports the fingerprint, which names the model and the backend, so
@@ -686,4 +946,6 @@ what order.
   at your stop sequence yourself, since generation runs on to the end of the
   model's turn or to `max_tokens`. Role sampling settings (`temperature`,
   `max_tokens`) are stored but not applied.
-- No TLS.
+- Browsers show a certificate warning for a LAN engine, which the user accepts
+  after comparing the fingerprint; Node needs the certificate as an extra
+  authority (`NODE_EXTRA_CA_CERTS`).

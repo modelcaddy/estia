@@ -16,8 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 # python-mlx and llama-runtime: `estia runtime install` downloads the Python
-# MLX runtime or upstream llama.cpp's llama-server.
-estia-engine = { path = "../engine", version = "0.4.0", features = ["python-mlx", "llama-runtime"] }
+# MLX runtime or upstream llama.cpp's llama-server. remote-tls: `--engine
+# https://…` with `--pin`, and `estia pair request` over https.
+estia-engine = { path = "../engine", version = "0.4.0", features = ["python-mlx", "llama-runtime", "remote-tls"] }
 # The llama.cpp adapter, run in-process as `estia runner llama`.
 estia-llama = { path = "../llama", version = "0.4.0" }
 estia-server = { path = "../server", version = "0.4.0" }
@@ -26,7 +27,6 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-reqwest = { version = "0.12", features = ["json", "blocking"] }
 # The subscriber for `serve` and the other commands: text or JSON lines on
 # stderr, filtered by --log-level / ESTIA_LOG / RUST_LOG. tracing-log forwards
 # records from crates that use `log` (mdns-sd).

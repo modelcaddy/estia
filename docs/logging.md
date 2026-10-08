@@ -132,7 +132,7 @@ runner was then version 2.1.0):
 {"timestamp":"2026-09-26T07:29:52.035818Z","level":"INFO","message":"runner handshake","model":"gemma4-e2b-it-4bit-mlx","pid":54146,"runner":"mlx-python","runner_version":"2.1.0","protocol":2,"capabilities":"generate,stream,embed,cancel,load,chat,tools,prompt_cache,count_tokens","target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:54.259940Z","level":"INFO","message":"model loaded","model":"gemma4-e2b-it-4bit-mlx","kind":"generation","load_ms":2223,"target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:55.081943Z","level":"INFO","request_id":"json-stream-1","method":"POST","path":"/v1/chat/completions","status":200,"duration_ms":540,"peer":"127.0.0.1:52658","caller":"builder","asked":"fast","model":"gemma4-e2b-it-4bit-mlx","stream":true,"max_tokens":60,"prompt_tokens":16,"cached_tokens":0,"completion_tokens":36,"time_to_first_token_ms":144,"tokens_per_s":66.7,"finish":"stop","target":"estia_server::access"}
-{"timestamp":"2026-09-26T07:29:55.542889Z","level":"INFO","message":"pairing requested","id":"d4650fbed2ae965a","name":"laptop","scopes":"generate,embed","from":"127.0.0.1","target":"estia_server::pairing","span":{"request_id":"a43995f8678d7f17","name":"request"}}
+{"timestamp":"2026-09-26T07:29:55.542889Z","level":"INFO","message":"pairing requested","id":"vddmwdcnvntravrh","name":"laptop","scopes":"generate,embed","from":"127.0.0.1","target":"estia_server::pairing","span":{"request_id":"a43995f8678d7f17","name":"request"}}
 {"timestamp":"2026-09-26T07:30:07.873609Z","level":"INFO","request_id":"60821612923d0aa3","method":"POST","path":"/v1/embeddings","status":200,"duration_ms":2518,"peer":"127.0.0.1:52682","caller":"embedonly2","asked":"embed","model":"embeddinggemma-300m-4bit","load_ms":2461,"inputs":2,"dims":768,"target":"estia_server::access"}
 {"timestamp":"2026-09-26T07:30:07.883858Z","level":"INFO","request_id":"a7e58cf390b5f3d8","method":"POST","path":"/v1/chat/completions","status":403,"duration_ms":0,"peer":"127.0.0.1:52686","caller":"embedonly2","error_type":"permission_error","error":"token lacks the `generate` scope","target":"estia_server::access"}
 {"timestamp":"2026-09-26T07:31:49.662579Z","level":"INFO","message":"released idle model","model":"gemma4-e2b-it-4bit-mlx","idle_s":60,"target":"estia_server"}
@@ -217,7 +217,7 @@ does not apply to the request is left out.
 | `peer` | Client address and port |
 | `caller` | The name of the token used (never the token) |
 | `error_type` | For error responses: the `type` of the error body |
-| `error` | For 401 and 403: the reason: `missing bearer token`, ``Authorization is not `Bearer <token>` ``, `unknown token`, `revoked token` (removed from `tokens.json` while the server ran), ``token lacks the `generate` scope``, ``host `x` not allowed (DNS-rebinding guard)``, ``cross-origin POST from Origin `…` ``. For other errors: the error message, except 422, whose message can quote model output. For a stream that failed: the runner's error. |
+| `error` | For 401 and 403: the reason: `missing bearer token`, ``Authorization is not `Bearer <token>` ``, `unknown token`, `revoked token` (removed from `tokens.json` while the server ran), ``token lacks the `generate` scope``, ``host `x` not allowed (DNS-rebinding guard)``, ``cross-origin POST from Origin `…` ``. For a request refused because it came over plain HTTP from another device: `plain HTTP from another device` (with `error_type=https_required`, or on its own for the redirect of `/client`). For other errors: the error message, except 422, whose message can quote model output. For a stream that failed: the runner's error. |
 | `asked` | The `model` the client sent: a role, family or model id |
 | `model` | The model that served it |
 | `stream` | Whether the generation streamed |
@@ -245,7 +245,11 @@ does not apply to the request is left out.
 
 | Event (message) | Level | Fields |
 |---|---|---|
-| `estia serving` | info | `version`, `commit`, `api_version`, `protocol_version`, `url`, `bind`, `auth`, `lan`, `advertise`, `idle_unload_s`, `tier`, `memory_budget`, `max_generation_models`, `mlx_wired_limit`, `allowed_hosts`, `data_dir`, `backend`, `runner`, `pid` |
+| `estia serving` | info | `version`, `commit`, `api_version`, `protocol_version`, `url` (`https://…` on a LAN bind), `bind`, `tls`, `tls_fingerprint` (`-` without TLS), `auth`, `lan`, `advertise`, `idle_unload_s`, `tier`, `memory_budget`, `max_generation_models`, `mlx_wired_limit`, `allowed_hosts`, `data_dir`, `backend`, `runner`, `pid` |
+| `created a TLS certificate for this engine; devices pin it when they pair` | info | `fingerprint`, `short`, `file`. Once, on the first LAN start (or after the files were removed) |
+| `half of the TLS key pair is missing; making a new pair: every paired device must pair again` | warn | `file` (the half that was there) |
+| `finished a TLS certificate change that was cut short` | warn | `dir`. A rotation interrupted by a crash or a full disk, finished or undone before the certificate is read |
+| `a valid token arrived over plain HTTP from another device, so it crossed the network in clear: …` | warn | `token_name`, `peer`; at most once every 10 minutes per token |
 | `runner started` | info | `model`, `pid`, `program` |
 | `runner handshake` | info | `model`, `pid`, `runner`, `runner_version`, `protocol`, `capabilities` |
 | `model loaded` | info | `model`, `kind`, `load_ms` (the runner's own measure) |
@@ -271,8 +275,9 @@ does not apply to the request is left out.
 | `model removed` | info | `model`, `removed` |
 | `runtime install started`, `runtime install phase`, `runtime install finished`, `runtime install failed` | info, warn on failure | `job_id`, `phase`, `step`, `python`, `mlx_lm`, `secs`, `error` |
 | `role table replaced` | info | `roles` |
-| `pairing requested` | info | `id`, `name`, `scopes`, `from` |
-| `pairing approved` | info | `id`, `name`, `scopes`, `token_name` |
+| `pairing requested` | info | `id`, `name`, `scopes`, `from`, `check` (`waiting` for a request with a commitment, `none`, `plain`) |
+| `pairing code ready; the operator approves once the device shows the same code as this engine` | info | `id`, `name`. The device revealed its nonce; the code is not logged |
+| `pairing approved` | info | `id`, `name`, `scopes`, `token_name`, `check` |
 | `pairing denied` | info | `id`, `name`, `revoked`, `token_name` |
 | `pairing token collected` | info | `id`, `name` |
 | `pairing request expired undecided` | info | `id`, `name` |
@@ -284,6 +289,8 @@ does not apply to the request is left out.
 | `Bonjour advertisement failed; …`, `Bonjour re-registration failed` | warn | `error`, `reason` |
 | `registering via dns-sd failed; falling back to our own multicast sockets` | warn | `error` (macOS) |
 | `connection refused: this client already holds its share of connections` | warn | `peer`, `per_client`, `refused`; at most one line every 10 seconds |
+| `a client refused this engine's certificate (a device paired before `estia tls rotate` must pair again)` | info | `peer`, `alert` (the TLS alert it sent: `UnknownCA` from a browser that has not accepted the certificate, others from a device that pinned another one), `refused`; at most one line every 10 seconds |
+| `TLS handshake failed`, `TLS handshake timed out`, `connection closed or silent before its first byte` | debug | `peer`, `error` |
 | `accept failed` | warn | `error` |
 | `shutdown requested` | info | `signal` |
 | `shutting down: …`, `stopped the Bonjour advertisement` | info | |

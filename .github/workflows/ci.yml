@@ -54,6 +54,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The workspace builds estia-engine with every feature its members turn
+      # on. A host such as ModelCaddy builds it with only `discovery`, which
+      # leaves out the pinned TLS client (`remote-tls`) and its cfg'd code.
+      - name: Clippy (estia-engine without remote-tls)
+        run: cargo clippy -p estia-engine --no-default-features --features discovery --all-targets --locked -- -D warnings
       - name: Build
         run: cargo build --workspace --locked
       - name: Test

@@ -2,7 +2,7 @@
 # Check that a running Estia engine answers the way clients expect.
 #
 #   scripts/smoke-test.sh [--url URL] [--token TOKEN | --token-file FILE]
-#                         [--model ROLE] [--embed ROLE] [--quick]
+#                         [--pinnedpubkey PIN] [--model ROLE] [--embed ROLE] [--quick]
 #
 # Each check prints PASS, FAIL or SKIP, how long it took, and what it saw.
 # The exit code is 0 when nothing failed, 1 when a check failed, and 2 when
@@ -18,7 +18,13 @@
 #   estia token new smoke --scopes generate,embed,models:read
 #
 # Environment: ESTIA_URL (default http://127.0.0.1:27200), ESTIA_TOKEN,
-# ESTIA_MODEL (default fast). NO_COLOR turns colours off.
+# ESTIA_PINNEDPUBKEY, ESTIA_MODEL (default fast). NO_COLOR turns colours off.
+#
+# An engine on another machine serves https with its own certificate: pass
+# --url https://<engine>:27200 and --pinnedpubkey with the `sha256//…` value
+# `estia tls fingerprint` prints on the engine's machine. curl then runs with
+# `-k --pinnedpubkey`: -k skips the chain and name checks a self-signed
+# certificate fails, and the pin still refuses any other key.
 
 set -u
 
@@ -32,6 +38,8 @@ Options:
   --url URL          The engine (default: $ESTIA_URL, else http://127.0.0.1:27200)
   --token TOKEN      A bearer token (default: $ESTIA_TOKEN)
   --token-file FILE  Read the token from the first line of FILE instead
+  --pinnedpubkey PIN For an https:// engine: its key pin, sha256//... (default:
+                     $ESTIA_PINNEDPUBKEY; `estia tls fingerprint` prints it)
   --model ROLE       The role or model to chat with (default: $ESTIA_MODEL, else fast)
   --embed ROLE       The role or model to embed with (default: embed)
   --quick            Only three checks: health, one chat, one embedding
@@ -53,6 +61,7 @@ die() {
 URL="${ESTIA_URL:-http://127.0.0.1:27200}"
 TOKEN="${ESTIA_TOKEN:-}"
 TOKEN_SOURCE="ESTIA_TOKEN"
+PINNEDPUBKEY="${ESTIA_PINNEDPUBKEY:-}"
 MODEL="${ESTIA_MODEL:-fast}"
 EMBED="embed"
 QUICK=0
@@ -74,6 +83,8 @@ while [ $# -gt 0 ]; do
       IFS= read -r TOKEN <"$f" || [ -n "$TOKEN" ] || die "the token file $f is empty"
       TOKEN_SOURCE="$f"
       ;;
+    --pinnedpubkey) [ $# -ge 2 ] || die "--pinnedpubkey needs a value"; PINNEDPUBKEY="$2"; shift 2 ;;
+    --pinnedpubkey=*) PINNEDPUBKEY="${1#*=}"; shift ;;
     --model) [ $# -ge 2 ] || die "--model needs a value"; MODEL="$2"; shift 2 ;;
     --model=*) MODEL="${1#*=}"; shift ;;
     --embed) [ $# -ge 2 ] || die "--embed needs a value"; EMBED="$2"; shift 2 ;;
@@ -87,9 +98,18 @@ done
 # Strip whitespace a copied token often carries.
 TOKEN="${TOKEN//[[:space:]]/}"
 URL="${URL%/}"
+TLS_ARGS=()
 case "$URL" in
-  http://* | https://*) ;;
-  *) die "--url must start with http:// (got: $URL)" ;;
+  http://*) ;;
+  https://*)
+    [ -n "$PINNEDPUBKEY" ] || die "an https:// engine needs its key pin: --pinnedpubkey sha256//... (estia tls fingerprint prints it on the engine's machine)"
+    case "$PINNEDPUBKEY" in
+      sha256//*) ;;
+      *) die "--pinnedpubkey takes curl's form, sha256//<base64> (got: $PINNEDPUBKEY)" ;;
+    esac
+    TLS_ARGS=(-k --pinnedpubkey "$PINNEDPUBKEY")
+    ;;
+  *) die "--url must start with http:// or https:// (got: $URL)" ;;
 esac
 for v in "$MODEL" "$EMBED"; do
   case "$v" in
@@ -523,7 +543,7 @@ req() {
     auth | rid) ;;
     *) set -- -H "X-Request-Id: $RUN_ID-$name" "$@" ;;
   esac
-  out="$(curl -sS -X "$method" "$URL$path" --connect-timeout 5 --max-time "$max" \
+  out="$(curl -sS ${TLS_ARGS[@]+"${TLS_ARGS[@]}"} -X "$method" "$URL$path" --connect-timeout 5 --max-time "$max" \
     -o "$TMP/$name.body" -D "$TMP/$name.head" -w '%{http_code} %{time_total}' "$@" 2>"$TMP/$name.err")" || true
   CODE="${out%% *}"
   TIME="${out##* }"

@@ -9,6 +9,15 @@
 # Reads ESTIA_URL (default http://127.0.0.1:27200), ESTIA_TOKEN and
 # ESTIA_MODEL (default fast). Needs only curl. Long JSON is shortened with
 # "..." so each step fits on screen.
+#
+# An engine on another machine serves https with its own certificate. Pin its
+# key with ESTIA_PINNEDPUBKEY, the `curl` line `estia tls fingerprint` prints
+# on the engine's machine:
+#
+#   ESTIA_URL=https://192.168.1.20:27200 ESTIA_PINNEDPUBKEY='sha256//…' ./quickstart.sh
+#
+# curl then runs with `-k --pinnedpubkey`: -k skips the chain and name checks
+# a self-signed certificate fails, and the pin still refuses any other key.
 
 set -u
 
@@ -19,6 +28,18 @@ MODEL="${ESTIA_MODEL:-fast}"
 CONV="quickstart-$$" # one conversation id: the prompt-cache key
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
+
+TLS=()
+case "$URL" in
+  https://*)
+    if [ -z "${ESTIA_PINNEDPUBKEY:-}" ]; then
+      echo "ESTIA_URL is https: set ESTIA_PINNEDPUBKEY to the engine's key pin (sha256//...)," >&2
+      echo "which 'estia tls fingerprint' prints on the engine's machine." >&2
+      exit 2
+    fi
+    TLS=(-k --pinnedpubkey "$ESTIA_PINNEDPUBKEY")
+    ;;
+esac
 
 if [ -z "$TOKEN" ]; then
   echo "ESTIA_TOKEN is not set. On the engine's machine run" >&2
@@ -33,10 +54,10 @@ say() { printf '   %s\n' "$*"; }
 # call METHOD PATH [JSON]: the body goes to $OUT, the HTTP status to $STATUS.
 call() {
   if [ $# -ge 3 ]; then
-    STATUS=$(curl -sS -o "$OUT" -w '%{http_code}' -X "$1" "$URL$2" \
+    STATUS=$(curl -sS ${TLS[@]+"${TLS[@]}"} -o "$OUT" -w '%{http_code}' -X "$1" "$URL$2" \
       -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$3") || STATUS=000
   else
-    STATUS=$(curl -sS -o "$OUT" -w '%{http_code}' -X "$1" "$URL$2" \
+    STATUS=$(curl -sS ${TLS[@]+"${TLS[@]}"} -o "$OUT" -w '%{http_code}' -X "$1" "$URL$2" \
       -H "Authorization: Bearer $TOKEN") || STATUS=000
   fi
 }
@@ -105,7 +126,7 @@ show 900
 
 step "5. Streaming: \"stream\": true returns server-sent events, one 'data:' line per piece, then 'data: [DONE]'."
 say "The last chunk before [DONE] carries usage and x_estia. Closing the connection cancels the generation."
-curl -sS -N "$URL/v1/chat/completions" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+curl -sS ${TLS[@]+"${TLS[@]}"} -N "$URL/v1/chat/completions" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d "{\"model\": \"$MODEL\", \"stream\": true, \"max_tokens\": 40,
        \"messages\": [{\"role\": \"user\", \"content\": \"Count from one to five in words.\"}]}" |
   grep '^data:'
@@ -141,7 +162,7 @@ show 900
 
 step "10. Errors share one shape: {\"error\": {\"message\", \"type\", \"code\", \"request_id\"}}."
 say "No token (401):"
-STATUS=$(curl -sS -o "$OUT" -w '%{http_code}' "$URL/v1/models")
+STATUS=$(curl -sS ${TLS[@]+"${TLS[@]}"} -o "$OUT" -w '%{http_code}' "$URL/v1/models")
 printf '   %s ' "$STATUS"
 show
 say "Unknown model (404):"
@@ -169,7 +190,7 @@ step "11. Request ids: every response has an X-Request-Id header, and error bodi
 say "Send your own id (1 to 64 letters, digits, '.', '_', ':' or '-') and the engine keeps it."
 say "Log it with every error you show or report, so the operator can find the request."
 RID="quickstart-$$-11"
-curl -sS -D - -o "$OUT" "$URL/v1/models" -H "X-Request-Id: $RID" -H 'Authorization: Bearer estia_not_a_real_token' |
+curl -sS ${TLS[@]+"${TLS[@]}"} -D - -o "$OUT" "$URL/v1/models" -H "X-Request-Id: $RID" -H 'Authorization: Bearer estia_not_a_real_token' |
   tr -d '\r' | grep -i '^x-request-id' | sed 's/^/   /'
 show
 say "The engine logged this 401 with request_id=$RID. docs/logging.md says where the log is."

@@ -19,8 +19,48 @@
 //! Each step is logged (`info`): requested, approved, denied, token
 //! collected, expired. An approved token that expires uncollected is a `warn`,
 //! because the token stays valid until revoked.
+//!
+//! **The pairing code.** A request that arrives over HTTPS may carry a
+//! commitment: the hash of a nonce the device keeps to itself for now. The
+//! engine answers with its own nonce; the device then reveals its nonce
+//! ([`PairingStore::reveal`]), and the engine computes a 6-digit code
+//! ([`estia_engine::tls::pairing_code`]) from its own certificate's
+//! fingerprint and the two nonces. The device computes the same from the
+//! certificate it saw. Each shows its own, and a person compares them, the
+//! way Bluetooth's numeric comparison works: the operator approves only when
+//! the device shows the code this engine shows (`estia pair list`, `estia pair
+//! approve`), and the user at the device confirms there that this engine
+//! shows the device's code before the device pins the certificate. A device
+//! that met an interceptor's certificate shows another code. The engine's
+//! code is never sent to the device: something in between would relay it.
+//!
+//! Approving a request with a code takes that code
+//! ([`PairingStore::approve_with_code`]): the one the engine showed the
+//! operator, sent back on their yes, or the one a script read off the device.
+//! A different code, or none, is refused. That ties an approval to the
+//! request whose code was shown and stops a blind or codeless one (an old
+//! client, a request whose commitment was stripped); it cannot show that
+//! anyone compared: an admin app or a script that sends back the code it
+//! listed, without asking anyone, approves without looking.
+//!
+//! A request over HTTPS without a commitment (a browser, curl, or a device
+//! request something in between stripped) has no code at all, and is
+//! approved only when the approver says so explicitly (`allow_uncoded`: the
+//! CLI's `--no-code`, the HTTP route's `"no_code": true`). Each request
+//! records which check applies ([`PairingCheck`]).
+//!
+//! Since people compare codes by eye, a device name cannot hold a run of
+//! digits long enough to pass for one (see [`validate_name`]): a request named
+//! `phone 482 913` would otherwise put the device's code on the engine's
+//! screen, next to a different one. For the same reason a pairing id is made
+//! of letters that cannot pass for digits
+//! ([`estia_engine::tls::random_pairing_id`]): the device shows it next to its
+//! code. Neither rule makes the code the only thing on a screen that looks
+//! like one (letters that resemble digits, an IPv6 source address of the
+//! sender's choosing): people compare the code where it is labelled as one.
 
 use crate::tokens::{lock_exclusive, write_private, FileLock, TokenStore, ALL_SCOPES};
+use estia_engine::tls::{self as etls, Fingerprint};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -33,6 +73,11 @@ pub const MAX_PENDING: usize = 24;
 pub const MAX_PENDING_PER_SOURCE: usize = 4;
 /// Longest device name, in characters (after trimming).
 pub const MAX_NAME_CHARS: usize = 64;
+/// Most digits a device name may hold in a row, counting digits separated by
+/// anything but a letter with case as one row ([`ends_digit_run`]): a
+/// pairing code has six, and a name is shown beside the code the operator
+/// compares.
+pub const MAX_NAME_DIGIT_RUN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +109,72 @@ pub struct Pairing {
     /// Denied after it was approved: the minted token was revoked.
     #[serde(default)]
     pub revoked: bool,
+    /// The request arrived over HTTPS.
+    #[serde(default)]
+    pub tls: bool,
+    /// The device's commitment to its nonce (hex), sent with an HTTPS request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commitment: Option<String>,
+    /// The engine's nonce for this request (hex), answered to a commitment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_nonce: Option<String>,
+    /// The pairing code (six digits) the engine computed from its certificate
+    /// once the device revealed its nonce: shown to the operator, who checks
+    /// the device shows the same, and never sent to the device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Which check an approval of this request makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCheck {
+    /// The device committed and revealed: approving needs the code, once the
+    /// device shows the same one as the engine.
+    Code,
+    /// The device committed but has not revealed its nonce yet.
+    Waiting,
+    /// Over HTTPS without a commitment: a browser or curl, which cannot show a
+    /// code, or a request whose commitment something in between removed.
+    /// Approve only explicitly, after comparing the certificate the device
+    /// shows with `estia tls fingerprint`, and never when the device shows a
+    /// code.
+    #[serde(rename = "none")]
+    Uncoded,
+    /// Plain HTTP from this machine: no certificate involved.
+    Plain,
+}
+
+impl PairingCheck {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PairingCheck::Code => "code",
+            PairingCheck::Waiting => "waiting",
+            PairingCheck::Uncoded => "none",
+            PairingCheck::Plain => "plain",
+        }
+    }
+}
+
+impl Pairing {
+    pub fn check(&self) -> PairingCheck {
+        match (self.tls, &self.commitment, &self.code) {
+            (false, _, _) => PairingCheck::Plain,
+            (true, None, _) => PairingCheck::Uncoded,
+            (true, Some(_), None) => PairingCheck::Waiting,
+            (true, Some(_), Some(_)) => PairingCheck::Code,
+        }
+    }
+
+    /// The code as people read it, `482 913`.
+    pub fn code_shown(&self) -> Option<String> {
+        self.pairing_code().map(|c| c.to_string())
+    }
+
+    /// The engine's code for this request, once the device has revealed.
+    pub fn pairing_code(&self) -> Option<etls::PairingCode> {
+        self.code.as_deref().and_then(etls::PairingCode::parse)
+    }
 }
 
 /// Why a pairing operation failed. Handlers map these to HTTP statuses.
@@ -106,6 +217,17 @@ const DENY_HINT: &str = "; if it was approved, its token (pair:<name>:<id>) may 
 /// two in a row), and `. _ - ' ’ ( )`; at most [`MAX_NAME_CHARS`] characters.
 /// Everything else is refused, not stripped, so two names cannot silently
 /// collapse into one.
+///
+/// People compare pairing codes by eye, and the name is printed on the same
+/// screens as the code, so a name holds at most [`MAX_NAME_DIGIT_RUN`] digits
+/// in a row (digits in any script). Only a letter with case (Latin, Greek,
+/// Cyrillic, Armenian, …) breaks a row ([`ends_digit_run`]); spaces,
+/// punctuation, letters of scripts without case, modifier letters and
+/// combining marks do not, since some of those are blank or pass for a
+/// separator. Otherwise something in between could ask in the name of
+/// `phone 482 913`, or `phone 482ㅡ913`, putting the code the device shows
+/// next to the engine's different one. That stops the direct trick, not
+/// every one: letters that look like digits (`4B2 9I3`) are still letters.
 pub fn validate_name(raw: &str) -> Result<String, PairingError> {
     const ALLOWED: &str = "letters, digits, single spaces and . _ - ' ( )";
     let name = raw.trim();
@@ -117,6 +239,7 @@ pub fn validate_name(raw: &str) -> Result<String, PairingError> {
         return Err(PairingError::Invalid(format!("name is {count} characters long; at most {MAX_NAME_CHARS}")));
     }
     let mut prev_space = false;
+    let mut digits_in_a_row = 0;
     for c in name.chars() {
         if c.is_control() || is_format_char(c) {
             return Err(PairingError::Invalid(format!(
@@ -132,21 +255,99 @@ pub fn validate_name(raw: &str) -> Result<String, PairingError> {
             return Err(PairingError::Invalid(format!("name contains consecutive spaces; use {ALLOWED}")));
         }
         prev_space = c == ' ';
+        // Numeric first: some numerals (Ⅻ) count as letters too.
+        if c.is_numeric() {
+            digits_in_a_row += 1;
+            if digits_in_a_row > MAX_NAME_DIGIT_RUN {
+                return Err(PairingError::Invalid(format!(
+                    "name holds more than {MAX_NAME_DIGIT_RUN} digits in a row, which could pass for a pairing code; \
+                     use at most {MAX_NAME_DIGIT_RUN} (only a letter such as a-z, α-ω or а-я ends a row: spaces, \
+                     punctuation and letters of scripts without upper and lower case do not)"
+                )));
+            }
+        } else if ends_digit_run(c) {
+            digits_in_a_row = 0;
+        }
     }
     Ok(name.to_string())
 }
 
-/// Invisible characters that change how text around them is shown: bidi
-/// embeddings, overrides and isolates, zero-width characters, line and
-/// paragraph separators, the byte-order mark. (The allowlist in
-/// [`validate_name`] refuses them anyway; this names them in the error.)
-fn is_format_char(c: char) -> bool {
+/// Does `c` end a run of digits in a device name? Only a letter with case
+/// does, and not every one of those: combining marks (U+0345 counts as a
+/// lowercase letter), the spacing modifier letters (`ʰ`, `ˑ`) and the two
+/// saltillos (`ꞌ`, which looks like an apostrophe) do not. Letters of scripts
+/// without case do not either: among them are blank ones and ones that pass
+/// for a dash or a dot (U+3164 HANGUL FILLER, `ㅡ`, `一`, U+A78F `ꞏ`, U+0640
+/// ARABIC TATWEEL), and no list of those would be complete. The price: in a
+/// name such as `東京 2024 店 15` the two numbers count as one row.
+pub fn ends_digit_run(c: char) -> bool {
+    (c.is_uppercase() || c.is_lowercase())
+        && !matches!(c,
+            '\u{02B0}'..='\u{02FF}'   // spacing modifier letters
+            | '\u{0300}'..='\u{036F}' // combining diacritical marks
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+            | '\u{A78B}' | '\u{A78C}') // saltillo
+}
+
+/// Characters that are invisible or change how the text around them is
+/// shown: bidi embeddings, overrides, isolates and marks, zero-width
+/// characters, line and paragraph separators, the byte-order mark, tag
+/// characters, and every other default-ignorable code point (Unicode's
+/// list), among them the Hangul fillers, which count as letters but print
+/// as a blank. [`validate_name`] refuses them, and the CLI escapes them
+/// wherever it prints text that came from outside.
+pub fn is_format_char(c: char) -> bool {
     matches!(c,
-        '\u{00AD}' | '\u{061C}' | '\u{180E}'
+        '\u{00AD}' | '\u{034F}' | '\u{061C}'
+        | '\u{115F}' | '\u{1160}'
+        | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}'
         | '\u{200B}'..='\u{200F}'
         | '\u{2028}'..='\u{202E}'
         | '\u{2060}'..='\u{206F}'
-        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+        | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FEFF}'
+        | '\u{FFA0}'
+        | '\u{FFF0}'..='\u{FFFB}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// The approval rules of [`PairingStore::approve_with_code`] for one request.
+fn check_code(p: &Pairing, given: Option<etls::PairingCode>, allow_uncoded: bool) -> Result<(), PairingError> {
+    let stored = p.pairing_code();
+    match (p.check(), given) {
+        (PairingCheck::Code, Some(g)) if Some(g) == stored => Ok(()),
+        (PairingCheck::Code, Some(_)) => Err(PairingError::Invalid(
+            "the code does not match this engine's: if the device shows another code than this engine, something between \
+             them presented its own certificate; deny the request"
+                .into(),
+        )),
+        (PairingCheck::Code, None) => Err(PairingError::Invalid(
+            "this request has a code: approve it only once the device shows the same code as this engine, and give that code \
+             (`estia pair approve <id>` shows it and asks; a script passes --code <code>; over HTTP, {\"code\": \"…\"})"
+                .into(),
+        )),
+        (PairingCheck::Waiting, _) => {
+            Err(PairingError::Invalid("the device has not finished the certificate check; try again in a moment".into()))
+        }
+        (PairingCheck::Uncoded | PairingCheck::Plain, Some(_)) => Err(PairingError::Invalid(
+            "this request has no code, but you gave one: the device you are looking at made a different request; deny this one".into(),
+        )),
+        (PairingCheck::Uncoded, None) if !allow_uncoded => Err(PairingError::Invalid(
+            "this request came over https with no code: a browser or curl cannot show one. If the device you are pairing \
+             shows a 6-digit code, deny this request: something between it and this engine removed the code. Otherwise \
+             compare the certificate fingerprint the device shows with `estia tls fingerprint`, then approve explicitly \
+             without a code (estia pair approve <id> --no-code; over HTTP, {\"no_code\": true})"
+                .into(),
+        )),
+        (PairingCheck::Uncoded | PairingCheck::Plain, None) => Ok(()),
+    }
 }
 
 /// Every scope must be one of [`ALL_SCOPES`]; repeats are dropped.
@@ -268,14 +469,50 @@ impl PairingStore {
         self.load().unwrap_or_default()
     }
 
-    /// A client asks to be paired. `from` is its address; it counts against
-    /// [`MAX_PENDING_PER_SOURCE`].
+    /// A client asks to be paired over plain HTTP (from this machine). `from`
+    /// is its address; it counts against [`MAX_PENDING_PER_SOURCE`].
     pub fn request(&self, name: &str, scopes: &[String], from: Option<String>) -> Result<Pairing, PairingError> {
+        self.request_inner(name, scopes, from, false, None)
+    }
+
+    /// A client asks to be paired over HTTPS. With a `commitment` (64 hex
+    /// digits, [`etls::pairing_commitment`]) the request gets an engine nonce
+    /// and, once revealed, a code; without one it is approved without a code
+    /// ([`PairingCheck::Uncoded`]).
+    pub fn request_tls(
+        &self,
+        name: &str,
+        scopes: &[String],
+        from: Option<String>,
+        commitment: Option<&str>,
+    ) -> Result<Pairing, PairingError> {
+        self.request_inner(name, scopes, from, true, commitment)
+    }
+
+    fn request_inner(
+        &self,
+        name: &str,
+        scopes: &[String],
+        from: Option<String>,
+        tls: bool,
+        commitment: Option<&str>,
+    ) -> Result<Pairing, PairingError> {
         let name = validate_name(name)?;
         let scopes = validate_scopes(scopes)?;
-        let mut bytes = [0u8; 8];
-        getrandom::getrandom(&mut bytes).map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
-        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        // Letters only, none that passes for a digit: a device shows the id
+        // next to its code (see `etls::PAIRING_ID_ALPHABET`).
+        let id = etls::random_pairing_id().map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+        // A commitment counts only over HTTPS: over plain HTTP there is no
+        // certificate for a code to check.
+        let (commitment, engine_nonce) = match commitment.filter(|_| tls) {
+            Some(c) => {
+                let c = etls::parse_nonce(c)
+                    .ok_or_else(|| PairingError::Invalid("commitment must be 64 hex digits (SHA-256 of the device's nonce)".into()))?;
+                let nonce = etls::random_nonce().map_err(|e| anyhow::anyhow!("randomness: {e}"))?;
+                (Some(etls::nonce_hex(&c)), Some(etls::nonce_hex(&nonce)))
+            }
+            None => (None, None),
+        };
 
         let _lock = self.lock()?;
         let mut v = self.load()?;
@@ -302,6 +539,10 @@ impl PairingStore {
             claimed: false,
             token_name: None,
             revoked: false,
+            tls,
+            commitment,
+            engine_nonce,
+            code: None,
         };
         v.push(p.clone());
         self.save(&v)?;
@@ -310,20 +551,96 @@ impl PairingStore {
             name = p.name.as_str(),
             scopes = %p.scopes.join(","),
             from = p.from.as_deref().map(tracing::field::display),
+            check = p.check().as_str(),
             "pairing requested"
         );
         Ok(p)
     }
 
+    /// The device reveals the nonce it committed to; the engine computes the
+    /// pairing code from `fingerprint` (its own certificate's) and stores it.
+    /// The answer to the device must not carry it.
+    /// Revealing the same nonce again changes nothing (a retry after a lost
+    /// answer); any other nonce is refused, as is a request without a
+    /// commitment or no longer pending.
+    pub fn reveal(&self, id: &str, nonce: &str, fingerprint: &Fingerprint) -> Result<Pairing, PairingError> {
+        let device_nonce = etls::parse_nonce(nonce).ok_or_else(|| PairingError::Invalid("nonce must be 64 hex digits".into()))?;
+        let _lock = self.lock()?;
+        let mut v = self.load()?;
+        let p = find(&mut v, id, "")?;
+        let (Some(commitment), Some(engine_nonce)) = (p.commitment.clone(), p.engine_nonce.as_deref().and_then(etls::parse_nonce)) else {
+            return Err(PairingError::Invalid(format!("pairing `{id}` has no commitment to reveal a nonce for")));
+        };
+        if p.status != PairingStatus::Pending {
+            return Err(PairingError::Invalid(format!("pairing `{id}` is already {:?}", p.status)));
+        }
+        if etls::pairing_commitment(&device_nonce) != commitment {
+            return Err(PairingError::Invalid("the nonce does not match the commitment sent with the request".into()));
+        }
+        let code = etls::pairing_code(fingerprint, &device_nonce, &engine_nonce).digits();
+        if p.code.as_deref() == Some(code.as_str()) {
+            return Ok(p.clone());
+        }
+        p.code = Some(code);
+        let out = p.clone();
+        self.save(&v)?;
+        tracing::info!(
+            id = %out.id,
+            name = out.name.as_str(),
+            "pairing code ready; the operator approves once the device shows the same code as this engine"
+        );
+        Ok(out)
+    }
+
     /// The operator approves: a token is minted with the requested scopes and
-    /// parked on the record until the client collects it.
+    /// parked on the record until the client collects it. No code is given,
+    /// so this approves only a request over plain HTTP from this machine
+    /// ([`PairingCheck::Plain`]): one with a code, or one over HTTPS without
+    /// one, is refused. Use [`PairingStore::approve_with_code`] for those.
     pub fn approve(&self, id: &str, tokens: &TokenStore) -> Result<Pairing, PairingError> {
+        self.approve_with_code(id, tokens, None, false)
+    }
+
+    /// The operator approves, giving the request's code. By the request's
+    /// [`PairingCheck`]:
+    /// - `code`: `code` must equal the engine's, else refused. It is the code
+    ///   the engine showed the operator, sent back once they saw the device
+    ///   show the same (`estia pair approve` asks; an admin app shows it with
+    ///   an approve button), or the code a script read off the device. A
+    ///   mismatch means the device saw another certificate, and the request
+    ///   should be denied; no code at all is refused too. Sending back the
+    ///   listed code without asking anyone passes this check: it proves the
+    ///   approver read this request, not that anyone compared;
+    /// - `waiting`: refused until the device has revealed its nonce;
+    /// - `none`: a code given is refused (the device in front of the operator
+    ///   made another request, or something stripped the commitment); no code
+    ///   is accepted only with `allow_uncoded`, the approver's explicit word
+    ///   that the device cannot show a code;
+    /// - `plain`: no code involved; one given is refused.
+    ///
+    /// After approving a `code` request, tell the user at the device to
+    /// confirm there that this engine shows the device's code: the device
+    /// pins the certificate only then.
+    pub fn approve_with_code(
+        &self,
+        id: &str,
+        tokens: &TokenStore,
+        code: Option<&str>,
+        allow_uncoded: bool,
+    ) -> Result<Pairing, PairingError> {
         let _lock = self.lock()?;
         let mut v = self.load()?;
         let p = find(&mut v, id, "")?;
         if p.status != PairingStatus::Pending {
             return Err(PairingError::Invalid(format!("pairing `{id}` is already {:?}", p.status)));
         }
+        let given = match code {
+            Some(c) => Some(
+                etls::PairingCode::parse(c).ok_or_else(|| PairingError::Invalid("a pairing code is six digits, such as 482913".into()))?,
+            ),
+            None => None,
+        };
+        check_code(p, given, allow_uncoded)?;
         let token_name = format!("pair:{}:{}", p.name, p.id);
         let refs: Vec<&str> = p.scopes.iter().map(String::as_str).collect();
         // The name carries this pairing's random id, so a token already under
@@ -339,7 +656,14 @@ impl PairingStore {
             let _ = tokens.revoke(&token_name);
             return Err(e);
         }
-        tracing::info!(id = %out.id, name = out.name.as_str(), scopes = %out.scopes.join(","), token_name = token_name.as_str(), "pairing approved");
+        tracing::info!(
+            id = %out.id,
+            name = out.name.as_str(),
+            scopes = %out.scopes.join(","),
+            token_name = token_name.as_str(),
+            check = out.check().as_str(),
+            "pairing approved"
+        );
         Ok(out)
     }
 
@@ -439,6 +763,7 @@ mod tests {
         let store = PairingStore::new(&dir);
         let tokens = TokenStore::open(dir.join("tokens.json")).unwrap();
         let p = store.request("phone", &scopes(&["generate", "embed"]), Some("10.0.0.7".into())).unwrap();
+        assert!(etls::is_pairing_id(&p.id), "letters that cannot pass for digits: {}", p.id);
         assert_eq!(store.poll(&p.id).unwrap(), (PairingStatus::Pending, None));
         assert!(store.request("x", &["bogus".into()], None).is_err());
         let approved = store.approve(&p.id, &tokens).unwrap();
@@ -483,6 +808,12 @@ mod tests {
             "ip\u{200f}ad",           // RTL mark
             "\u{feff}ipad",           // BOM (not trimmed)
             "ipad\u{2028}x",          // line separator
+            "ip\u{3164}ad",           // Hangul filler: a letter that prints as a blank
+            "ip\u{FFA0}ad",           // halfwidth Hangul filler
+            "ip\u{115F}ad",           // Hangul choseong filler
+            "ipad\u{FE0F}",           // variation selector
+            "ip\u{034F}ad",           // combining grapheme joiner
+            "ipad\u{E0041}",          // tag character
             "ipad  generate",         // column padding
             "ipad/phone",             // outside the set
             "pair:ipad",              // colon: token names split on it
@@ -497,6 +828,53 @@ mod tests {
             assert!(!e.to_string().chars().any(|c| c.is_control() || is_format_char(c)), "{e}");
             assert!(ok(bad).is_err(), "request refuses {bad:?}");
         }
+        // A run of digits that could pass for a pairing code, in any script
+        // and whatever separates them, is refused; up to four in a row is a
+        // name ("iPhone 15", "Room 2024").
+        for code_like in
+            ["phone 482 913", "482913", "phone 48291", "4829-13", "48.29.13", "(482) 913", "ipad 4 8 2 9 1", "４８２ ９１３", "٤٨٢٩١٣"]
+        {
+            let e = validate_name(code_like).expect_err(code_like);
+            assert!(e.to_string().contains("pairing code"), "{code_like}: {e}");
+        }
+        // Real digits split by something that is a letter to Unicode but
+        // reads as a blank, a dash, a dot or an apostrophe: the same row.
+        for split in [
+            "phone 482\u{A78F}913", // ꞏ LATIN LETTER SINOLOGICAL DOT (Lo)
+            "phone 482\u{0640}913", // ـ ARABIC TATWEEL (Lm)
+            "phone 482\u{02D1}913", // ˑ MODIFIER LETTER HALF TRIANGULAR COLON (Lm)
+            "phone 482\u{0345}913", // COMBINING GREEK YPOGEGRAMMENI (Mn, counts as lowercase)
+            "phone 482\u{A78C}913", // ꞌ LATIN SMALL LETTER SALTILLO (Ll, an apostrophe to the eye)
+            "phone 482\u{3161}913", // ㅡ HANGUL LETTER EU (Lo, a dash to the eye)
+            "phone 482\u{4E00}913", // 一 CJK "one" (Lo, a dash to the eye)
+            "phone 482\u{01C0}913", // ǀ LATIN LETTER DENTAL CLICK (Lo, a bar)
+        ] {
+            assert!(split.chars().all(|c| c.is_alphanumeric() || c == ' '), "every character is a letter or digit: {split:?}");
+            let e = validate_name(split).expect_err(split);
+            assert!(e.to_string().contains("pairing code"), "{split:?}: {e}");
+        }
+        // The Hangul fillers are letters too, but print as nothing at all.
+        let e = validate_name("phone 482\u{FFA0}913").unwrap_err();
+        assert!(e.to_string().contains("formatting character"), "{e}");
+        for fine in [
+            "iPhone 15 Pro",
+            "Room 2024",
+            "Pixel 8",
+            "phone 482 a 913",
+            "phone 482 ω 913",
+            "phone 482 ж 913",
+            "ThinkPad X1 Gen 11",
+            "HP 15-dy2045",
+            "東京 2024",
+            "갤럭시 S23",
+        ] {
+            assert_eq!(validate_name(fine).unwrap(), fine);
+        }
+        // The price of not trusting letters without case: two numbers they
+        // separate count as one row.
+        assert!(validate_name("東京 2024 店 15").is_err());
+        assert!(ends_digit_run('a') && ends_digit_run('Ж') && ends_digit_run('ω'));
+        assert!(!ends_digit_run('東') && !ends_digit_run('\u{0345}') && !ends_digit_run('ʰ') && !ends_digit_run(' '));
         let long = "a".repeat(MAX_NAME_CHARS + 1);
         assert!(validate_name(&long).is_err(), "too long is refused, not truncated");
         assert!(validate_name(&"é".repeat(MAX_NAME_CHARS)).is_ok(), "the limit counts characters, not bytes");
@@ -533,6 +911,10 @@ mod tests {
                 claimed: false,
                 token_name: None,
                 revoked: false,
+                tls: false,
+                commitment: None,
+                engine_nonce: None,
+                code: None,
             })
             .collect();
         store.save(&stale).unwrap();
@@ -593,6 +975,80 @@ mod tests {
 
         let e = store.deny("ffffffffffffffff").unwrap_err();
         assert!(e.to_string().contains("estia token list"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The commit/reveal exchange and the approval rules for each check.
+    #[test]
+    fn codes_are_computed_on_reveal_and_checked_on_approve() {
+        let dir = scratch("codes");
+        let store = PairingStore::new(&dir);
+        let tokens = TokenStore::open(dir.join("tokens.json")).unwrap();
+        let fp = Fingerprint::of_certificate(b"the engine's certificate");
+        let nonce = [7u8; 32];
+        let commitment = etls::pairing_commitment(&nonce);
+
+        // Over TLS with a commitment: waiting, then a code.
+        let p = store.request_tls("phone", &scopes(&["generate"]), Some("10.0.0.2".into()), Some(&commitment)).unwrap();
+        assert_eq!(p.check(), PairingCheck::Waiting);
+        let engine_nonce = etls::parse_nonce(p.engine_nonce.as_deref().unwrap()).unwrap();
+        let e = store.approve_with_code(&p.id, &tokens, Some("123456"), false).unwrap_err();
+        assert!(e.to_string().contains("not finished"), "{e}");
+        let e = store.reveal(&p.id, &etls::nonce_hex(&[8u8; 32]), &fp).unwrap_err();
+        assert!(e.to_string().contains("does not match the commitment"), "{e}");
+        assert!(store.reveal(&p.id, "zz", &fp).is_err());
+        assert!(matches!(store.reveal("0000000000000000", &etls::nonce_hex(&nonce), &fp), Err(PairingError::NotFound { .. })));
+        let revealed = store.reveal(&p.id, &etls::nonce_hex(&nonce), &fp).unwrap();
+        assert_eq!(revealed.check(), PairingCheck::Code);
+        let expected = etls::pairing_code(&fp, &nonce, &engine_nonce);
+        assert_eq!(revealed.code.as_deref(), Some(expected.digits().as_str()), "the device's code, from the same certificate");
+        assert_eq!(revealed.code_shown(), Some(expected.to_string()));
+        assert_eq!(revealed.pairing_code(), Some(expected));
+        assert_eq!(store.reveal(&p.id, &etls::nonce_hex(&nonce), &fp).unwrap().code, revealed.code, "a retry changes nothing");
+        // A code from another certificate (what an interceptor's device shows).
+        let other = etls::pairing_code(&Fingerprint::of_certificate(b"interceptor"), &nonce, &engine_nonce);
+        let e = store.approve_with_code(&p.id, &tokens, Some(&other.digits()), false).unwrap_err();
+        assert!(e.to_string().contains("does not match") && e.to_string().contains("deny"), "{e}");
+        // No code at all: a blind approval, refused whatever else is said.
+        for allow_uncoded in [false, true] {
+            let e = store.approve_with_code(&p.id, &tokens, None, allow_uncoded).unwrap_err();
+            assert!(e.to_string().contains("same code as this engine"), "{e}");
+        }
+        let e = store.approve(&p.id, &tokens).unwrap_err();
+        assert!(e.to_string().contains("same code as this engine"), "{e}");
+        assert!(store.approve_with_code(&p.id, &tokens, Some("12345"), false).is_err(), "not six digits");
+        assert_eq!(store.list().into_iter().find(|q| q.id == p.id).unwrap().status, PairingStatus::Pending, "refusals mint nothing");
+        // The code the engine shows, sent back on the operator's yes.
+        let approved = store.approve_with_code(&p.id, &tokens, Some(&revealed.code_shown().unwrap()), false).unwrap();
+        assert_eq!(approved.status, PairingStatus::Approved);
+        assert_eq!(approved.code_shown(), Some(expected.to_string()), "still shown, for the user at the device to compare");
+        assert!(store.reveal(&p.id, &etls::nonce_hex(&nonce), &fp).is_err(), "not pending any more");
+        let on_disk = std::fs::read_to_string(dir.join("pairings.json")).unwrap();
+        assert!(!on_disk.contains("confirm"), "one code per pairing: {on_disk}");
+
+        // Over TLS without a commitment (a browser): no code; needs allow_uncoded.
+        let b = store.request_tls("browser", &scopes(&["generate"]), Some("10.0.0.3".into()), None).unwrap();
+        assert_eq!((b.check(), b.engine_nonce.is_none()), (PairingCheck::Uncoded, true));
+        assert!(store.reveal(&b.id, &etls::nonce_hex(&nonce), &fp).is_err(), "nothing to reveal");
+        let e = store.approve_with_code(&b.id, &tokens, Some(&expected.digits()), true).unwrap_err();
+        assert!(e.to_string().contains("no code, but you gave one"), "{e}");
+        let e = store.approve_with_code(&b.id, &tokens, None, false).unwrap_err();
+        assert!(e.to_string().contains("--no-code") && e.to_string().contains("shows a 6-digit code, deny"), "{e}");
+        // `approve` gives no code and no explicit word: refused (what a
+        // request whose commitment was stripped on the way must meet).
+        assert!(store.approve(&b.id, &tokens).unwrap_err().to_string().contains("no_code"));
+        assert_eq!(store.list().into_iter().find(|q| q.id == b.id).unwrap().status, PairingStatus::Pending, "nothing minted");
+        let approved = store.approve_with_code(&b.id, &tokens, None, true).unwrap();
+        assert_eq!(approved.code_shown(), None, "no code to compare");
+
+        // Plain HTTP from this machine: a commitment is ignored; no code.
+        let l = store.request("local app", &scopes(&["generate"]), Some("127.0.0.1".into())).unwrap();
+        assert_eq!(l.check(), PairingCheck::Plain);
+        let l2 = store.request_inner("local app 2", &scopes(&["generate"]), None, false, Some(&commitment)).unwrap();
+        assert_eq!((l2.check(), l2.commitment.is_none()), (PairingCheck::Plain, true));
+        assert!(store.approve_with_code(&l.id, &tokens, Some("123456"), false).is_err());
+        store.approve_with_code(&l.id, &tokens, None, false).unwrap();
+        assert!(store.request_tls("bad", &[], None, Some("not hex")).is_err(), "a malformed commitment is refused");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

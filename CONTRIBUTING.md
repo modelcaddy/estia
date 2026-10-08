@@ -30,8 +30,8 @@ cargo test --workspace
 ```
 
 The tests drive a fake runner written in Python, so they need `python3` on
-`PATH`. Without it, those tests print `skip:` and pass. They do not need MLX
-or a model.
+`PATH`, 3.9 or newer (the macOS system Python is enough). Without it, those
+tests print `skip:` and pass. They do not need MLX or a model.
 
 Some tests are marked `#[ignore]` because they use the network: the model
 download tests reach huggingface.co, and the Bonjour tests advertise on the
