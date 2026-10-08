@@ -64,6 +64,11 @@ impl Out {
 pub(crate) enum Fail {
     /// Answer `{"error": …}` and carry on.
     Msg(String),
+    /// llama-server refused the request as invalid (a 4xx — the chat template
+    /// rejecting the conversation, say). Answer `{"error": …, "refused": true}`
+    /// so the API can tell the client its request was wrong (400) instead of
+    /// reporting the server broken (500).
+    Refused(String),
     /// A cancel line stopped it.
     Cancelled,
     /// llama-server died while serving a loaded model: answer, then exit so
@@ -193,6 +198,7 @@ impl Adapter {
         match r {
             Ok(()) => Ok(Flow::Continue),
             Err(Fail::Msg(m)) => out.emit(&json!({ "error": m })).map(|_| Flow::Continue),
+            Err(Fail::Refused(m)) => out.emit(&json!({ "error": m, "refused": true })).map(|_| Flow::Continue),
             Err(Fail::Cancelled) if streaming => out.emit(&json!({"done": true, "cancelled": true})).map(|_| Flow::Continue),
             Err(Fail::Cancelled) => out.emit(&json!({"error": "cancelled"})).map(|_| Flow::Continue),
             Err(Fail::Died(m)) => {
@@ -387,7 +393,8 @@ impl Adapter {
                 let mut resp = conn.read_head(&mut idle)?;
                 if resp.head.status != 200 {
                     let raw = resp.read_all(&mut idle, MAX_BODY).unwrap_or_default();
-                    return Err(io::Error::other(ServerSaid(server_error(resp.head.status, &raw))));
+                    let refused = is_refusal(resp.head.status);
+                    return Err(io::Error::other(ServerSaid(server_error(resp.head.status, &raw), refused)));
                 }
                 let mut sse = SseParser::default();
                 let mut events = Vec::new();
@@ -509,9 +516,10 @@ impl Adapter {
             let mut resp = conn.read_head(&mut idle)?;
             let raw = resp.read_all(&mut idle, MAX_BODY)?;
             if resp.head.status != 200 {
-                return Err(io::Error::other(ServerSaid(server_error(resp.head.status, &raw))));
+                let refused = is_refusal(resp.head.status);
+                return Err(io::Error::other(ServerSaid(server_error(resp.head.status, &raw), refused)));
             }
-            serde_json::from_slice(&raw).map_err(|e| io::Error::other(ServerSaid(format!("llama-server sent invalid JSON: {e}"))))
+            serde_json::from_slice(&raw).map_err(|e| io::Error::other(ServerSaid(format!("llama-server sent invalid JSON: {e}"), false)))
         })();
         result.map_err(|e| self.io_fail(e, seq))
     }
@@ -521,6 +529,9 @@ impl Adapter {
     fn io_fail(&mut self, e: io::Error, seq: u64) -> Fail {
         if let Some(inner) = e.get_ref() {
             if let Some(said) = inner.downcast_ref::<ServerSaid>() {
+                if said.1 {
+                    return Fail::Refused(said.0.clone());
+                }
                 return msg(said.0.clone());
             }
         }
@@ -542,15 +553,23 @@ impl Adapter {
     }
 }
 
-/// An error llama-server answered with, already worded.
+/// An error llama-server answered with, already worded, and whether it was a
+/// 4xx refusal of the request rather than a server failure.
 #[derive(Debug)]
-struct ServerSaid(String);
+struct ServerSaid(String, bool);
 impl fmt::Display for ServerSaid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 impl std::error::Error for ServerSaid {}
+
+/// A 4xx from llama-server means the request was refused — the chat template
+/// rejecting the conversation, a too-large context, a bad parameter — not that
+/// the server is broken.
+fn is_refusal(status: u16) -> bool {
+    (400..=499).contains(&status)
+}
 
 fn classify_abort(e: io::Error, shared: &Shared, seq: u64) -> Fail {
     if let Some(inner) = e.get_ref() {
@@ -1254,5 +1273,20 @@ mod tests {
         assert_eq!(c, json!({"id": "call_3", "type": "function", "function": {"name": "f", "arguments": "{\"a\":1}"}}));
         let c = normalize_tool_call(&json!({"id": "x", "type": "function", "function": {"name": "f", "arguments": "{}"}}), 0);
         assert_eq!(c["id"], "x");
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::is_refusal;
+
+    #[test]
+    fn client_error_statuses_are_refusals() {
+        assert!(is_refusal(400));
+        assert!(is_refusal(422));
+        assert!(is_refusal(499));
+        assert!(!is_refusal(200));
+        assert!(!is_refusal(500));
+        assert!(!is_refusal(503));
     }
 }

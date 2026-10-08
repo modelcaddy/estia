@@ -729,6 +729,7 @@ impl Session {
                     match proto::parse_stream_line(&raw) {
                         None | Some(StreamEvent::Other) | Some(StreamEvent::Keepalive) => continue,
                         Some(StreamEvent::Meta(v)) => meta = Some(v),
+                        Some(StreamEvent::Refused(e)) => break Err(SessionError::Refused(e)),
                         Some(StreamEvent::Error(e)) => break Err(SessionError::Runner(e)),
                         Some(StreamEvent::Token(t)) => {
                             if !t.is_empty() {
