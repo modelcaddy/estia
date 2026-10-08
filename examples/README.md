@@ -16,7 +16,8 @@ The concepts behind them are explained in
 | [python/structured.py](python/structured.py) | JSON Schema extraction and the 422 when the output does not fit | Python, OpenAI SDK | `generate` |
 | [python/tools.py](python/tools.py) | A tool-calling loop around one local Python function | Python, OpenAI SDK | `generate` |
 | [python/vision.py](python/vision.py) | Ask the `vision` role about an image on disk | Python, OpenAI SDK | `generate` |
-| [python/pair.py](python/pair.py) | How a device app gets a token: request, wait for approval, save it with mode 0600 | Python, stdlib | none (the token gets what you ask for) |
+| [python/pair.py](python/pair.py) | How a device app gets a token: over https, prove the certificate with a 6-digit code; request, wait for approval, save it with mode 0600, print the pin | Python, stdlib | none (the token gets what you ask for) |
+| [python/estia_tls.py](python/estia_tls.py) | Pin an engine's certificate by fingerprint, for urllib and the OpenAI SDK; the pairing-code functions | Python, stdlib | none |
 | [javascript/chat.mjs](javascript/chat.mjs) | Streaming chat, two turns sharing the prompt cache, Ctrl-C to cancel | JavaScript, OpenAI SDK | `generate` |
 | [javascript/embed.mjs](javascript/embed.mjs) | Embeddings with `task` and `expect_fingerprint`, ranked by cosine | JavaScript, OpenAI SDK | `embed` |
 | [remote_client.rs](../engine/examples/remote_client.rs) | `RemoteEngine` from Rust: pair or use a token, streamed chat, cancel, embeddings, the handle types | Rust | `generate`, `embed` |
@@ -46,16 +47,20 @@ The concepts behind them are explained in
    ```
 
    On another device, pair instead. Run `python/pair.py` (or
-   `estia pair request --engine http://<engine>:27200`) and approve the
-   request on the engine's machine with `estia pair approve <id>`. The engine
-   must be serving the LAN (`estia serve --lan`) for other devices to reach it.
+   `estia pair request --engine https://<engine>:27200`); it shows a 6-digit
+   code. Approve the request on the engine's machine with `estia pair approve
+   <id> --code <code>`. The engine must be serving the LAN (`estia serve
+   --lan`) for other devices to reach it, and then it serves https with its
+   own certificate: pairing prints the fingerprint to pin (`ESTIA_PIN`).
 
 3. The environment is set:
 
    | Variable | Meaning | Default |
    |---|---|---|
-   | `ESTIA_URL` | Where the engine listens | `http://127.0.0.1:27200` |
+   | `ESTIA_URL` | Where the engine listens: `http://127.0.0.1:27200` on its machine, `https://<engine>:27200` from another device | `http://127.0.0.1:27200` |
    | `ESTIA_TOKEN` | The bearer token | none; every example except `pair.py` and `in_process.rs` needs it |
+   | `ESTIA_PIN` | For an `https://` engine: its certificate fingerprint (64 hex digits), which `pair.py` prints, and `estia tls fingerprint` on the engine's machine | none; required for `https://` |
+   | `ESTIA_PINNEDPUBKEY` | For `curl/quickstart.sh` against an `https://` engine: the `sha256//…` value from the `curl` line of `estia tls fingerprint` | none |
    | `ESTIA_MODEL` | The role (or model) to chat with | `fast` |
 
    ```bash
@@ -84,7 +89,7 @@ curl (needs only curl):
 ./curl/quickstart.sh
 ```
 
-Python 3.10 or newer:
+Python 3.9 or newer:
 
 ```bash
 cd python
@@ -97,6 +102,16 @@ python tools.py "What time is it in Tokyo?"
 python vision.py invoice.png "What is the total?"
 python no_sdk.py                         # no pip needed
 python pair.py --name "my laptop"        # no pip needed, no token needed
+python estia_tls.py                      # checks the pairing-code functions
+```
+
+From another device, over https, the Python examples need the pin as well:
+
+```bash
+export ESTIA_URL=https://192.168.1.20:27200
+python pair.py --name "my laptop"        # shows a code, asks for the confirmation code, prints ESTIA_PIN
+export ESTIA_TOKEN=$(cat estia-token) ESTIA_PIN=<what pair.py printed>
+python chat.py
 ```
 
 JavaScript, Node 18 or newer:
@@ -108,11 +123,23 @@ node chat.mjs "Suggest a name for a small sailing boat."
 node embed.mjs "where is the spare key?"
 ```
 
+Node cannot pin a certificate by fingerprint without code of your own. To
+reach an `https://` engine on another machine, trust its certificate as the
+one extra authority: copy `tls/cert.pem` from the engine's data directory,
+check it (`openssl x509 -in cert.pem -noout -fingerprint -sha256` against
+`estia tls fingerprint`), and reach the engine by a name the certificate
+carries, such as its `.local` name. Node checks the certificate's dates,
+unlike a pin: it is valid for 820 days.
+
+```bash
+NODE_EXTRA_CA_CERTS=cert.pem ESTIA_URL=https://studio.local:27200 node chat.mjs "hello"
+```
+
 Rust, from the repository root:
 
 ```bash
 cargo run -p estia-engine --example remote_client
-cargo run -p estia-engine --example remote_client -- --pair "my laptop"
+cargo run -p estia-engine --features remote-tls --example remote_client -- --pair "my laptop"   # https needs remote-tls
 cargo run -p estia-engine --example in_process
 ```
 

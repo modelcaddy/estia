@@ -23,16 +23,78 @@ it before you report, if you can.
 These are known and documented. They are not vulnerabilities, but reports that
 show a practical impact beyond what is described here are welcome.
 
-- **No TLS on the LAN.** `estia serve --lan` serves plain HTTP. Bearer tokens,
-  prompts and model output cross the network unencrypted. Anyone who can
-  observe that traffic can read it and reuse a token. Use LAN mode only on a
-  network you trust, such as your home network, not shared or public Wi-Fi.
-  Note that `estia service install` runs `estia serve --lan` unless you pass
-  `--local`.
+- **TLS on the LAN, pinned at pairing.** On a LAN bind (`estia serve --lan`,
+  or `estia service install` without `--local`) the engine serves HTTPS with
+  its own self-signed certificate (ECDSA P-256), made on the first LAN start
+  and kept in `tls/` in the data directory. The key file is owner-only (0600
+  in a 0700 directory); whoever can read it can impersonate the engine.
+  Tokens, prompts and output from other devices cross the network encrypted.
+  Plain HTTP stays, on the same port, for peers on the engine's own machine
+  only (loopback); plain HTTP from another device is refused with a 400
+  (`https_required`) before any handler runs, but whatever that request
+  carried (a token, a prompt) has already crossed the network in clear; the
+  engine logs the name of any valid token that arrives that way (a `warn`),
+  but does not revoke it. After upgrading from 0.4, pair each device again
+  and revoke the token it had. The Rust client and the Python examples refuse
+  to send a token over plain HTTP to another machine at all.
+
+  Nothing vouches for the certificate, so each device pins its SHA-256
+  fingerprint, and what makes that safe is how the device learns it:
+
+  - **Pairing** (`estia pair request`, `begin_pairing` in the Rust client,
+    `examples/python/pair.py`) proves, in both directions, which certificate
+    each end used. The device commits to a random nonce before it sees the
+    engine's nonce, and both sides compute two 6-digit codes from the
+    certificate fingerprint each of them used and the two nonces. You type
+    the pairing code the device shows into `estia pair approve <id> --code
+    <code>`; the engine approves only if it computed the same code from its
+    own certificate, so something in between gets no token for the engine.
+    `estia pair approve` then prints a confirmation code, which you type into
+    the device; the device pins the certificate only if it computed the same
+    code from the certificate it saw, so it never trusts an "approved"
+    answered by something in between, with a token of its own making.
+    Something between the device and the engine that presents its own
+    certificate gets one guess in a million at each code per pairing and
+    cannot prepare one in advance. The engine's certificate is public, so a
+    code taken from the fingerprint alone could be matched by a certificate
+    ground offline; the nonces are what prevent that.
+  - **Requests with no code.** A browser or curl cannot compute a code, so
+    it pairs without a commitment, and so does a device whose commitment
+    something in between removed on the way. Such a request (`check: none`
+    in `estia pair list`) is approved only when you say so explicitly:
+    `estia pair approve <id> --no-code`, or `{"no_code": true}` on the HTTP
+    approve route. Every other approval path refuses it. Never approve one
+    without a code when the device in front of you shows a code: deny it.
+    Even then that device would not pin the certificate, because the engine
+    has no confirmation code to give for such a request; but whatever made
+    the request would hold a token.
+  - **Trust on first use, where there is no pairing exchange.** A browser
+    (`/client`) cannot pin or show a code: it pairs without one (approved with
+    `--no-code`), and you compare the SHA-256 in the browser's certificate
+    viewer with `estia tls fingerprint` before accepting the warning. An app
+    given a token from `estia token new` should ask for the fingerprint too
+    (the command prints it), or show the 64-bit short form of what it sees
+    and pin it only after you confirm it matches.
+  - **Expiry.** The certificate is valid for 820 days from its creation:
+    Apple's TLS stack refuses a server certificate valid for longer than 825
+    days, even one the user trusts. Pinned devices ignore its dates. Browsers
+    and clients that trust it as an authority (Node, curl `--cacert`) see it
+    expire; `estia tls rotate` then makes a new one, and paired devices must
+    pair again. Pins name the whole certificate, so it is never re-issued on
+    its own.
+  - **Rotation.** `estia tls rotate` makes a new certificate; every paired
+    device must pair again, and their old tokens stay valid until you revoke
+    them. A pinned device refuses any other certificate before sending its
+    token, and says so.
+
+  Loopback stays plain: a process on the engine's machine can watch its
+  loopback traffic only with privileges that would let it read the data
+  directory anyway.
 - **Pairing trusts the operator's judgement.** Any device on the LAN can send a
   pairing request, with a name and scopes of its choosing. It gets a token only
-  after you approve it with `estia pair approve <id>` or an app that embeds
-  Estia and holds an admin token. Names are limited to printable letters,
+  after you approve it with `estia pair approve <id> --code <code>` or an app
+  that embeds Estia and holds an admin token (`--no-code`, or `no_code` over
+  HTTP, for a request that has no code). Names are limited to printable letters,
   digits and a little punctuation so they cannot rewrite your terminal, and
   `estia pair approve` refuses a request for `admin` without
   `--allow-admin`. The HTTP approve route and the `/client` Admin tab grant
@@ -45,9 +107,10 @@ show a practical impact beyond what is described here are welcome.
   make any proxy forward the original `Host`.
 - **Availability on the LAN.** There are caps on pending pairing requests (24,
   4 per address), request size (`max_tokens` 8192, 256 embedding inputs),
-  header time (10 s) and connections (32 per address), but no request rate
-  limit. A device on the LAN can still keep the engine busy with valid work,
-  or hold connections open with slowly sent request bodies.
+  header time (10 s, which also bounds the first byte and the TLS handshake of
+  a connection) and connections (32 per address), but no request rate limit.
+  A device on the LAN can still keep the engine busy with valid work or with
+  TLS handshakes, or hold connections open with slowly sent request bodies.
 - **Tokens only, no accounts.** Access is controlled by bearer tokens with
   scopes (`generate`, `embed`, `models:read`, `models:write`, `admin`).
   `tokens.json` stores SHA-256 hashes, not the tokens. Whoever can write to

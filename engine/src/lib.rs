@@ -33,6 +33,12 @@
 //!   ([`find_local_engine`]) and joins it without a typed token.
 //! - [`RemoteEngine`], [`GenHandle`] / [`EmbedHandle`]: the same shapes over
 //!   HTTP, for a model served by an `estia serve` daemon on another machine.
+//!   An engine on the LAN serves HTTPS with its own certificate, which a
+//!   device pins ([`RemoteEngine::with_pin`], feature `remote-tls`);
+//!   [`remote::begin_pairing`] gets the token, and the pin once the user
+//!   confirms it with the code the engine's operator reads out.
+//! - [`tls`]: the certificate as clients see it: [`Fingerprint`], the
+//!   [`PairingCode`]s both ends of a pairing compute, and the pin check.
 //!
 //! The wire types live in [`proto`] (re-exported `estia-proto`).
 
@@ -54,6 +60,7 @@ pub mod roles;
 pub mod runtime;
 pub mod session;
 pub mod structured;
+pub mod tls;
 
 pub use backend::{Backend, BACKEND_LLAMA_CPP};
 pub use engine::{Engine, EngineConfig, EngineError, LlamaLaunch, LlamaServer, Reaped};
@@ -65,8 +72,9 @@ pub use location::EngineLocation;
 pub use machine::{DeviceTier, MachineProfile, MemoryPolicy};
 pub use oneshot::{OneShot, OneShotConfig};
 pub use procmem::phys_footprint;
-pub use remote::{RemoteEmbed, RemoteEngine, RemoteGen};
+pub use remote::{begin_pairing, probe_certificate, PairingOutcome, PendingPairing, RemoteEmbed, RemoteEngine, RemoteGen};
 pub use resident::{ChatOutcome, EmbedSession, GenSession};
 pub use roles::{RoleBinding, RoleError, Roles};
 pub use session::{CancelToken, Launch, NoopObserver, Priority, Session, SessionConfig, SessionObserver, StreamOutcome};
 pub use structured::{OutputFormat, Structured, StructuredError};
+pub use tls::{Fingerprint, PairingCode, UnverifiedFingerprint};

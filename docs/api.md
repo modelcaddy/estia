@@ -13,6 +13,26 @@ The code is in `server/src/` (`openai.rs`, `engine_api.rs`, and
 `required_scope` in `lib.rs`). The `/engine/*` contract is versioned:
 `/engine/health` reports `api_version` (currently `1`).
 
+## Transport
+
+A loopback-only engine (`estia serve`) speaks plain HTTP. A LAN engine
+(`estia serve --lan`, `estia service install`) serves HTTPS with its own
+self-signed certificate on the same port, and still plain HTTP to peers on its
+own machine: the engine tells the two apart by a connection's first byte.
+Plain HTTP from any other address is answered with a 400 of type
+`https_required` before authentication or any handler runs (a `GET` of `/` or
+`/client` is redirected to `https://` instead), and the response closes the
+connection. The server speaks HTTP/1.1 only, over TLS 1.2 or 1.3.
+
+Clients pin the certificate's SHA-256 fingerprint (64 hex digits, the SHA-256
+of the certificate's DER bytes) rather than checking a chain:
+[building-clients.md](building-clients.md#pinning-the-engines-certificate)
+shows how, and [Pairing](#pairing) how a device learns the fingerprint safely.
+`/engine/health` and the pairing answers carry `tls`
+(`{"fingerprint", "short"}`, or null on a loopback-only engine). That is a
+statement for display and cross-checks: a client pins the certificate its
+connection presented, never a value from a body.
+
 ## Authentication
 
 Send `Authorization: Bearer <token>`. Tokens are minted with `estia token new`,
@@ -64,7 +84,7 @@ original `Host`, or its own name must be allowed.
 | Inputs per `/v1/embeddings` or `/engine/embed` request | 256 | 400 |
 | Request body | 32 MiB. Change it with `estia serve --max-body-bytes <bytes>` (or `estia service install --max-body-bytes <bytes>`) or `ESTIA_MAX_BODY_BYTES=<bytes>`; the flag wins. | 413, type `invalid_request_error`; the message gives the limit and how to raise it |
 | Pending pairing requests | 24 overall, 4 per client address | 429, type `rate_limit_error` |
-| Time to send a request's headers | 10 s | Connection closed; also closes a keep-alive connection idle that long |
+| Time to send a request's headers | 10 s | Connection closed; also closes a keep-alive connection idle that long. On a LAN engine the same 10 s also bound a connection's first byte and its TLS handshake |
 | Open connections per client address | 32 (IPv6 counted per /64; loopback exempt) | New connections are closed at once |
 | Open connections in total | Below the open-files limit, which the server raises at start (at most 4096) | New connections wait in the listen backlog |
 
@@ -95,11 +115,12 @@ The server speaks HTTP/1.1 only.
 | GET | `/engine/jobs/{id}` | `models:read` | One job |
 | GET | `/engine/jobs/{id}/events` | `models:read` | Server-sent events for one job until it ends |
 | POST | `/engine/runtime/install` | `admin` | Install a backend's runtime as a job: Python and MLX, or the pinned llama.cpp build |
-| POST | `/engine/pair` | none | Ask for a token (pairing request) |
+| POST | `/engine/pair` | none | Ask for a token (pairing request), with an optional `commitment` |
+| POST | `/engine/pair/{id}/reveal` | none | Reveal the nonce a request's commitment hashed; the engine computes the pairing code |
 | POST | `/engine/local-token` | none (loopback + same-user secret) | An app on this machine gets a token without typing one |
 | GET | `/engine/pair/{id}` | none | Poll a pairing request; returns the token once |
-| GET | `/engine/pairings` | `admin` | Pending and recent pairing requests |
-| POST | `/engine/pairings/{id}/approve` | `admin` | Approve: mint a token with the requested scopes |
+| GET | `/engine/pairings` | `admin` | Pending and recent pairing requests, with each one's `check` and `code` |
+| POST | `/engine/pairings/{id}/approve` | `admin` | Approve, with `{"code"}` for a request that has one (`{"no_code": true}` for an HTTPS request without one): mint a token with the requested scopes |
 | POST | `/engine/pairings/{id}/deny` | `admin` | Deny a pending request, or take back an approved one and revoke its token |
 | GET | `/client` | none | The browser test client (a static page) |
 | GET | `/client/` | none | Redirects (308) to `/client` |
@@ -134,10 +155,10 @@ Every error uses OpenAI's shape, plus the request id (see
 
 | Status | When |
 |---|---|
-| 400 | Empty `messages`, `input` or `inputs`, more than 256 embedding inputs, neither `prompt` nor `messages`, unknown `response_format` type, embedding `task` or `encoding_format`, an artifact id in the other backend's format, pulling an imported model, unknown scope, a pairing name that breaks the [name rules](#pairing), an unknown pairing id on approve or deny, a pairing that cannot be approved or denied |
+| 400 | Empty `messages`, `input` or `inputs`, more than 256 embedding inputs, neither `prompt` nor `messages`, unknown `response_format` type, embedding `task` or `encoding_format`, an artifact id in the other backend's format, pulling an imported model, unknown scope, a pairing name that breaks the [name rules](#pairing), an unknown pairing id on approve or deny, a pairing that cannot be approved or denied, a pairing code that is missing, wrong or not expected, an approval of an HTTPS request without a code that does not say `no_code` (see [Pairing](#pairing)), a malformed commitment, a reveal with the wrong nonce or for a request without a commitment. Type `https_required`: plain HTTP from another device to a LAN engine ([Transport](#transport)) |
 | 401 | Missing, unknown or revoked token |
 | 403 | Token lacks the scope; `Host` not allowed or cross-origin write (type `permission_error`, see [Host and Origin checks](#host-and-origin-checks)) |
-| 404 | Unknown path; a `model` that names no model, family or role (``unknown model or role `…` ``); a model with no artifact for the running backend; a model that is not installed (the message names the `estia pull` that fixes it); unknown job; unknown pairing id on poll |
+| 404 | Unknown path; a `model` that names no model, family or role (``unknown model or role `…` ``); a model with no artifact for the running backend; a model that is not installed (the message names the `estia pull` that fixes it); unknown job; unknown pairing id on poll or reveal |
 | 413 | Request body over the [limit](#limits) (32 MiB by default) |
 | 422 | Structured output still invalid after the retry; embedding fingerprint mismatch |
 | 429 | `POST /engine/pair` while 24 requests are pending, or 4 from the same address (type `rate_limit_error`) |
@@ -307,8 +328,14 @@ are regrouped here):
  "backends": [{"id": "mlx-python", "active": true, "supported": true, "runtime_installed": true},
               {"id": "llama-cpp", "active": false, "supported": true, "runtime_installed": false,
                "build": "b11146", "variant": null, "server": null}],
- "loaded": []}
+ "loaded": [], "tls": null}
 ```
+
+On a LAN engine, `tls` names the certificate it serves:
+`{"fingerprint": "78cd9cd1…0d72", "short": "78cd 9cd1 cca5 b77a"}` (64 hex
+digits and the first 64 bits in groups of four). An app on the engine's
+machine can read it over loopback to show the operator; a remote client must
+not pin it from here ([Transport](#transport)).
 
 On a llama.cpp engine with the runtime installed, the `llama-cpp` entry comes
 first, for example `"variant": "metal", "server": "installed"`, and `loaded`
@@ -560,15 +587,105 @@ and `LocalEngine::claim_token("myapp", None)` reads the secret and asks.
 
 ## Pairing
 
+A device asks for a token; the operator approves on the engine's machine; the
+device collects the token once. Over HTTPS the two ends also prove to each
+other which certificate each used, with two 6-digit codes both compute: the
+pairing code goes from the device to the engine (the operator types it), the
+confirmation code from the engine to the device (the user types it):
+
 ```text
-client                                   engine                      operator
-POST /engine/pair {name, scopes}  ──►    pending, expires in 300 s
-  ◄── 202 {"id": "772ca7c0bf6ada4b", …}
-GET /engine/pair/{id}             ──►    {"status": "pending", "token": null}
-                                                            ◄── estia pair approve {id}
-GET /engine/pair/{id}             ──►    {"status": "approved", "token": "estia_…"}
-GET /engine/pair/{id}             ──►    {"status": "approved", "token": null}
+device (sees certificate F_d)                    engine (serves F_e)
+nonce_d = 32 random bytes
+POST /engine/pair {name, scopes, commitment: C(nonce_d)}
+                                          ──►    pending; nonce_e = 32 random bytes
+  ◄── 202 {id, status, check: "waiting", engine_nonce: nonce_e, tls: {fingerprint: F_e, short}, expires_in, how}
+POST /engine/pair/{id}/reveal {nonce: nonce_d}
+                                          ──►    checks C(nonce_d) == commitment;
+                                                 code_e = code(F_e, nonce_d, nonce_e), kept on the request
+  ◄── 200 {id, status: "pending", check: "code"}
+code_d = code(F_d, nonce_d, nonce_e)     shown on the device: "482 913"
+                                                 operator: estia pair approve {id} --code 482913
+                                                 (refused unless the code equals code_e)
+                                                 it prints confirm(F_e, nonce_d, nonce_e): "452 618"
+GET /engine/pair/{id}                     ──►    {"status": "pending", "token": null, "tls": …}
+GET /engine/pair/{id}                     ──►    {"status": "approved", "token": "estia_…", "tls": …}   (once)
+user types "452618" into the device; it must equal confirm(F_d, nonce_d, nonce_e)
+device pins F_d from now on
 ```
+
+The definitions (SHA-256, `‖` is concatenation, labels are ASCII):
+
+- `C(nonce_d)` = SHA-256(`"estia pairing commitment v1"` ‖ `0x00` ‖
+  nonce_d), sent as 64 lowercase hex digits.
+- `code(F, nonce_d, nonce_e)`: take SHA-256(`"estia pairing code v1"` ‖
+  `0x00` ‖ F (the 32 raw bytes of the fingerprint) ‖ nonce_d ‖ nonce_e),
+  read its first 8 bytes as a big-endian unsigned integer, take it modulo
+  1 000 000, and write it as 6 digits with leading zeros. It is shown as
+  `482 913` and typed as `482913` (spaces and dashes are ignored).
+- `confirm(F, nonce_d, nonce_e)`: the same, with the label `"estia pairing
+  confirm v1"`. The engine never sends it to the device: the operator reads
+  it from `estia pair approve` (or the approve route's answer) to the user.
+
+Known-answer vector (the Rust tests and `examples/python/estia_tls.py` check
+it):
+
+```text
+fingerprint   000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+device_nonce  202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
+engine_nonce  404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+commitment    71f9884a2523f984d667e49fff85b931cdaff466dc51fe953ca46436319974dd
+code          865695   (shown "865 695")
+confirm       452618   (shown "452 618")
+short         0001 0203 0405 0607
+```
+
+Why it works: the device commits to its nonce before it sees the engine's, and
+the engine's nonce is new for each request. Something in between that presents
+its own certificate holds two TLS sessions with two certificates, so the two
+codes are independent: it gets one guess in a million and cannot work one out
+in advance (when it picks the nonce it shows the device, it knows only the
+commitment). A code from the fingerprint alone would not do, because the
+certificate is public and long-lived: a look-alike could be ground offline.
+The device must show the code it computed, never one it was sent.
+
+Why both directions: the pairing code tells the engine what the device saw,
+but nothing tells the device what the engine saw. Something in between could
+answer the device's request and polls itself ("approved", with a token of its
+own making) without the engine ever approving anything. The confirmation code
+closes that: only the operator can read the engine's, and the device pins the
+certificate only when the one typed into it equals its own. An "approved"
+answer alone proves nothing to the device.
+
+The rules:
+
+- `commitment` is optional. A request over HTTPS without one is recorded with
+  `check: "none"`: a browser or curl, which cannot show a code, or a device
+  whose commitment something in between removed. Over plain HTTP from the
+  engine's own machine there is no certificate: `check: "plain"`, and a
+  commitment is ignored. `engine_nonce` is in the answer only for a
+  commitment that arrived over HTTPS.
+- Reveal: an unknown id is 404; a request with no commitment, a nonce that
+  does not match it, a request that is no longer pending, or an engine with
+  no certificate is 400; the same nonce again answers 200 (a retry after a
+  lost answer). The answer never carries either code.
+- `GET /engine/pairings` rows carry `check` (`code`, `waiting` (committed,
+  not revealed yet), `none` or `plain`), `code` (the engine's 6 digits, or
+  null) and, once approved, `confirm` (the confirmation code, or null), and
+  the list carries the engine's `tls`.
+- `POST /engine/pairings/{id}/approve` takes an optional body:
+  `{"code": "482913"}` for a `code` request, which needs it (a wrong one is a
+  400, "the code does not match: … deny the request"); `{"no_code": true}`
+  for a `none` request, which is refused without it (and the approver should
+  first compare the fingerprint the device shows, and deny the request if
+  the device shows a code); no body, or `{}`, for a `plain` request. A
+  `waiting` request is a 400 until the device has revealed; a code given for
+  a `none` or `plain` request is a 400 (the device in front of the operator
+  made another request); `code` and `no_code` together are a 400. The answer
+  carries `check`, `code`, `tls` and `confirm`: for a `code` request, the
+  confirmation code to read to the user.
+- The CLI applies the same rules and asks for the flag: `estia pair approve
+  <id> --code <code>`, or `--no-code` for a `none` request. It prints the
+  confirmation code.
 
 `scopes` defaults to `generate`, `embed`, `models:read`. Unknown scopes are
 refused with 400; a scope listed twice counts once.
@@ -607,10 +724,13 @@ that points to `estia token revoke`.
 [`examples/`](../examples/README.md) has runnable programs in shell, Python,
 JavaScript and Rust.
 
-- Any OpenAI SDK: set the base URL to `http://<host>:27200/v1` and the API key
-  to the token.
+- Any OpenAI SDK: set the base URL to `https://<host>:27200/v1` (on the
+  engine's own machine, `http://127.0.0.1:27200/v1`) and the API key to the
+  token, and give the SDK's HTTP client the pin
+  ([building-clients.md](building-clients.md#pinning-the-engines-certificate)).
 - Rust: `estia_engine::RemoteEngine`, with `RemoteGen` and `RemoteEmbed`,
   talks to a daemon through the `/engine/*` routes with the same method shapes
-  as local sessions.
+  as local sessions; `RemoteEngine::connect` pins the certificate, and
+  `estia_engine::begin_pairing` does the whole pairing above.
 - Browser: `/client`, source in `server/client/index.html`, uses only the
   routes above.

@@ -26,9 +26,14 @@ breaking changes before 1.0.
   run end to end only on an Apple Silicon Mac, with two small test models; it
   has not yet run the Gemma 4 GGUF files, and on Linux it has run only in CI
   (the adapter's tests, on Ubuntu x64). Estia does not build for Windows yet.
-- **No TLS.** LAN traffic is plain HTTP, including bearer tokens, prompts and
-  outputs. That is fine on a home network you control. Do not serve the LAN on
-  shared or public Wi-Fi.
+- **TLS on the LAN, with a certificate of its own.** A LAN engine serves HTTPS
+  with a self-signed certificate that each device pins when it pairs; two
+  6-digit codes, one typed on each side, prove the device saw the engine's
+  real certificate and the approval came from the engine. Loopback stays
+  plain HTTP. Browsers show a certificate warning
+  you accept by hand, after comparing the fingerprint (see
+  [Using it from other devices](#using-it-from-other-devices)). Devices
+  paired with 0.4 over plain HTTP must pair again.
 - **One machine, tokens only.** One engine runs on one machine. Access is by
   bearer token with scopes. There are no user accounts.
 - **A fixed model list, plus your own GGUF files.** The registry knows three
@@ -206,11 +211,13 @@ To check a running engine, give the smoke test a token with the scopes
 (umask 077 && estia token new smoke --scopes generate,embed,models:read > ~/.estia-smoke-token)
 scripts/smoke-test.sh --token-file ~/.estia-smoke-token            # 12 checks
 scripts/smoke-test.sh --token-file ~/.estia-smoke-token --quick    # health, one chat, one embedding
-scripts/smoke-test.sh --url http://192.168.1.20:27200 --token-file ~/.estia-token        # an engine on another machine, with a paired token
+scripts/smoke-test.sh --url https://192.168.1.20:27200 --pinnedpubkey 'sha256//…' --token-file ~/.estia-token   # an engine on another machine
 ```
 
 It needs only bash, curl and python3, prints PASS, FAIL or SKIP with the time
-each check took, and exits 1 if any check failed.
+each check took, and exits 1 if any check failed. For an engine on another
+machine, `--pinnedpubkey` is the `curl` line `estia tls fingerprint` prints on
+the engine's machine.
 
 `estia --version` and `estia version` say which build you are running;
 `/engine/health` reports the build of a running engine. Put the output of
@@ -365,9 +372,31 @@ estia serve --lan              # or: estia service install
 estia status                   # prints the URL other devices should use
 ```
 
-`--lan` binds `0.0.0.0` and advertises the engine over Bonjour. Authentication
-stays on: every route except health, pairing and `/client` needs a token, and
-`--no-auth` is refused on any non-loopback bind, so a LAN server always requires a token.
+`--lan` binds `0.0.0.0`, serves HTTPS and advertises the engine over Bonjour.
+Authentication stays on: every route except health, pairing and `/client`
+needs a token, and `--no-auth` is refused on any non-loopback bind, so a LAN
+server always requires a token.
+
+On the first LAN start the engine makes its own certificate (ECDSA P-256,
+self-signed) and keeps it in `tls/` in the data directory. It serves HTTPS and
+plain HTTP on the same port and tells them apart by a connection's first
+byte: HTTPS for everyone, plain HTTP for programs on this machine only
+(`http://127.0.0.1:27200` keeps working). Plain HTTP from another device gets
+a 400 of type `https_required` (or, for `/client`, a redirect to `https://`).
+
+```bash
+estia tls fingerprint          # what devices pin, its short form, curl's pin
+estia tls rotate --yes         # a new certificate: every paired device must pair again
+```
+
+Nothing vouches for the certificate, so each device pins it: it trusts exactly
+the certificate with that SHA-256 fingerprint. Pairing gives the device the
+fingerprint along with its token and proves it is the engine's (next
+section). The certificate is kept when the machine's address or name changes,
+and when it expires (pinned devices ignore its dates); only `estia tls
+rotate` replaces it. It is valid for 820 days, because Apple's TLS stack
+(Safari on `/client`) refuses a server certificate valid for longer than 825;
+browsers and Node see it expire after that.
 
 Devices must reach the engine by its IP address, by `<hostname>.local`, or by
 this machine's own hostname. Any other name in the `Host` header gets a 403
@@ -391,42 +420,87 @@ for a token with `generate` and `embed` (`POST /engine/local-token`, see
 A device asks for a token and names the scopes it wants. You approve the
 request on the engine's machine. The device then collects its token, once.
 
-From a browser on the device, open <http://192.168.1.20:27200/client>, enter a
-name, tick the scopes and press **Request pairing**. The page shows a pairing
-id and picks up the token when you approve it.
-
 From a terminal on the device:
 
 ```bash
-estia pair request --engine http://192.168.1.20:27200 --name laptop --scopes generate,embed,models:read
+estia pair request --engine https://192.168.1.20:27200 --name laptop --scopes generate,embed,models:read
 ```
 
-It prints the pairing id, waits up to 290 s (`--wait-seconds`; the engine
-drops an undecided request after 5 minutes), and prints
-the token when the request is approved.
+```text
+engine certificate 3f2a 9c41 7b0e d512 (not trusted yet: the codes check it)
+pairing request `772ca7c0bf6ada4b` sent as `laptop`.
 
-With curl only:
+    code: 482 913
+
+on the engine's machine, the operator runs:
+  estia pair approve 772ca7c0bf6ada4b --code 482913
+It prints a confirmation code: type that here when asked.
+```
+
+Approve on the engine's machine, typing the code the device shows:
 
 ```bash
-curl -s -X POST http://192.168.1.20:27200/engine/pair \
+estia pair list                                        # ID, STATUS, CODE, SCOPES, FROM, NAME
+estia pair approve 772ca7c0bf6ada4b --code 482913      # or: estia pair deny 772ca7c0bf6ada4b
+```
+
+```text
+approved 772ca7c0bf6ada4b with scopes [generate,embed,models:read] from 192.168.1.31, name `laptop`, the code matched — …
+
+    confirmation code: 452 618
+
+on the device, type this code to finish pairing: the device checks it before it trusts this engine
+```
+
+Type the confirmation code on the device when it asks. It then prints the
+token on stdout (`--json` prints `{url, name, scopes, token, pin}` instead)
+and the certificate fingerprint to pin on stderr. It waits up to 290 s for the
+approval (`--wait-seconds`; the engine drops an undecided request after 5
+minutes).
+
+The two codes are how the device and the engine prove to each other which
+certificate each used. The device commits to a random number before it learns
+the engine's; both ends then compute both codes from the certificate
+fingerprint they each used and the two numbers. The engine approves only when
+the code you type equals its own, and the device trusts the engine only when
+the confirmation code you type there equals its own. If the engine says the
+code does not match, or the device says the confirmation code does not,
+something between the device and the engine answered with its own
+certificate: deny the request, and cancel on the device.
+
+From a browser on the device, open <https://192.168.1.20:27200/client>. The
+browser warns that it does not know the certificate. Open the certificate
+details (the warning page, or the padlock), compare its SHA-256 fingerprint
+with `estia tls fingerprint` on the engine's machine, and accept it only if
+they match. Then enter a name, tick the scopes and press **Request pairing**.
+A page cannot show a pairing code, so approve it with `estia pair approve <id>
+--no-code`, which says what you checked. Never use `--no-code` for a device
+that shows a code: its request reached the engine without one, so something
+in between removed it. Deny it.
+
+With curl only (`-k --pinnedpubkey` checks the engine's key instead of a
+chain; the value is the `curl` line of `estia tls fingerprint`):
+
+```bash
+PIN='sha256//KcRfPaV4WCo5XHv9YWvSNn/ZDixnWYjJSznFuOON8mk='
+curl -s -k --pinnedpubkey "$PIN" -X POST https://192.168.1.20:27200/engine/pair \
   -H 'Content-Type: application/json' \
   -d '{"name": "laptop", "scopes": ["generate", "embed", "models:read"]}'
-# {"id":"772ca7c0bf6ada4b","status":"pending","expires_in":300,...}
+# {"id":"772ca7c0bf6ada4b","status":"pending","check":"none",...}
 
-curl -s http://192.168.1.20:27200/engine/pair/772ca7c0bf6ada4b
+curl -s -k --pinnedpubkey "$PIN" https://192.168.1.20:27200/engine/pair/772ca7c0bf6ada4b
 # poll until "status":"approved"; that response carries the token, once
 ```
 
-Approve on the engine's machine:
-
-```bash
-estia pair list                         # ID, STATUS, SCOPES, FROM, NAME
-estia pair approve 772ca7c0bf6ada4b     # or: estia pair deny 772ca7c0bf6ada4b
-```
+curl sends no commitment, so it has no code either (`--no-code`). The
+commitment, the reveal and the code are described in
+[docs/api.md](docs/api.md#pairing).
 
 A client holding an `admin` token can approve from anywhere: with
-`estia pair approve <id> --engine http://192.168.1.20:27200 --token <admin token>`,
-from the Admin tab of `/client`, or with `POST /engine/pairings/<id>/approve`.
+`estia pair approve <id> --code <code> --engine https://192.168.1.20:27200 --token <admin token> --pin <fingerprint>`,
+from the Admin tab of `/client`, or with `POST /engine/pairings/<id>/approve`
+and `{"code": "482913"}` (`{"no_code": true}` for a browser or curl). Each
+shows the confirmation code to type into the device.
 
 Read the requested scopes before you approve. A device can ask for `admin`,
 which is full control of the engine. `estia pair approve` refuses such a
@@ -452,20 +526,37 @@ Limits on pairing requests, which anyone who can reach the port may send:
   from one address. Past either limit the engine answers 429 until a request is
   decided or expires.
 
-The paired device then uses the engine like a local one:
+The paired device then uses the engine like a local one, pinning its
+certificate:
 
 ```bash
-estia remote-check --engine http://192.168.1.20:27200 --token <token>
+estia remote-check --engine https://192.168.1.20:27200 --token <token> --pin <fingerprint>   # or ESTIA_PIN
 ```
 
 ```python
-client = OpenAI(base_url="http://192.168.1.20:27200/v1", api_key="<token>")
+import estia_tls  # examples/python/estia_tls.py, standard library only; ESTIA_PIN=<fingerprint>
+URL = "https://192.168.1.20:27200"
+client = OpenAI(base_url=f"{URL}/v1", api_key="<token>", http_client=estia_tls.openai_http_client(URL))
 ```
+
+[docs/building-clients.md](docs/building-clients.md#pinning-the-engines-certificate)
+shows the same for Rust, Node and curl. A device that pinned a certificate
+refuses any other at the same address before it sends its token. After
+`estia tls rotate` every device must pair again. A token given to a device by
+hand (`estia token new`) needs the fingerprint too: the command prints it.
+
+Upgrading from 0.4: devices paired over plain HTTP get `https_required` from
+the engine. Pair each one again over `https://`, then revoke its old token
+(`estia token list`, `estia token revoke pair:<name>:<id>`): it crossed the
+network in clear.
 
 ### Discovery
 
 A LAN engine advertises the Bonjour service `_estia._tcp` with TXT keys
-`api_version`, `engine_version` and `protocol_version`. The instance name is
+`api_version`, `engine_version`, `protocol_version`, `tls` (`1`) and `fp` (its
+certificate's fingerprint). `fp` is a claim anyone on the LAN could make: an
+app compares it with a pin it already holds (to find its engine at a new
+address), and pins only what pairing proved. The instance name is
 the machine's short hostname; change it with `serve --name`, or turn
 advertising off with `--no-advertise`.
 
@@ -716,12 +807,13 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | `serve` | Run the server in the foreground (`--lan`, `--port`, `--bind`, `--allow-host`, `--name`, `--no-advertise`, `--idle-unload-minutes`, `--memory-budget`, `--no-auth`, `--max-body-bytes`, `--log-level`, `--log-format`) |
 | `recommend [--apply] [--json]` | This machine's memory tier and budget, which models fit, and the role bindings to use; `--apply` sets them |
 | `status` | Data directory, runtime, runner, machine and memory policy, installed models, roles, running server, pending pairings, service |
-| `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--once` for one snapshot) |
-| `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one |
-| `pair list`, `pair approve <id> [--allow-admin]`, `pair deny <id>` | Decide pairing requests; add `--engine` and `--token` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
-| `pair request --engine <url>` | Ask an engine for a token and wait for approval |
-| `discover` | Find engines on the LAN |
-| `remote-check --engine <url>` | Health, one generation and one embedding against a server |
+| `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--pin` for an `https://` `--engine`, `--once` for one snapshot) |
+| `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one. `new` also prints the certificate fingerprint a LAN device needs |
+| `pair list`, `pair approve <id> [--code <code> \| --no-code] [--allow-admin]`, `pair deny <id>` | Decide pairing requests; `list` shows each request's code. Approve with the code the device shows (`--no-code` for a browser or curl); it prints the confirmation code to type into the device. Add `--engine`, `--token` and `--pin` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
+| `pair request --engine <url> [--json]` | Ask an engine for a token, show the pairing code, wait for approval, ask for the confirmation code `pair approve` printed; then prints the token and the certificate fingerprint to pin |
+| `tls fingerprint [--json]`, `tls rotate [--yes]` | The engine's certificate: its fingerprint, short form and curl pin; make a new one (every paired device must pair again) |
+| `discover` | Find engines on the LAN, with the certificate each advertises (unverified) |
+| `remote-check --engine <url> [--pin]` | Health, one generation and one embedding against a server; `--pin` (`ESTIA_PIN`) for `https://` |
 | `models`, `pull <id>`, `rm <id>` | List, download and remove models; `pull` takes an artifact id, or a family, role or embedding model id for the running backend's artifact |
 | `import <file.gguf> [--id] [--kind] [--family] [--ctx] [--dims] [--link] [--replace]` | Register a GGUF file of your own (llama.cpp backend) |
 | `roles`, `roles set <role> <family>`, `roles rm <role>` | Show and change role bindings |
@@ -761,7 +853,8 @@ directory answers.
 | `tokens.json` | Token names, SHA-256 hashes of the tokens, scopes, creation times |
 | `pairings.json` | Recent pairing requests |
 | `tokens.lock`, `pairings.lock` | Empty lock files that keep the server and the CLI from writing those two files at the same time |
-| `engine.json` | PID, address and port of the running server; removed when it exits cleanly |
+| `engine.json` | PID, address and port of the running server, and whether it serves TLS; removed when it exits cleanly |
+| `tls/` | Mode 0700. `cert.pem` and `key.pem` (both 0600): the certificate a LAN engine serves and devices pin, made on the first LAN start and replaced only by `estia tls rotate` |
 | `local-access.secret` | Mode 0600. The secret an app on this machine trades for a token; new on every start, removed on a clean exit |
 | `engine/` | The copy of the binary and runner scripts that the service runs |
 | `logs/` | `estia.err.log` (the log) and `estia.out.log` (normally empty) from the launchd service |
@@ -778,6 +871,7 @@ directory answers.
 | `ESTIA_LLAMA_ARGS` | Extra `llama-server` arguments, split on spaces (`-ngl 0`) |
 | `ESTIA_LLAMA_VARIANT` | The llama.cpp build `runtime install` picks: `cpu`, `metal`, `vulkan`, `cuda-12`, `cuda-13`, `rocm` |
 | `ESTIA_ALLOWED_HOSTS` | Extra `Host` names the server answers to, comma-separated (same syntax as `serve --allow-host`) |
+| `ESTIA_PIN` | The certificate fingerprint of an `https://` engine, for `remote-check`, `dashboard` and `pair … --engine` (same as `--pin`), and for the examples |
 | `ESTIA_MAX_BODY_BYTES` | Largest request body the server accepts, in bytes (default 33554432, 32 MiB; `serve --max-body-bytes` wins over it). A larger body gets a 413. For the service, use `service install --max-body-bytes`: the service does not see your shell's environment. |
 | `ESTIA_MEMORY_BUDGET` | Memory budget for resident models: `8GB`, `6144MB` or `off` (`serve --memory-budget` wins over it). See [Memory](#memory). |
 | `ESTIA_DEVICE_TIER` | `constrained`, `standard` or `capable`, whatever was detected. A testing aid. |
@@ -850,17 +944,25 @@ the crates in your own program.
   collects it, then it is removed. Denying an approved pairing revokes its
   token. Whoever can write the data directory can approve pairings and mint
   tokens.
-- **No TLS.** Tokens, prompts and outputs cross the network unencrypted. Serve
-  the LAN only on a network you trust. For anything else, keep the server on
-  loopback and reach it through a tunnel you trust, such as SSH port
-  forwarding.
+- **TLS on the LAN.** A LAN engine serves HTTPS with its own certificate, so
+  tokens, prompts and outputs from other devices cross the network
+  encrypted. Plain HTTP is served to programs on the engine's own machine
+  only; from another device it is refused before any handler runs. Each
+  device pins the certificate's SHA-256 fingerprint, learnt by pairing, where
+  two 6-digit codes prove it both ways: one the operator types on the engine
+  (the device saw the engine's own certificate, not an interceptor's) and one
+  typed on the device (the approval came from the engine). Browsers and
+  devices given a token by hand compare the fingerprint by eye instead (trust
+  on first use). The key is in `tls/key.pem`, mode 0600.
+  [SECURITY.md](SECURITY.md) says what the codes do and do not prove.
 - **Limits, not rate limiting.** There is no per-client request rate limit.
   There are caps: 24 pending pairing requests, 4 from one address; 8192
   `max_tokens`; 256 inputs per embedding request; a 10-second limit to send a
   request's headers (which also closes idle keep-alive connections); 32 open
   connections per client address (loopback exempt); and a total connection cap
   kept below the open-files limit, which the server raises at start. The
-  server speaks HTTP/1.1 only.
+  10-second limit also covers a connection's first byte and its TLS
+  handshake. The server speaks HTTP/1.1 only.
 - **The browser client** keeps its token in the page's `localStorage`.
 - **llama-server is private.** Each `llama-server` listens on a UNIX socket in
   `<data dir>/run/` (mode 0700) and accepts only a random API key that its
@@ -894,7 +996,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | Crate | Path | What it holds |
 |---|---|---|
 | `estia-proto` | `proto/` | Wire types for the runner protocol |
-| `estia-engine` | `engine/` | Runner sessions (priority gate, cancel, deadlines, one respawn), one-shot runs, backends, the model registry, the Hugging Face downloader (resume, parallel chunks, SHA-256) and on-disk store, GGUF metadata and imports, the Python runtime installer (feature `python-mlx`) and the llama.cpp installer (feature `llama-runtime`), roles, structured output, and `RemoteEngine` for talking to a server from Rust |
+| `estia-engine` | `engine/` | Runner sessions (priority gate, cancel, deadlines, one respawn), one-shot runs, backends, the model registry, the Hugging Face downloader (resume, parallel chunks, SHA-256) and on-disk store, GGUF metadata and imports, the Python runtime installer (feature `python-mlx`) and the llama.cpp installer (feature `llama-runtime`), roles, structured output, and `RemoteEngine` for talking to a server from Rust (pinned HTTPS and pairing with feature `remote-tls`) |
 | `estia-llama` | `llama/` | The llama.cpp adapter: speaks the runner protocol on stdin and stdout and runs one `llama-server` per model. A library and a small `estia-llama` binary; the `estia` CLI runs it as `estia runner llama` |
 | `estia-server` | `server/` | The axum server: `/v1/*`, `/engine/*`, tokens, pairing, Bonjour |
 | `estia` | `cli/` | The `estia` binary |

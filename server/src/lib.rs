@@ -14,6 +14,11 @@
 //! `engine.json` in the data directory records where it bound, and a second
 //! `serve` refuses when that port answers.
 //!
+//! A non-loopback bind serves HTTPS with the engine's own certificate
+//! ([`tls`]), which devices pin when they pair; plain HTTP stays, on the same
+//! port, for peers on this machine only. Plain HTTP from another device is
+//! refused with `https_required` before any handler runs.
+//!
 //! In front of auth sits a DNS-rebinding guard ([`HostPolicy`]): a request is
 //! served only when its `Host` is an IP literal, `localhost`, a `.local` name,
 //! this machine's hostname or a name the operator allowed, and a state-changing
@@ -30,6 +35,7 @@ pub mod jobs;
 pub mod local_access;
 pub mod openai;
 pub mod pairing;
+pub mod tls;
 pub mod tokens;
 pub mod toolcalls;
 
@@ -45,6 +51,7 @@ use axum::{
 use estia_engine::machine::{self, MemoryPolicy};
 use estia_engine::models::embed::EmbedModel;
 use estia_engine::models::{Artifact, ResolveError};
+use estia_engine::tls::Fingerprint;
 use estia_engine::{Backend, EmbedSession, Engine, EngineError, GenSession};
 use jobs::JobTable;
 use serde::Serialize;
@@ -99,6 +106,10 @@ pub struct AppState {
     /// The secret a same-user app on this machine trades for a token
     /// ([`local_access`]); `None` until [`serve`] publishes one.
     local_secret: RwLock<Option<String>>,
+    /// The fingerprint of the certificate this engine serves; `None` for a
+    /// loopback-only engine. Shown in `/engine/health` and pairing answers, and
+    /// what pairing codes are computed from.
+    tls: RwLock<Option<Fingerprint>>,
 }
 
 /// Default cap on a request body: 32 MiB, room for a full embed batch
@@ -244,7 +255,18 @@ impl AppState {
             memory: RwLock::new(engine_memory),
             load_gate: Mutex::new(()),
             local_secret: RwLock::new(None),
+            tls: RwLock::new(None),
         }
+    }
+
+    /// The certificate this engine serves ([`serve`] sets it on a LAN bind;
+    /// tests that run [`serve_router_tls`] set it themselves).
+    pub fn set_tls(&self, fingerprint: Option<Fingerprint>) {
+        *self.tls.write().unwrap_or_else(|e| e.into_inner()) = fingerprint;
+    }
+
+    pub fn tls_fingerprint(&self) -> Option<Fingerprint> {
+        *self.tls.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Accept `secret` on `POST /engine/local-token` ([`local_access`]).
@@ -1035,6 +1057,69 @@ async fn json_rejections(State(state): State<Arc<AppState>>, req: Request<Body>,
     ApiError { status, kind: "invalid_request_error", message }.into_response()
 }
 
+/// Plain HTTP from another device ([`tls::Transport::PlainRefused`]) is
+/// answered here, before auth or any handler: a 307 to `https://` for the
+/// browser page, and for everything else a 400 of type `https_required` that
+/// says what to do. 400 follows nginx's answer to plain HTTP on a TLS port; 426
+/// would promise an in-band upgrade the engine does not offer. Whatever the
+/// request carried (a token, a prompt) has crossed the network in clear
+/// already; nothing in it is acted on, but a valid token in it is named in a
+/// warning ([`warn_token_in_clear`]) so the operator can revoke it.
+async fn https_only(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
+    if req.extensions().get::<tls::Transport>() != Some(&tls::Transport::PlainRefused) {
+        return next.run(req).await;
+    }
+    let bearer = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|b| b.strip_prefix("Bearer "));
+    if let Some(record) = bearer.map(str::trim).filter(|t| !t.is_empty()).and_then(|t| state.tokens.verify(t)) {
+        let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
+        warn_token_in_clear(&record.name, peer);
+    }
+    // The Host was checked by `host_guard`, outside this step.
+    let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let path = req.uri().path();
+    if let Some(a) = access::Access::current() {
+        a.refused("plain HTTP from another device".to_string());
+    }
+    if matches!(*req.method(), Method::GET | Method::HEAD) && matches!(path, "/" | "/client" | "/client/") && !host.is_empty() {
+        // Temporary, so a browser does not remember it.
+        return axum::response::Redirect::temporary(&format!("https://{host}/client")).into_response();
+    }
+    let shown = if host.is_empty() { "<this engine>".to_string() } else { host };
+    let mut res = ApiError {
+        status: StatusCode::BAD_REQUEST,
+        kind: "https_required",
+        message: format!(
+            "this engine serves other devices over HTTPS only: use https://{shown} and pair again so your app pins the \
+             engine's certificate"
+        ),
+    }
+    .into_response();
+    res.headers_mut().insert(header::CONNECTION, header::HeaderValue::from_static("close"));
+    res
+}
+
+/// A valid token arrived over plain HTTP from another device: anyone on the
+/// network could read it. Not revoked here (the engine cannot tell the
+/// operator's intent), but named, at most once every ten minutes per token,
+/// so the operator can revoke it and pair that device again over HTTPS.
+fn warn_token_in_clear(token_name: &str, peer: Option<std::net::IpAddr>) {
+    static SEEN: std::sync::OnceLock<Mutex<HashMap<String, Instant>>> = std::sync::OnceLock::new();
+    let mut seen = lock(SEEN.get_or_init(Mutex::default));
+    if seen.get(token_name).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(600)) {
+        return;
+    }
+    if seen.len() >= 1024 {
+        seen.clear();
+    }
+    seen.insert(token_name.to_string(), Instant::now());
+    tracing::warn!(
+        token_name,
+        peer = peer.map(tracing::field::display),
+        "a valid token arrived over plain HTTP from another device, so it crossed the network in clear: revoke it \
+         (estia token revoke <name>) and pair that device again over https"
+    );
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let max_body = state.max_body_bytes();
     Router::new()
@@ -1055,6 +1140,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/engine/pair", post(engine_api::pair_request))
         .route("/engine/local-token", post(engine_api::local_token))
         .route("/engine/pair/:id", get(engine_api::pair_poll))
+        .route("/engine/pair/:id/reveal", post(engine_api::pair_reveal))
         .route("/engine/pairings", get(engine_api::list_pairings))
         .route("/engine/pairings/:id/approve", post(engine_api::approve_pairing))
         .route("/engine/pairings/:id/deny", post(engine_api::deny_pairing))
@@ -1071,6 +1157,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .fallback(no_route)
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), json_rejections))
+        // Inside the Host guard, so the refusal names a checked Host; outside
+        // auth, so a token sent in clear is never looked at.
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), https_only))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), host_guard))
         // Outermost: request ids and the access log see every request,
         // including the ones the guards refuse and unknown paths.
@@ -1086,6 +1175,9 @@ pub struct EngineRecord {
     pub bind: String,
     pub started_unix: u64,
     pub api_version: u32,
+    /// It serves HTTPS to other devices (a LAN bind); loopback stays plain.
+    #[serde(default)]
+    pub tls: bool,
 }
 
 pub fn engine_record_path(data_dir: &std::path::Path) -> PathBuf {
@@ -1156,13 +1248,21 @@ fn hostname() -> String {
 
 pub use estia_engine::discovery::lan_ipv4_addresses;
 
-/// The TXT record every registration path publishes.
-fn advert_props() -> Vec<(&'static str, String)> {
-    vec![
+/// The TXT record every registration path publishes. An engine serving HTTPS
+/// adds `tls=1` and its certificate's fingerprint (`fp`, one string of 67
+/// bytes): a hint for clients, never a basis for trust (see
+/// [`estia_engine::discovery`]).
+fn advert_props(tls: Option<&Fingerprint>) -> Vec<(&'static str, String)> {
+    let mut props = vec![
         ("api_version", API_VERSION.to_string()),
         ("engine_version", env!("CARGO_PKG_VERSION").to_string()),
         ("protocol_version", estia_engine::proto::PROTOCOL_VERSION.to_string()),
-    ]
+    ];
+    if let Some(fp) = tls {
+        props.push(("tls", "1".to_string()));
+        props.push(("fp", fp.to_hex()));
+    }
+    props
 }
 
 /// Who is doing the multicast for us.
@@ -1209,10 +1309,10 @@ impl Registration {
 /// It also buys correct conflict resolution and re-announcement on wake, which
 /// our own sockets did not survive.
 #[cfg(target_os = "macos")]
-fn register_via_dns_sd(port: u16, instance: &str) -> anyhow::Result<std::process::Child> {
+fn register_via_dns_sd(port: u16, instance: &str, props: &[(&'static str, String)]) -> anyhow::Result<std::process::Child> {
     let ty = MDNS_SERVICE_TYPE.trim_end_matches(".local.");
     let mut args: Vec<String> = vec!["-R".into(), instance.into(), ty.into(), "local.".into(), port.to_string()];
-    args.extend(advert_props().into_iter().map(|(k, v)| format!("{k}={v}")));
+    args.extend(props.iter().map(|(k, v)| format!("{k}={v}")));
     // The registration lives exactly as long as this process; nothing is read back.
     let mut child = spawn_tethered("dns-sd", &args)?;
     // `dns-sd` exits immediately on a bad type or a missing responder; give it
@@ -1278,10 +1378,10 @@ fn stop_tethered(mut child: std::process::Child) {
 }
 
 /// Register the mDNS advertisement with our own multicast sockets.
-fn register_via_mdns_sd(port: u16, instance: &str) -> anyhow::Result<mdns_sd::ServiceDaemon> {
+fn register_via_mdns_sd(port: u16, instance: &str, props: &[(&'static str, String)]) -> anyhow::Result<mdns_sd::ServiceDaemon> {
     let mdns = mdns_sd::ServiceDaemon::new()?;
     let host = hostname();
-    let props: std::collections::HashMap<String, String> = advert_props().into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let props: std::collections::HashMap<String, String> = props.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
     // addr_auto only. Registering explicit IPv4 addresses (alone or alongside
     // addr_auto) made the instance invisible to both the mdns-sd browser and
     // the system resolver on macOS; addr_auto is announced fine, it just
@@ -1292,10 +1392,10 @@ fn register_via_mdns_sd(port: u16, instance: &str) -> anyhow::Result<mdns_sd::Se
     Ok(mdns)
 }
 
-fn register(port: u16, instance: &str) -> anyhow::Result<Registration> {
+fn register(port: u16, instance: &str, props: &[(&'static str, String)]) -> anyhow::Result<Registration> {
     #[cfg(target_os = "macos")]
     {
-        match register_via_dns_sd(port, instance) {
+        match register_via_dns_sd(port, instance, props) {
             Ok(c) => {
                 tracing::debug!(instance = %instance, port, via = "dns-sd", "Bonjour registration");
                 return Ok(Registration::System(c));
@@ -1303,7 +1403,7 @@ fn register(port: u16, instance: &str) -> anyhow::Result<Registration> {
             Err(e) => tracing::warn!(error = %e, "registering via dns-sd failed; falling back to our own multicast sockets"),
         }
     }
-    let d = register_via_mdns_sd(port, instance)?;
+    let d = register_via_mdns_sd(port, instance, props)?;
     tracing::debug!(instance = %instance, port, via = "mdns-sd", "Bonjour registration");
     Ok(Registration::Rust(Box::new(d)))
 }
@@ -1332,6 +1432,8 @@ const SLEEP_SLOP: std::time::Duration = std::time::Duration::from_secs(10);
 struct Advertiser {
     port: u16,
     instance: String,
+    /// The TXT record ([`advert_props`]), published again on every rebuild.
+    props: Vec<(&'static str, String)>,
     reg: Option<Registration>,
     ips: Vec<std::net::Ipv4Addr>,
     at_mono: Instant,
@@ -1339,9 +1441,16 @@ struct Advertiser {
 }
 
 impl Advertiser {
-    fn start(port: u16, instance: String) -> anyhow::Result<Self> {
-        let mut a =
-            Advertiser { port, instance, reg: None, ips: Vec::new(), at_mono: Instant::now(), at_wall: std::time::SystemTime::now() };
+    fn start(port: u16, instance: String, props: Vec<(&'static str, String)>) -> anyhow::Result<Self> {
+        let mut a = Advertiser {
+            port,
+            instance,
+            props,
+            reg: None,
+            ips: Vec::new(),
+            at_mono: Instant::now(),
+            at_wall: std::time::SystemTime::now(),
+        };
         a.rebuild()?;
         Ok(a)
     }
@@ -1361,7 +1470,7 @@ impl Advertiser {
         if let Some(r) = self.reg.take() {
             r.stop();
         }
-        self.reg = Some(register(self.port, &self.instance)?);
+        self.reg = Some(register(self.port, &self.instance, &self.props)?);
         self.ips = lan_ipv4_addresses();
         self.at_mono = Instant::now();
         self.at_wall = std::time::SystemTime::now();
@@ -1427,7 +1536,7 @@ fn refresh_interval() -> std::time::Duration {
 }
 
 /// The test client: one static page, no build step, same origin as the API so
-/// a phone on the LAN opens `http://<host>:<port>/client` and nothing else.
+/// a phone on the LAN opens `https://<host>:<port>/client` and nothing else.
 async fn client_page() -> impl axum::response::IntoResponse {
     use axum::http::header;
     (
@@ -1554,8 +1663,24 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     if let Some(n) = opts.max_body_bytes {
         state.set_max_body_bytes(n);
     }
+    // A LAN bind serves HTTPS; the certificate is made on the first one and
+    // kept (see `tls`). Before binding, so a broken pair of files stops the
+    // start with its own message.
+    let identity = if tls::wants_tls(addr) { Some(tls::load_or_create(&data_dir)?) } else { None };
+    if let Some(id) = &identity {
+        state.set_tls(Some(id.fingerprint()));
+        if id.is_new() {
+            tracing::info!(
+                fingerprint = %id.fingerprint(),
+                short = %id.fingerprint().short(),
+                file = %tls::cert_path(&data_dir).display(),
+                "created a TLS certificate for this engine; devices pin it when they pair"
+            );
+        }
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
+    let scheme = if identity.is_some() { "https" } else { "http" };
     let idle_unload = match opts.idle_unload {
         Some(d) if d.is_zero() => None,
         Some(d) => Some(d),
@@ -1568,6 +1693,7 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         bind: bound.ip().to_string(),
         started_unix: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
         api_version: API_VERSION,
+        tls: identity.is_some(),
     };
     std::fs::create_dir_all(&data_dir)?;
     std::fs::write(engine_record_path(&data_dir), serde_json::to_string_pretty(&record)?)?;
@@ -1576,8 +1702,10 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         commit = %BUILD_COMMIT,
         api_version = API_VERSION,
         protocol_version = estia_engine::proto::PROTOCOL_VERSION,
-        url = %format!("http://{bound}"),
+        url = %format!("{scheme}://{bound}"),
         bind = %bound,
+        tls = identity.is_some(),
+        tls_fingerprint = %identity.as_ref().map(|i| i.fingerprint().to_hex()).unwrap_or_else(|| "-".into()),
         auth = state.require_auth,
         lan = opts.lan,
         advertise = opts.advertise && !bound.ip().is_loopback(),
@@ -1596,7 +1724,8 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
     );
     let advertiser = if opts.advertise && !bound.ip().is_loopback() {
         let instance = opts.name.clone().unwrap_or_else(hostname);
-        match Advertiser::start(bound.port(), instance.clone()) {
+        let fp = identity.as_ref().map(|i| i.fingerprint());
+        match Advertiser::start(bound.port(), instance.clone(), advert_props(fp.as_ref())) {
             Ok(a) => {
                 tracing::info!(service = MDNS_SERVICE_TYPE, instance = %instance, port = bound.port(), "advertising over Bonjour");
                 Some(Arc::new(std::sync::Mutex::new(Some(a))))
@@ -1645,7 +1774,10 @@ pub async fn serve(state: Arc<AppState>, data_dir: PathBuf, opts: ServeOptions) 
         Err(e) => tracing::warn!(error = %e, "could not write the local access secret; local apps must pair or use a token"),
     }
     let app = router(Arc::clone(&state));
-    let result = serve_router(listener, app, ConnLimits::default(), shutdown_signal()).await;
+    let result = match &identity {
+        Some(id) => serve_router_tls(listener, app, ConnLimits::default(), tls::TlsServe::new(id)?, shutdown_signal()).await,
+        None => serve_router(listener, app, ConnLimits::default(), shutdown_signal()).await,
+    };
     let loaded = state.loaded();
     local_access::withdraw(&data_dir);
     let _ = std::fs::remove_file(engine_record_path(&data_dir));
@@ -1785,19 +1917,76 @@ impl Drop for PeerSlot {
 /// and refused connections are logged (`warn`). On shutdown, in-flight
 /// requests get ten seconds; a long SSE stream does not hold the process
 /// hostage.
+///
+/// Plain HTTP only: for a loopback bind. [`serve_router_tls`] serves a LAN bind.
 pub async fn serve_router(
     listener: tokio::net::TcpListener,
     app: Router,
     limits: ConnLimits,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<()> {
+    serve_conns(listener, app, limits, None, shutdown).await
+}
+
+/// [`serve_router`] with HTTPS: each connection's first byte says whether it
+/// is a TLS handshake. TLS is served to everyone; plain HTTP only to loopback
+/// peers (unless [`tls::TlsServe::plain_from_loopback`] says otherwise), and
+/// from any other peer it reaches the router marked
+/// [`tls::Transport::PlainRefused`], which answers it with `https_required`.
+///
+/// The first byte and the handshake share one deadline, the request-head
+/// timeout, inside the connection's own task: a client that stalls in its
+/// handshake holds its per-peer slot and its share of the total while it
+/// does, so the same caps bound it, and `accept` never waits on it.
+pub async fn serve_router_tls(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ConnLimits,
+    tls: tls::TlsServe,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
+    serve_conns(listener, app, limits, Some(tls), shutdown).await
+}
+
+/// Handshakes clients refused (a device that pinned another certificate, a
+/// browser that has not accepted this one), logged at most every 10 s.
+#[derive(Default)]
+struct HandshakeRefusals {
+    since_log: u64,
+    last_log: Option<Instant>,
+}
+
+impl HandshakeRefusals {
+    fn note(&mut self, peer: std::net::IpAddr, alert: &str) {
+        self.since_log += 1;
+        if self.last_log.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+            tracing::info!(
+                peer = %peer,
+                alert = %alert,
+                refused = self.since_log,
+                "a client refused this engine's certificate (a device paired before `estia tls rotate` must pair again)"
+            );
+            self.since_log = 0;
+            self.last_log = Some(Instant::now());
+        }
+    }
+}
+
+async fn serve_conns(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ConnLimits,
+    tls: Option<tls::TlsServe>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> std::io::Result<()> {
     use tower_service::Service as _;
     let soft = raise_fd_limit();
     let total = limits.total.unwrap_or_else(|| soft.saturating_sub(FD_HEADROOM).clamp(16, 4_096) as usize);
-    tracing::debug!(open_files = soft, max_connections = total, per_client = limits.per_peer, "connection limits");
+    tracing::debug!(open_files = soft, max_connections = total, per_client = limits.per_peer, tls = tls.is_some(), "connection limits");
     // A client over its connection cap is logged at most every 10 s, with a count.
     let mut refused_since_log: u64 = 0;
     let mut last_refusal_log: Option<Instant> = None;
+    let refusals = Arc::new(Mutex::new(HandshakeRefusals::default()));
     let budget = Arc::new(tokio::sync::Semaphore::new(total));
     let peers: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> = Arc::default();
     let mut http = hyper::server::conn::http1::Builder::new();
@@ -1840,10 +2029,28 @@ pub async fn serve_router(
         };
         let _ = stream.set_nodelay(true);
         let svc = make.call(peer).await.unwrap_or_else(|e| match e {});
-        let conn = http.serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(svc));
-        let conn = graceful.watch(conn);
+        let (http, watcher, tls, refusals) = (http.clone(), graceful.watcher(), tls.clone(), Arc::clone(&refusals));
+        let deadline = tokio::time::Instant::now() + limits.header_read_timeout;
         tokio::spawn(async move {
-            let _ = conn.await;
+            match tls {
+                // No TLS on this server: every request is plain, unmarked.
+                None => serve_one(&http, watcher, stream, svc, None).await,
+                Some(tls) => match first_byte(&stream, deadline).await {
+                    Some(0x16) => match tokio::time::timeout_at(deadline, tls.acceptor.accept(stream)).await {
+                        Ok(Ok(tls_stream)) => serve_one(&http, watcher, tls_stream, svc, Some(tls::Transport::Tls)).await,
+                        Ok(Err(e)) => match received_alert(&e) {
+                            Some(alert) => lock(&refusals).note(peer.ip(), &alert),
+                            None => tracing::debug!(peer = %peer.ip(), error = %e, "TLS handshake failed"),
+                        },
+                        Err(_) => tracing::debug!(peer = %peer.ip(), "TLS handshake timed out"),
+                    },
+                    Some(_) => {
+                        let t = if tls.plain_allowed(peer.ip()) { tls::Transport::Plain } else { tls::Transport::PlainRefused };
+                        serve_one(&http, watcher, stream, svc, Some(t)).await
+                    }
+                    None => tracing::debug!(peer = %peer.ip(), "connection closed or silent before its first byte"),
+                },
+            }
             drop(slot);
             drop(permit);
         });
@@ -1854,6 +2061,51 @@ pub async fn serve_router(
         tracing::warn!("requests still in flight after 10 s; closing them");
     }
     Ok(())
+}
+
+/// The connection's first byte, without consuming it; `None` when the peer
+/// closes, errs or sends nothing before `deadline`.
+async fn first_byte(stream: &tokio::net::TcpStream, deadline: tokio::time::Instant) -> Option<u8> {
+    let mut b = [0u8; 1];
+    match tokio::time::timeout_at(deadline, stream.peek(&mut b)).await {
+        Ok(Ok(1)) => Some(b[0]),
+        _ => None,
+    }
+}
+
+/// The alert a client sent to end a handshake (it refused the certificate),
+/// as text; `None` for any other failure.
+fn received_alert(e: &std::io::Error) -> Option<String> {
+    match e.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::AlertReceived(alert) => Some(format!("{alert:?}")),
+        _ => None,
+    }
+}
+
+/// Serve one connection with hyper, marking each request with how it arrived.
+async fn serve_one<I, S>(
+    http: &hyper::server::conn::http1::Builder,
+    watcher: hyper_util::server::graceful::Watcher,
+    io: I,
+    svc: S,
+    transport: Option<tls::Transport>,
+) where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tower_service::Service<axum::http::Request<hyper::body::Incoming>, Response = Response, Error = std::convert::Infallible>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    use tower::ServiceExt as _;
+    let svc = svc.map_request(move |mut req: axum::http::Request<hyper::body::Incoming>| {
+        if let Some(t) = transport {
+            req.extensions_mut().insert(t);
+        }
+        req
+    });
+    let conn = http.serve_connection(hyper_util::rt::TokioIo::new(io), hyper_util::service::TowerToHyperService::new(svc));
+    let _ = watcher.watch(conn).await;
 }
 
 /// Ctrl-C, or SIGTERM from launchd/systemd.
@@ -2023,6 +2275,19 @@ mod host_guard_tests {
 mod advert_tests {
     use super::*;
 
+    /// An engine serving HTTPS says so, with its certificate's fingerprint.
+    #[test]
+    fn tls_engines_advertise_their_fingerprint() {
+        let plain = advert_props(None);
+        assert!(!plain.iter().any(|(k, _)| *k == "tls" || *k == "fp"), "{plain:?}");
+        let fp = Fingerprint::of_certificate(b"engine");
+        let props = advert_props(Some(&fp));
+        assert!(props.contains(&("tls", "1".to_string())), "{props:?}");
+        assert!(props.contains(&("fp", fp.to_hex())), "{props:?}");
+        // One TXT string must stay under 255 bytes.
+        assert!(props.iter().all(|(k, v)| k.len() + 1 + v.len() < 255));
+    }
+
     /// The heartbeat is what keeps a long-lived daemon discoverable, so a
     /// misparsed override would quietly disable the whole repair.
     #[test]
@@ -2044,13 +2309,17 @@ mod advert_tests {
     #[test]
     #[ignore]
     fn advertised_engine_is_discoverable() {
-        let a = Advertiser::start(27299, "estia-test-probe".to_string()).expect("register");
+        let fp = Fingerprint::of_certificate(b"probe certificate");
+        let a = Advertiser::start(27299, "estia-test-probe".to_string(), advert_props(Some(&fp))).expect("register");
         std::thread::sleep(std::time::Duration::from_secs(1));
         let found = discover(std::time::Duration::from_secs(5)).expect("browse");
         a.stop();
         let probe = found.iter().find(|d| d.name == "estia-test-probe");
         let probe = probe.unwrap_or_else(|| panic!("probe not discovered: {found:?}"));
         assert_eq!(probe.port, 27299);
+        assert!(probe.tls, "tls=1 in the TXT record: {probe:?}");
+        assert!(probe.fingerprint.is_some_and(|f| f.matches(&fp)), "fp in the TXT record: {probe:?}");
+        assert!(probe.url().is_some_and(|u| u.starts_with("https://")));
         assert!(probe.addresses.iter().any(|a| a.parse::<std::net::Ipv4Addr>().is_ok()), "no IPv4 address to connect to: {probe:?}");
     }
 
@@ -2062,7 +2331,7 @@ mod advert_tests {
     #[ignore]
     #[cfg(target_os = "macos")]
     fn dns_sd_sees_an_advertised_engine() {
-        let a = Advertiser::start(27298, "estia-test-probe".to_string()).expect("register");
+        let a = Advertiser::start(27298, "estia-test-probe".to_string(), advert_props(None)).expect("register");
         std::thread::sleep(std::time::Duration::from_secs(2));
         let found = estia_engine::discovery::discover_via_dns_sd(std::time::Duration::from_secs(4));
         a.stop();
@@ -2075,7 +2344,7 @@ mod engine_record_tests {
     use super::*;
 
     fn rec(bind: &str) -> EngineRecord {
-        EngineRecord { pid: 1, port: 27182, bind: bind.to_string(), started_unix: 0, api_version: API_VERSION }
+        EngineRecord { pid: 1, port: 27182, bind: bind.to_string(), started_unix: 0, api_version: API_VERSION, tls: false }
     }
 
     /// `"{bind}:{port}"` does not parse for an IPv6 bind, which made a running

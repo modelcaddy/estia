@@ -28,6 +28,8 @@ The index is a plain JSON file. That is fine for a few thousand passages; past
 that, put the vectors in a vector store and keep the fingerprint next to them.
 """
 
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -36,6 +38,8 @@ from pathlib import Path
 
 import openai
 from openai import OpenAI
+
+import estia_tls
 
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
 TOKEN = os.environ.get("ESTIA_TOKEN", "")
@@ -48,6 +52,8 @@ TOP_K = 3
 
 def explain(e: Exception) -> str:
     if isinstance(e, openai.APIConnectionError):
+        if estia_tls.mismatch_in(e):
+            return f"refused the engine at {URL}: {estia_tls.mismatch_in(e)}"
         return f"cannot reach the engine at {URL}. Is `estia serve` running? Set ESTIA_URL if it listens elsewhere."
     if isinstance(e, openai.APIStatusError):
         message = e.body.get("message") if isinstance(e.body, dict) else e.message
@@ -173,7 +179,8 @@ def main() -> int:
     if len(sys.argv) < 3 or sys.argv[1] not in ("index", "ask"):
         print("usage: python rag.py index <folder>\n       python rag.py ask <question>", file=sys.stderr)
         return 2
-    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0)
+    # An https engine (on the LAN) is pinned by its certificate fingerprint.
+    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0, http_client=estia_tls.openai_http_client(URL))
     try:
         if sys.argv[1] == "index":
             return index(client, sys.argv[2])

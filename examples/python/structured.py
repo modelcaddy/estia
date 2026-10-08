@@ -25,6 +25,8 @@ import sys
 import openai
 from openai import OpenAI
 
+import estia_tls
+
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
 TOKEN = os.environ.get("ESTIA_TOKEN", "")
 MODEL = os.environ.get("ESTIA_MODEL", "fast")
@@ -62,6 +64,8 @@ IMPOSSIBLE_SCHEMA = {
 
 def explain(e: Exception) -> str:
     if isinstance(e, openai.APIConnectionError):
+        if estia_tls.mismatch_in(e):
+            return f"refused the engine at {URL}: {estia_tls.mismatch_in(e)}"
         return f"cannot reach the engine at {URL}. Is `estia serve` running? Set ESTIA_URL if it listens elsewhere."
     if isinstance(e, openai.APIStatusError):
         message = e.body.get("message") if isinstance(e.body, dict) else e.message
@@ -110,7 +114,8 @@ def main() -> int:
         schema, args = IMPOSSIBLE_SCHEMA, args[1:]
     text = " ".join(args) or SAMPLE
 
-    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0)
+    # An https engine (on the LAN) is pinned by its certificate fingerprint.
+    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0, http_client=estia_tls.openai_http_client(URL))
     try:
         event = extract(client, text, schema)
     except openai.UnprocessableEntityError as e:

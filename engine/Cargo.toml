@@ -18,7 +18,15 @@ thiserror.workspace = true
 # Model downloads (models::hf). The download and install paths use anyhow for
 # their error contexts; the session layer stays on typed errors.
 anyhow = "1"
+# The default backend, native-tls, serves model downloads and `https://`
+# through the system's trust store. The `remote-tls` feature adds the rustls
+# backend for clients that pin an engine's certificate.
 reqwest = { version = "0.12", features = ["json", "blocking"] }
+# The pin check (tls::PinVerifier) and the client configuration reqwest is
+# given; `remote-tls` only.
+rustls = { workspace = true, optional = true }
+# Pairing nonces.
+getrandom.workspace = true
 sha2 = "0.10"
 # JSON Schema validation for structured output (structured::enforce).
 jsonschema = { version = "0.26", default-features = false }
@@ -35,12 +43,24 @@ flate2 = { version = "1", optional = true }
 mdns-sd = { workspace = true, optional = true }
 tar = { version = "0.4", optional = true }
 
+[dev-dependencies]
+# Certificates for the in-test TLS servers that the pinned client is checked against.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # procmem: proc_pid_rusage for a runner's physical footprint.
 libc = "0.2"
 
 [features]
 default = []
+# Pinned HTTPS to an engine on the LAN: `RemoteEngine::with_pin` and
+# `connect` with a pin, `probe_certificate`, `begin_pairing` over https://.
+# Brings rustls with the ring provider and reqwest's rustls backend (no
+# bundled root store). Without it those calls return an error that names the
+# feature, and nothing of rustls or ring is compiled in. A host that also
+# links rustls with aws-lc-rs and relies on rustls choosing its provider must
+# install one at start-up (docs/building-clients.md).
+remote-tls = ["dep:rustls", "reqwest/rustls-tls-manual-roots"]
 # `discovery::discover`: engines advertising `_estia._tcp` on the LAN.
 discovery = ["dep:mdns-sd"]
 # The downloaded-Python + mlx runtime installer.

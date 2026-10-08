@@ -7,11 +7,15 @@ What it shows:
     `data: [DONE]`)
   - the error shape: {"error": {"message", "type", "code"}}
   - cancelling by closing the connection (Ctrl-C)
+  - pinning an https engine's certificate (estia_tls.py, ESTIA_PIN)
 
 Scopes: generate
 
     export ESTIA_TOKEN=estia_...      # estia token new chat --scopes generate
     python no_sdk.py
+
+    # An engine on another machine serves https; pin its certificate:
+    export ESTIA_URL=https://192.168.1.20:27200 ESTIA_PIN=<fingerprint from pair.py or `estia tls fingerprint`>
 
 Type a message and press Enter. /quit or Ctrl-D exits.
 """
@@ -22,6 +26,8 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
+
+import estia_tls
 
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
 TOKEN = os.environ.get("ESTIA_TOKEN", "")
@@ -42,7 +48,7 @@ def open_chat(messages: list, user: str):
         method="POST",
     )
     try:
-        return urllib.request.urlopen(req, timeout=600)
+        return urllib.request.urlopen(req, timeout=600, context=CTX)
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
         try:
@@ -53,6 +59,8 @@ def open_chat(messages: list, user: str):
         hint = "\nCheck ESTIA_TOKEN, or mint a token: estia token new chat --scopes generate" if e.code == 401 else ""
         raise EngineError(f"the engine answered {e.code}: {message}" + (f" (request id {rid})" if rid else "") + hint) from None
     except urllib.error.URLError as e:
+        if isinstance(e.reason, estia_tls.CertificateMismatch):
+            raise EngineError(f"refused the engine at {URL}: {e.reason}") from None
         raise EngineError(f"cannot reach the engine at {URL} ({e.reason}). Is `estia serve` running?") from None
 
 
@@ -79,7 +87,17 @@ def read_stream(resp):
                 yield {"usage": event.get("usage", {}), "x_estia": event.get("x_estia", {})}
 
 
+CTX = None
+
+
 def main() -> int:
+    global CTX
+    try:
+        # None for http; for https, pinned to ESTIA_PIN.
+        CTX = estia_tls.context_for(URL)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
     if not TOKEN:
         print(
             "ESTIA_TOKEN is not set. On the engine's machine run\n"

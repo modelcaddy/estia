@@ -2,9 +2,10 @@
 
     python vision.py invoice.png "What is the total?"
 
-Reads ESTIA_URL (default http://127.0.0.1:27200) and ESTIA_TOKEN. The token
-needs the `generate` scope; the `vision` role (Gemma 4 E4B by default) reads
-the image.
+Reads ESTIA_URL (default http://127.0.0.1:27200) and ESTIA_TOKEN, and for an
+https engine ESTIA_PIN (its certificate fingerprint; see estia_tls.py). The
+token needs the `generate` scope; the `vision` role (Gemma 4 E4B by default)
+reads the image.
 """
 
 import base64
@@ -13,6 +14,8 @@ import os
 import sys
 
 from openai import APIStatusError, OpenAI
+
+import estia_tls
 
 
 def main() -> int:
@@ -30,7 +33,7 @@ def main() -> int:
     with open(path, "rb") as f:
         data = base64.b64encode(f.read()).decode()
 
-    client = OpenAI(base_url=f"{base}/v1", api_key=token)
+    client = OpenAI(base_url=f"{base}/v1", api_key=token, http_client=estia_tls.openai_http_client(base))
     try:
         r = client.chat.completions.create(
             model=os.environ.get("ESTIA_MODEL", "vision"),

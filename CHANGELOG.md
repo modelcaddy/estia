@@ -14,6 +14,92 @@ and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
+### TLS on the LAN
+
+- A LAN engine (`estia serve --lan`, `estia service install`) serves HTTPS
+  with its own certificate (ECDSA P-256, self-signed, valid for 820 days:
+  Apple's TLS stack refuses a server certificate valid for more than 825),
+  made on the first LAN start and kept in `tls/` in the data directory (0600
+  files in a 0700 directory, changed under a lock and never half-replaced).
+  Loopback stays plain HTTP on the same port: the engine tells the two apart
+  by a connection's first byte, within the existing 10 s header deadline and
+  connection caps.
+- **Breaking:** plain HTTP from another device gets a 400 with type
+  `https_required` (`GET /` and `/client` redirect to `https://`), and a
+  valid token that arrives that way is named in a `warn` log line. Pair each
+  device again over `https://`, then revoke the token it had: it crossed the
+  network in clear.
+- Devices pin the certificate's SHA-256 fingerprint. Pairing proves, both
+  ways, which certificate each end used: the device commits to a nonce, the
+  engine answers with its own, and both compute two 6-digit codes from the
+  fingerprint and the two nonces. The operator types the device's pairing
+  code into `estia pair approve <id> --code <code>`, which prints the
+  confirmation code; the user types that into the device, which pins the
+  certificate only when it matches. `estia pair list` shows each request's
+  code and the engine's certificate.
+- **Breaking:** an approval of a request over HTTPS that has no code (a
+  browser, curl, or a commitment stripped on the way) needs the approver's
+  explicit word: `estia pair approve <id> --no-code`, or `{"no_code": true}`
+  on the HTTP route. A request that carries a commitment needs its code.
+  `PairingStore::approve`, the route with no body, and
+  `RemoteEngine::decide_pairing(id, true)` approve only plain-HTTP requests
+  from the engine's own machine.
+- HTTP: `POST /engine/pair` takes `commitment` and answers `engine_nonce`,
+  `check` and `tls`; `POST /engine/pair/{id}/reveal`; `/engine/health` and
+  the poll answer carry `tls` (`{fingerprint, short}`, or null on a
+  loopback-only engine); `/engine/pairings` rows carry `check`, `code` and,
+  once approved, `confirm`; the approve route takes `{"code"}` or
+  `{"no_code": true}` and answers `confirm`. Bonjour TXT: `tls`, `fp`.
+  `API_VERSION` stays 1: the transport and the pairing checks are the two
+  kinds of breaking change it does not count (docs/versioning.md says why);
+  everything else is an addition.
+- CLI: `estia tls fingerprint [--json]`, `estia tls rotate [--yes]`; `--pin`
+  (default `ESTIA_PIN`, which an `http://` engine ignores) on `remote-check`,
+  `dashboard` and `pair list|approve|deny --engine`; `estia pair request`
+  shows the code, asks for the confirmation code, then prints the token and
+  the pin, and `--json` prints `{url, name, scopes, token, pin}`; `estia pair
+  approve` prints the confirmation code; `estia token new` prints the
+  fingerprint a LAN device needs; `estia status`, `discover` and `service
+  install` show the certificate and `https://` URLs, and `status` and
+  `dashboard` reach an engine bound to one LAN address over https. LAN
+  addresses come from `ip` where there is no `ifconfig`.
+- Rust: `tls::Fingerprint`, `UnverifiedFingerprint`, `PairingCode`,
+  `pairing_commitment`, `pairing_code`, `pairing_confirmation`;
+  `RemoteEngine::with_pin`, `connect`, `cleartext`, `pin`, `get_json`,
+  `approve_pairing`, `approve_pairing_without_code`;
+  `EngineLocation::connect`; `remote::probe_certificate`;
+  `remote::begin_pairing` → `PendingPairing` (`code`, `certificate`,
+  `needs_confirmation`, `confirm`) → `poll()` → `PairingOutcome`. The pinned
+  client is behind the new `remote-tls` feature of `estia-engine` (rustls
+  with ring); without it those calls return an error naming the feature.
+  A host that also uses rustls with aws-lc-rs and lets rustls pick its
+  provider must install one at start-up (docs/building-clients.md).
+  **Breaking:** `EngineLocation::Remote` has a `pin` field (build it with a
+  struct literal, connect through `EngineLocation::connect`);
+  `RemoteEngine::new` and `connect` refuse a token over `http://` to another
+  machine (`cleartext` is the explicit way to an older engine), and any URL
+  with a user name or password; `SessionError` has a `CertificateMismatch`
+  variant; `Discovered` has `tls` and `fingerprint`;
+  `RemoteEngine::pair_request` and `pair_poll` are deprecated (they send no
+  commitment: use `begin_pairing`). Server: `serve_router_tls`,
+  `tls::{TlsIdentity, TlsServe, Transport, VALIDITY_DAYS, load,
+  load_or_create, rotate}`, `PairingStore::{request_tls, reveal,
+  approve_with_code}`. **Breaking** for struct literals: `pairing::Pairing`
+  has `tls`, `commitment`, `engine_nonce`, `code` and `confirm`;
+  `EngineRecord` has `tls`.
+- Examples: `examples/python/estia_tls.py` pins a certificate with the
+  standard library (urllib, and the OpenAI SDK through
+  `openai_http_client`); `PinnedContext` refuses to start without a pin
+  (`PinnedContext.learning()` is for pairing only), and `context_for`
+  refuses plain http to another machine. `pair.py` pairs with both codes.
+  The Python examples run on Python 3.9 or newer. The curl quickstart and
+  `scripts/smoke-test.sh` take `ESTIA_PINNEDPUBKEY` / `--pinnedpubkey` for
+  `curl -k --pinnedpubkey`.
+- New dependencies: rustls and ring (the TLS stack, ring provider only, no
+  aws-lc-rs), tokio-rustls, rcgen; all Apache-2.0, MIT, ISC or BSD. rustls is
+  0.23.45 or later (RUSTSEC-2026-0285). The `estia` CLI no longer depends on
+  reqwest directly.
+
 ### Image input
 
 - Chat messages can carry images: OpenAI `image_url` parts with a `data:` URL

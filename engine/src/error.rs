@@ -1,3 +1,4 @@
+use crate::tls::Fingerprint;
 use estia_proto::ProtoError;
 
 /// Everything a [`crate::Session`] call can fail with.
@@ -58,6 +59,18 @@ pub enum SessionError {
     /// A one-shot runner exited cleanly but streamed nothing usable.
     #[error("runner produced no output: {stderr}")]
     NoOutput { stderr: String },
+    /// A remote engine presented a certificate other than the one this client
+    /// pinned (see [`crate::tls`]). Nothing was sent: the handshake stopped
+    /// before the request. Either its owner made a new certificate (`estia tls
+    /// rotate`), and the device must pair again, or something on the network
+    /// is answering in the engine's place.
+    #[error(
+        "the engine at {url} presented certificate {}, but this app pinned {}: if its owner ran `estia tls rotate`, \
+         pair again; otherwise something on the network is impersonating it",
+        presented.short(),
+        pinned.short()
+    )]
+    CertificateMismatch { url: String, pinned: Fingerprint, presented: Fingerprint },
 }
 
 impl From<ProtoError> for SessionError {

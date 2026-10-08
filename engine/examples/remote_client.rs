@@ -3,6 +3,14 @@
 //! What it shows:
 //!   - checking an engine with `health()` before you have a token
 //!   - getting a token by pairing (`--pair <name>`), or using `ESTIA_TOKEN`
+//!   - pinning an engine on the LAN: it serves https with its own
+//!     certificate, and `RemoteEngine::connect` trusts exactly the one whose
+//!     fingerprint it is given (`ESTIA_PIN`, or what pairing returns).
+//!     Pairing shows a 6-digit code the operator types into `estia pair
+//!     approve`, which proves to the engine that the device saw its real
+//!     certificate; `estia pair approve` then prints a confirmation code the
+//!     user types here, which proves to the device that the approval came
+//!     from the engine
 //!   - a streamed chat with a cache key: the second turn reuses the cache
 //!   - cancelling a stream with a `CancelToken`
 //!   - `GenHandle` / `EmbedHandle`: code that holds a handle works the same
@@ -17,15 +25,21 @@
 //!
 //! ```text
 //! ESTIA_TOKEN=estia_... cargo run -p estia-engine --example remote_client
-//! ESTIA_URL=http://192.168.1.20:27200 cargo run -p estia-engine --example remote_client -- --pair "my laptop"
+//! ESTIA_URL=https://192.168.1.20:27200 cargo run -p estia-engine --features remote-tls --example remote_client -- --pair "my laptop"
+//! ESTIA_URL=https://192.168.1.20:27200 ESTIA_TOKEN=estia_... ESTIA_PIN=3f2a… cargo run -p estia-engine --features remote-tls --example remote_client
 //! ```
+//!
+//! An https engine needs the `remote-tls` feature of estia-engine (the pinned
+//! client); without it the https calls say so.
 //!
 //! `RemoteEngine` uses the native `/engine/*` routes and blocking HTTP. Call it
 //! from a thread or `spawn_blocking`, not from inside an async task.
 
 use estia_engine::models::embed::{find_embed_model, EmbedTask};
 use estia_engine::proto::Message;
-use estia_engine::{CancelToken, EmbedHandle, GenHandle, Priority, RemoteEmbed, RemoteEngine, RemoteGen, SessionError};
+use estia_engine::{
+    CancelToken, EmbedHandle, Fingerprint, GenHandle, PairingOutcome, Priority, RemoteEmbed, RemoteEngine, RemoteGen, SessionError,
+};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,7 +56,11 @@ fn main() {
             other => other.to_string(),
         };
         eprintln!("error: {message}");
-        if message.contains(" 401 ") {
+        if matches!(e, SessionError::CertificateMismatch { .. }) {
+            eprintln!("The engine's certificate is not the one this app pinned (ESTIA_PIN). Pair again if its owner rotated it.");
+        } else if message.contains("https_required") || message.contains("over HTTPS only") {
+            eprintln!("This engine serves other devices over https: set ESTIA_URL=https://… and pair again (--pair).");
+        } else if message.contains(" 401 ") {
             eprintln!("Check ESTIA_TOKEN, or mint a token: estia token new rust-app --scopes generate,embed");
         } else if message.contains("unreachable") {
             eprintln!("Is `estia serve` running? Set ESTIA_URL to the engine's address.");
@@ -52,27 +70,46 @@ fn main() {
 }
 
 fn run(url: &str) -> Result<()> {
-    // Health needs no token: use it to check the address and the API version.
-    let anonymous = RemoteEngine::new(url, None)?;
-    let health = anonymous.health()?;
-    println!("engine {} (api v{}) at {url}", health["version"].as_str().unwrap_or("?"), health["api_version"]);
-
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let token = if args.first().map(String::as_str) == Some("--pair") {
-        pair(&anonymous, args.get(1).map(String::as_str).unwrap_or("rust example"))?
+    // ESTIA_PIN is for an https engine; one exported for a LAN engine is
+    // ignored for the engine on this machine (http://127.0.0.1).
+    let pin = match std::env::var("ESTIA_PIN") {
+        Ok(p) if !p.trim().is_empty() && url.starts_with("https://") => {
+            Some(Fingerprint::parse(&p).map_err(|e| SessionError::Runner(format!("ESTIA_PIN: {e}")))?)
+        }
+        _ => None,
+    };
+    let (token, pin) = if args.first().map(String::as_str) == Some("--pair") {
+        // Pairing checks the certificate itself and returns the pin with the token.
+        pair(url, args.get(1).map(String::as_str).unwrap_or("rust example"))?
     } else {
+        if url.starts_with("https://") && pin.is_none() {
+            eprintln!(
+                "ESTIA_PIN is not set: an https engine needs its certificate fingerprint. Pair from here (--pair \"my laptop\"),\n\
+                 or run `estia tls fingerprint` on the engine's machine and export ESTIA_PIN=<what it prints>."
+            );
+            std::process::exit(2);
+        }
         match std::env::var("ESTIA_TOKEN") {
-            Ok(t) if !t.is_empty() => t,
+            Ok(t) if !t.is_empty() => (t, pin),
             _ => {
                 eprintln!(
                     "ESTIA_TOKEN is not set. Mint one on the engine's machine:\n  estia token new rust-app --scopes generate,embed\n\
-                     or pair from here: cargo run -p estia-engine --example remote_client -- --pair \"my laptop\""
+                     or pair from here: cargo run -p estia-engine --features remote-tls --example remote_client -- --pair \"my laptop\""
                 );
                 std::process::exit(2);
             }
         }
     };
-    let engine = Arc::new(RemoteEngine::new(url, Some(token))?);
+    // Health needs no token: use it to check the address and the API version.
+    // `connect` pins the certificate when there is a pin (https), and uses
+    // plain HTTP otherwise (the engine on this machine).
+    let health = RemoteEngine::connect(url, None, pin)?.health()?;
+    println!("engine {} (api v{}) at {url}", health["version"].as_str().unwrap_or("?"), health["api_version"]);
+    if let Some(p) = pin {
+        println!("certificate {} (pinned)", p.short());
+    }
+    let engine = Arc::new(RemoteEngine::connect(url, Some(token), pin)?);
     // A role, not a model id: the server decides which model serves it.
     let model = std::env::var("ESTIA_MODEL").unwrap_or_else(|_| "fast".to_string());
 
@@ -169,28 +206,71 @@ fn run(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ask for a token and wait for the operator. The token comes back once.
-fn pair(engine: &RemoteEngine, name: &str) -> Result<String> {
-    let id = engine.pair_request(name, &["generate", "embed"])?;
-    println!("pairing id {id}. Approve it on the engine's machine:\n  estia pair approve {id}");
+/// Ask for a token and wait for the operator. The token comes back once;
+/// over https the certificate to pin comes from the confirmation code.
+fn pair(url: &str, name: &str) -> Result<(String, Option<Fingerprint>)> {
+    // Over https: connects without trusting the engine yet, commits to a
+    // nonce, and computes the codes from the certificate it saw.
+    let pending = estia_engine::begin_pairing(url, name, &["generate", "embed"])?;
+    if let Some(code) = pending.code() {
+        println!("\n    code: {code}\n");
+        println!("The operator types this code on the engine's machine, and `estia pair approve` prints a confirmation");
+        println!("code to type here. If the engine says the code does not match, stop: something between this device");
+        println!("and the engine answered with its own certificate.");
+    }
+    println!("Approve it on the engine's machine:\n  {}", pending.approve_command());
     // The engine drops an undecided request 300 s after it arrived. Stop
-    // polling a little before that, so the last answer is not a 404.
+    // polling a little before that, so the last answer is not "expired".
     let deadline = Instant::now() + Duration::from_secs(290);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_secs(2));
-        match engine.pair_poll(&id)? {
-            (status, Some(token)) if status == "approved" => {
+        match pending.poll() {
+            Ok(PairingOutcome::Approved { token }) => {
+                // Over https "approved" alone proves nothing: the device
+                // checks the code the operator read from `estia pair approve`.
+                let pin = if pending.needs_confirmation() { Some(confirm(&pending)?) } else { None };
                 println!("approved. Store the token somewhere only this app can read; it is not shown again.");
-                return Ok(token);
+                println!("To run again without pairing:\n  export ESTIA_URL={url} ESTIA_TOKEN={token}");
+                if let Some(p) = pin {
+                    println!("  export ESTIA_PIN={p}");
+                }
+                return Ok((token, pin));
             }
-            (status, None) if status == "approved" => {
+            Ok(PairingOutcome::AlreadyCollected) => {
                 return Err(SessionError::Runner("approved, but another poll collected the token".into()))
             }
-            (status, _) if status == "denied" => return Err(SessionError::Runner("the operator denied the pairing".into())),
-            _ => {}
+            Ok(PairingOutcome::Denied) => return Err(SessionError::Runner("the operator denied the pairing".into())),
+            Ok(PairingOutcome::Expired) => return Err(SessionError::Runner("the request expired. Pair again.".into())),
+            Ok(PairingOutcome::Pending) => {}
+            // A certificate swapped mid-pairing is final; anything else is
+            // worth another poll (the engine restarting, Wi-Fi dropping).
+            Err(e @ SessionError::CertificateMismatch { .. }) => return Err(e),
+            Err(e) => eprintln!("poll failed ({e}); retrying"),
         }
     }
     Err(SessionError::Runner("no decision in time: the request expires 5 minutes after it was made. Pair again.".into()))
+}
+
+/// Read the confirmation code from stdin: the pin once it matches, three
+/// tries for typos.
+fn confirm(pending: &estia_engine::PendingPairing) -> Result<Fingerprint> {
+    let mut last = SessionError::Runner("no confirmation code".into());
+    for _ in 0..3 {
+        print!("Type the confirmation code `estia pair approve` printed on the engine's machine: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        match pending.confirm(line.trim()) {
+            Ok(pin) => return Ok(pin),
+            Err(e) => {
+                eprintln!("{e}");
+                last = e;
+            }
+        }
+    }
+    Err(last)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

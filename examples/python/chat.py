@@ -26,6 +26,8 @@ import uuid
 import openai
 from openai import OpenAI
 
+import estia_tls
+
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
 TOKEN = os.environ.get("ESTIA_TOKEN", "")
 # A role, not a model id: the engine decides which model serves `fast`.
@@ -37,6 +39,8 @@ SYSTEM = "You are a concise personal assistant. Answer in a few short sentences.
 def explain(e: Exception) -> str:
     """Turn an SDK error into one message a person can act on."""
     if isinstance(e, openai.APIConnectionError):
+        if estia_tls.mismatch_in(e):
+            return f"refused the engine at {URL}: {estia_tls.mismatch_in(e)}"
         return f"cannot reach the engine at {URL}. Is `estia serve` running? Set ESTIA_URL if it listens elsewhere."
     if isinstance(e, openai.APIStatusError):
         message = e.body.get("message") if isinstance(e.body, dict) else e.message
@@ -66,7 +70,8 @@ def main() -> int:
         return 2
 
     # max_retries=0: a local engine that refuses a request will refuse it again.
-    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0)
+    # An https engine (on the LAN) is pinned by its certificate fingerprint.
+    client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN, max_retries=0, http_client=estia_tls.openai_http_client(URL))
     conversation_id, history = new_conversation()
     print(f"Estia at {URL}, model `{MODEL}`. /reset for a new conversation, /quit to exit.")
 
