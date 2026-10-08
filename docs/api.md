@@ -119,8 +119,8 @@ The server speaks HTTP/1.1 only.
 | POST | `/engine/pair/{id}/reveal` | none | Reveal the nonce a request's commitment hashed; the engine computes the pairing code |
 | POST | `/engine/local-token` | none (loopback + same-user secret) | An app on this machine gets a token without typing one |
 | GET | `/engine/pair/{id}` | none | Poll a pairing request; returns the token once |
-| GET | `/engine/pairings` | `admin` | Pending and recent pairing requests, with each one's `check` and `code` |
-| POST | `/engine/pairings/{id}/approve` | `admin` | Approve, with `{"code"}` for a request that has one (`{"no_code": true}` for an HTTPS request without one): mint a token with the requested scopes |
+| GET | `/engine/pairings` | `admin` | Pending and recent pairing requests, with each one's `check` and `code` (the engine's, to compare with the device's) |
+| POST | `/engine/pairings/{id}/approve` | `admin` | Approve, with `{"code"}` for a request that has one, once the device shows the same code (`{"no_code": true}` for an HTTPS request without one): mint a token with the requested scopes |
 | POST | `/engine/pairings/{id}/deny` | `admin` | Deny a pending request, or take back an approved one and revoke its token |
 | GET | `/client` | none | The browser test client (a static page) |
 | GET | `/client/` | none | Redirects (308) to `/client` |
@@ -589,9 +589,10 @@ and `LocalEngine::claim_token("myapp", None)` reads the secret and asks.
 
 A device asks for a token; the operator approves on the engine's machine; the
 device collects the token once. Over HTTPS the two ends also prove to each
-other which certificate each used, with two 6-digit codes both compute: the
-pairing code goes from the device to the engine (the operator types it), the
-confirmation code from the engine to the device (the user types it):
+other which certificate each used, the way Bluetooth's numeric comparison
+does: both compute one 6-digit code, each shows its own, and a person checks
+that the two screens show the same code and says so on both. Neither end ever
+sends its code to the other.
 
 ```text
 device (sees certificate F_d)                    engine (serves F_e)
@@ -604,12 +605,12 @@ POST /engine/pair/{id}/reveal {nonce: nonce_d}
                                                  code_e = code(F_e, nonce_d, nonce_e), kept on the request
   ◄── 200 {id, status: "pending", check: "code"}
 code_d = code(F_d, nonce_d, nonce_e)     shown on the device: "482 913"
-                                                 operator: estia pair approve {id} --code 482913
-                                                 (refused unless the code equals code_e)
-                                                 it prints confirm(F_e, nonce_d, nonce_e): "452 618"
+                                                 shown on the engine: estia pair list, estia pair approve {id}
+                                                 operator: "Does the device show 482 913?" yes
+                                                 → approve with {"code": code_e}
 GET /engine/pair/{id}                     ──►    {"status": "pending", "token": null, "tls": …}
 GET /engine/pair/{id}                     ──►    {"status": "approved", "token": "estia_…", "tls": …}   (once)
-user types "452618" into the device; it must equal confirm(F_d, nonce_d, nonce_e)
+device: "Does the engine show 482 913?"   user checks the engine's screen: yes
 device pins F_d from now on
 ```
 
@@ -621,10 +622,9 @@ The definitions (SHA-256, `‖` is concatenation, labels are ASCII):
   `0x00` ‖ F (the 32 raw bytes of the fingerprint) ‖ nonce_d ‖ nonce_e),
   read its first 8 bytes as a big-endian unsigned integer, take it modulo
   1 000 000, and write it as 6 digits with leading zeros. It is shown as
-  `482 913` and typed as `482913` (spaces and dashes are ignored).
-- `confirm(F, nonce_d, nonce_e)`: the same, with the label `"estia pairing
-  confirm v1"`. The engine never sends it to the device: the operator reads
-  it from `estia pair approve` (or the approve route's answer) to the user.
+  `482 913` and typed as `482913` (spaces and dashes are ignored). The
+  engine never sends it to the device, and the device never sends it to the
+  engine: each shows the one it computed.
 
 Known-answer vector (the Rust tests and `examples/python/estia_tls.py` check
 it):
@@ -635,7 +635,6 @@ device_nonce  202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f
 engine_nonce  404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
 commitment    71f9884a2523f984d667e49fff85b931cdaff466dc51fe953ca46436319974dd
 code          865695   (shown "865 695")
-confirm       452618   (shown "452 618")
 short         0001 0203 0405 0607
 ```
 
@@ -644,17 +643,30 @@ the engine's nonce is new for each request. Something in between that presents
 its own certificate holds two TLS sessions with two certificates, so the two
 codes are independent: it gets one guess in a million and cannot work one out
 in advance (when it picks the nonce it shows the device, it knows only the
-commitment). A code from the fingerprint alone would not do, because the
+commitment; when it commits towards the engine, it has not seen the engine's
+nonce). A code from the fingerprint alone would not do, because the
 certificate is public and long-lived: a look-alike could be ground offline.
-The device must show the code it computed, never one it was sent.
 
-Why both directions: the pairing code tells the engine what the device saw,
-but nothing tells the device what the engine saw. Something in between could
-answer the device's request and polls itself ("approved", with a token of its
-own making) without the engine ever approving anything. The confirmation code
-closes that: only the operator can read the engine's, and the device pins the
-certificate only when the one typed into it equals its own. An "approved"
-answer alone proves nothing to the device.
+Why confirm on both ends: the operator's yes tells the engine what the device
+saw, but nothing tells the device what the engine saw. Something in between
+could answer the device's request and polls itself ("approved", with a token
+of its own making) without the engine ever approving anything. The device's
+own yes closes that: the user looks at the engine's screen, which shows a
+different code (or none) in that case, and the device pins the certificate
+only on a yes. An "approved" answer alone proves nothing to the device.
+
+What it leaves to people: a code only protects a pairing if someone compares
+it. An operator who approves, or a user who confirms, without looking can
+pair a device with something in between. The engine's prompts and the
+device's question name the code to compare: compare it there, never digits
+found elsewhere on a screen. The sender chooses some of what shares those
+screens, and the rules remove the direct ways to make that look like a code:
+a device name cannot hold a run of digits that could pass for one (see the
+name rules below), and pairing ids are letters that cannot pass for digits,
+which a device checks. They do not make the code the only code-like thing in
+sight: letters that look like digits (`4B2 9I3`) are letters, and on a LAN a
+sender can choose its IPv6 address (`fe80::482:913`), which `estia pair list`
+shows. SECURITY.md lists what is left.
 
 The rules:
 
@@ -667,34 +679,63 @@ The rules:
 - Reveal: an unknown id is 404; a request with no commitment, a nonce that
   does not match it, a request that is no longer pending, or an engine with
   no certificate is 400; the same nonce again answers 200 (a retry after a
-  lost answer). The answer never carries either code.
+  lost answer). The answer never carries the code, and neither does any poll.
 - `GET /engine/pairings` rows carry `check` (`code`, `waiting` (committed,
-  not revealed yet), `none` or `plain`), `code` (the engine's 6 digits, or
-  null) and, once approved, `confirm` (the confirmation code, or null), and
-  the list carries the engine's `tls`.
+  not revealed yet), `none` or `plain`) and `code` (the engine's 6 digits, or
+  null), before and after the approval, and the list carries the engine's
+  `tls`. An app that shows them to the operator shows the code, so the user
+  at the device can compare it too.
 - `POST /engine/pairings/{id}/approve` takes an optional body:
-  `{"code": "482913"}` for a `code` request, which needs it (a wrong one is a
-  400, "the code does not match: … deny the request"); `{"no_code": true}`
-  for a `none` request, which is refused without it (and the approver should
-  first compare the fingerprint the device shows, and deny the request if
-  the device shows a code); no body, or `{}`, for a `plain` request. A
-  `waiting` request is a 400 until the device has revealed; a code given for
-  a `none` or `plain` request is a 400 (the device in front of the operator
-  made another request); `code` and `no_code` together are a 400. The answer
-  carries `check`, `code`, `tls` and `confirm`: for a `code` request, the
-  confirmation code to read to the user.
-- The CLI applies the same rules and asks for the flag: `estia pair approve
-  <id> --code <code>`, or `--no-code` for a `none` request. It prints the
-  confirmation code.
+  `{"code": "482913"}` for a `code` request, which needs it: the code the app
+  showed the operator, sent back once they said the device shows the same,
+  or the code a script read off the device (a wrong one is a 400, "the code
+  does not match this engine's: … deny the request"; none at all is a 400
+  too). That ties the approval to the request whose code was shown and stops
+  a codeless one; it cannot show that anyone compared, so an app sends the
+  listed code only on the operator's yes, and a script sends the code the
+  device shows, never the listed one; `{"no_code": true}` for a
+  `none` request, which is refused without it (and the approver should first
+  compare the fingerprint the device shows, and deny the request if the
+  device shows a code); no body, or `{}`, for a `plain` request. A `waiting`
+  request is a 400 until the device has revealed; a code given for a `none`
+  or `plain` request is a 400 (the device in front of the operator made
+  another request); `code` and `no_code` together are a 400. The answer
+  carries `check`, `code` and `tls`.
+- The CLI applies the same rules: `estia pair approve <id>` shows the
+  engine's code for a `code` request and asks "Does the device show 482
+  913? [y/N]" in a terminal; a script passes `--code <code>` (it must match),
+  and `--no-code` approves a `none` request. On the device, `estia pair
+  request` asks "Does the engine show 482 913?" and takes `y` only from a
+  terminal; with stdin not a terminal it reads the six digits the engine
+  shows and pins only if they equal its own code. `--json` prints its steps
+  as JSON lines on stderr: `{"event": "request", "id", "code", "certificate",
+  "approve", "expires_unix"}`, `{"event": "retry", "id", "detail"}`, and
+  `{"event": "confirm", "id", "code", "answer"}` just before it reads the
+  answer.
+- Pairing ids are 16 letters of `acdefhjkmnprtuvwxy` (lowercase, without
+  the ones that pass for a digit: `b g i l o q s z`). A device shows its id
+  next to its code, and whatever answers the request chooses it, so a device
+  pairing over HTTPS refuses an id of any other form before it reveals its
+  nonce (`tls::is_pairing_id` in Rust): an interceptor could otherwise answer
+  with an id such as `771204`, the code the engine shows for a request of its
+  own.
 
 `scopes` defaults to `generate`, `embed`, `models:read`. Unknown scopes are
 refused with 400; a scope listed twice counts once.
 
 `name` is trimmed and must then be 1 to 64 characters of: letters and digits
-in any script, single spaces, and `. _ - ' ’ ( )`. Control characters, escape
-sequences, invisible and bidi formatting characters, emoji, colons and runs of
-spaces are refused with 400 rather than stripped. The operator reads names in
-a terminal, and the token an approval mints is named `pair:<name>:<id>`.
+in any script, single spaces, and `. _ - ' ’ ( )`, with at most 4 digits in a
+row. Only a letter with case (Latin, Greek, Cyrillic, Armenian, …) breaks a
+row; spaces, punctuation, modifier letters, combining marks and letters of
+scripts without case do not, because some of those print as a blank, a dash
+or a dot (`ㅡ`, `一`, `ꞏ`, U+0640). So `東京 2024 店 15` counts its two
+numbers as one row. Control characters, escape sequences, invisible and
+bidi formatting characters (every default-ignorable code point, the Hangul
+fillers included), emoji, colons, runs of spaces and runs of 5 or more
+digits are refused with 400 rather than stripped. The operator reads names
+in a terminal, next to the code to compare: a name such as `phone 482 913`
+could put the device's code on the engine's screen beside a different one.
+The token an approval mints is named `pair:<name>:<id>`.
 
 At most 24 requests may be pending at once, and at most 4 from one client
 address. Past either cap a new request gets 429 (`rate_limit_error`) until one

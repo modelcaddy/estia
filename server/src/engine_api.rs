@@ -781,9 +781,10 @@ fn over_tls(transport: Option<axum::Extension<Transport>>) -> bool {
 fn pairing_how(p: &Pairing) -> &'static str {
     match p.check() {
         crate::pairing::PairingCheck::Waiting | crate::pairing::PairingCheck::Code => {
-            "reveal your nonce (POST /engine/pair/<id>/reveal), show the 6-digit code you compute from this engine's \
-             certificate, and have the operator run `estia pair approve <id> --code <code>`; poll GET /engine/pair/<id> \
-             until approved, then pin the certificate only when the confirmation code the operator reads you matches yours"
+            "reveal your nonce (POST /engine/pair/<id>/reveal) and show the 6-digit code you compute from the certificate \
+             you saw; the operator runs `estia pair approve <id>`, which shows this engine's code, and approves only if \
+             yours is the same. Poll GET /engine/pair/<id> until approved, then ask the user whether this engine shows your \
+             code, and pin the certificate only on a yes. This engine never sends you its code"
         }
         crate::pairing::PairingCheck::Uncoded => {
             "the operator compares the certificate you see with `estia tls fingerprint` and approves with \
@@ -838,8 +839,9 @@ pub struct RevealBody {
 }
 
 /// The device reveals its nonce; the engine computes the pairing code from
-/// its own certificate and keeps it for the approval. The answer carries no
-/// code: the device shows the one it computed itself.
+/// its own certificate and shows it to the operator. The answer carries no
+/// code: the device shows the one it computed itself, and a person compares
+/// the two screens.
 pub async fn pair_reveal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -897,7 +899,9 @@ pub async fn local_token(
     Ok(Json(json!({"token": token, "name": name, "scopes": scopes})))
 }
 
-/// The client polls; the token is returned exactly once when approved.
+/// The client polls; the token is returned exactly once when approved. The
+/// answer never carries the code: a device compares its own with the
+/// engine's screen, never with anything it was sent.
 pub async fn pair_poll(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     if let Some(a) = Access::current() {
         a.pairing(&id);
@@ -911,7 +915,9 @@ pub async fn pair_poll(State(state): State<Arc<AppState>>, Path(id): Path<String
 
 /// Operator view of pairing requests (admin scope) — a paired admin client,
 /// such as a host application, can approve other devices from wherever it is.
-/// Each row carries its `check` and `code`, and `confirm` once approved.
+/// Each row carries its `check` and `code`: show the code to the operator,
+/// who approves only when the device shows the same, and keep showing it
+/// after the approval, for the user at the device to compare.
 pub async fn list_pairings(State(state): State<Arc<AppState>>) -> Json<Value> {
     let list: Vec<Value> = state
         .pairings
@@ -922,7 +928,6 @@ pub async fn list_pairings(State(state): State<Arc<AppState>>) -> Json<Value> {
                 "id": p.id, "name": p.name, "scopes": p.scopes, "status": p.status, "from": p.from,
                 "created_unix": p.created_unix, "claimed": p.claimed, "revoked": p.revoked,
                 "check": p.check().as_str(), "code": p.code, "tls": p.tls,
-                "confirm": p.confirm_shown().map(|c| c.replace(' ', "")),
             })
         })
         .collect();
@@ -931,7 +936,10 @@ pub async fn list_pairings(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ApproveBody {
-    /// The code the device shows, for a request with `check: code`.
+    /// The request's code, for one with `check: code`: the one this engine
+    /// lists for it, sent back once the operator saw the device show the
+    /// same, or the one a script read off the device. It must equal the
+    /// engine's.
     #[serde(default)]
     pub code: Option<String>,
     /// Approve a request with `check: none` (over HTTPS without a code: a
@@ -941,12 +949,12 @@ pub struct ApproveBody {
     pub no_code: bool,
 }
 
-/// Approve with the code the device shows (`{"code": "482913"}`); a request
-/// over HTTPS without a code (`check: none`) only with `{"no_code": true}`,
-/// after the person at the device compared the certificate; a request over
-/// plain HTTP from this machine (`check: plain`) with no body. The answer
-/// carries `confirm` for a request with a code: the confirmation code the
-/// operator reads to the user, who types it into the device.
+/// Approve with the request's code (`{"code": "482913"}`), once the operator
+/// saw the device show the same code as this engine; a request over HTTPS
+/// without a code (`check: none`) only with `{"no_code": true}`, after the
+/// person at the device compared the certificate; a request over plain HTTP
+/// from this machine (`check: plain`) with no body. A request with a code is
+/// never approved without it.
 pub async fn approve_pairing(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -957,7 +965,7 @@ pub async fn approve_pairing(
     }
     let ApproveBody { code, no_code } = body.map(|Json(b)| b).unwrap_or_default();
     if code.is_some() && no_code {
-        return Err(ApiError::bad_request("give either the code the device shows or no_code, not both"));
+        return Err(ApiError::bad_request("give either the request's code or no_code, not both"));
     }
     let st = Arc::clone(&state);
     let p = spawn_blocking_in_span(move || st.pairings.approve_with_code(&id, &st.tokens, code.as_deref(), no_code))
@@ -966,7 +974,6 @@ pub async fn approve_pairing(
     Ok(Json(json!({
         "id": p.id, "name": p.name, "status": p.status, "scopes": p.scopes,
         "check": p.check().as_str(), "code": p.code, "tls": tls_block(&state),
-        "confirm": p.confirm_shown().map(|c| c.replace(' ', "")),
     })))
 }
 

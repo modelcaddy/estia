@@ -8,11 +8,15 @@
 //! - a device that pinned one engine refuses another certificate at the same
 //!   address, before it sends anything;
 //! - something in between that answers a pairing with its own certificate is
-//!   caught both ways: the engine refuses the device's code, an approval
-//!   without a code needs the approver's explicit word, and the device refuses
-//!   an "approved" that did not come with the engine's confirmation code;
+//!   caught both ways: the device and the engine show different codes, so
+//!   neither person confirms; an approval without the code is refused (and
+//!   one of a request with no code needs the approver's explicit word); and
+//!   a device that hears "approved" pins nothing until its user confirms;
+//! - the engine never sends the device its own code, and its pairing ids
+//!   cannot pass for one; a device refuses an id that could;
 //! - the Python examples pair, pin and chat over HTTPS, computing the same
-//!   pairing code as the engine;
+//!   pairing code as the engine; with no terminal, a piped "y" is not an
+//!   answer, the engine's six digits are;
 //! - plain HTTP from another device is refused (`https_required`), loopback
 //!   stays plain, and stalled handshakes are cut off by the usual caps.
 //!
@@ -296,20 +300,21 @@ async fn pairing_and_chat_cross_the_wire_encrypted() {
     let pending = blocking(move || estia_engine::begin_pairing(&u, "phone", &["generate"]).unwrap()).await;
     let code = *pending.code().expect("a pairing over https has a code");
     assert!(pending.certificate().is_some_and(|c| c.matches(&h.fingerprint)), "the device saw the engine's certificate");
-    assert_eq!(pending.approve_command(), format!("estia pair approve {} --code {}", pending.id(), code.digits()));
-    // The row the operator sees carries the same code, computed from the
-    // engine's own certificate.
+    assert_eq!(pending.approve_command(), format!("estia pair approve {}", pending.id()));
+    // The engine shows the same code, computed from its own certificate: the
+    // operator sees the two match and approves with the code it showed.
     let row = h.state.pairings.list().into_iter().find(|p| p.id == pending.id()).unwrap();
-    assert_eq!(row.code.as_deref(), Some(code.digits().as_str()));
-    let approved = h.state.pairings.approve_with_code(pending.id(), &h.state.tokens, Some(&code.to_string()), false).unwrap();
-    let confirmation = approved.confirm_shown().expect("the approval gives the confirmation code to read to the user");
+    assert_eq!(row.pairing_code(), Some(code), "the two screens show the same code");
+    h.state.pairings.approve_with_code(pending.id(), &h.state.tokens, row.code.as_deref(), false).unwrap();
     let p = pending.clone();
     let outcome = blocking(move || p.poll().unwrap()).await;
     let PairingOutcome::Approved { token } = outcome else { panic!("not approved: {outcome:?}") };
     assert!(token.starts_with("estia_"));
-    // The user types the confirmation code into the device, which pins the
-    // certificate only now.
-    let pin = pending.confirm(&confirmation).expect("the engine's confirmation code matches the device's");
+    // The user at the device sees the engine still show its code and says
+    // so; the device pins the certificate only now.
+    let row = h.state.pairings.list().into_iter().find(|p| p.id == pending.id()).unwrap();
+    assert_eq!(row.pairing_code(), pending.code().copied(), "the engine still shows the code after approving");
+    let pin = pending.confirm_match().expect("an https pairing has a pin");
     assert_eq!(pin, h.fingerprint);
 
     let prompt = format!("PROMPT-{}", std::process::id() * 7919);
@@ -445,26 +450,30 @@ async fn stalled_tls_handshakes_are_cut_off() {
     assert!(blocking(move || RemoteEngine::with_pin(url, None, fp).unwrap().health()).await.is_ok(), "the share is back");
 }
 
-/// "`estia remote-check`, remote_client.rs and the Python examples work with
-/// the pinned certificate": `pair.py` pairs over HTTPS (recording the
-/// certificate, committing, revealing) and prints the code it computed; the
-/// engine accepts that code, which proves the Python code computes the same
-/// one as Rust; then `no_sdk.py` chats with the token and the pin, and refuses
-/// a wrong pin.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn python_examples_pair_and_chat_over_tls() {
-    if !python3_available() {
-        eprintln!("skip: python3 not available");
-        return;
-    }
-    let h = start_tls(ConnLimits::default(), true).await;
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/python");
-    let token_file = h.dir.join("token");
+/// What `pair_py` writes to pair.py's stdin (a pipe, not a terminal) once the
+/// engine has approved.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// "n": the user says the engine does not show the code.
+    No,
+    /// "y", piped: no person compared anything, so it is not an answer.
+    PipedYes,
+    /// The six digits the engine shows for the request, read from the
+    /// engine's own records (what a script reads with `estia pair list`).
+    EngineCode,
+}
+
+/// Run `pair.py` against `h`, saving the token to `out`: read until it shows
+/// the approve command and its code, check the engine shows the same code
+/// (the operator's comparison: it also proves Python computes the code as
+/// Rust does), approve with it, and give `answer` to pair.py's question of
+/// whether the engine shows its code. Returns (success, everything printed).
+async fn pair_py(h: &Harness, examples: &std::path::Path, out_file: &std::path::Path, answer: Answer) -> (bool, String) {
     let mut pair = tokio::process::Command::new("python3")
         .arg("pair.py")
         .args(["--name", "ci", "--scopes", "generate", "--out"])
-        .arg(&token_file)
-        .current_dir(&examples)
+        .arg(out_file)
+        .current_dir(examples)
         .env("ESTIA_URL", h.url())
         .env_remove("ESTIA_PIN")
         .stdin(std::process::Stdio::piped())
@@ -473,37 +482,77 @@ async fn python_examples_pair_and_chat_over_tls() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    // Read until the approve command, which carries the id and the code.
     let mut out = pair.stdout.take().unwrap();
     let mut printed = String::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    let (id, code) = loop {
+    let (id, shown) = loop {
         let mut buf = [0u8; 1024];
         let n = tokio::time::timeout_at(deadline, out.read(&mut buf)).await.expect("pair.py printed the approve command").unwrap();
         assert!(n > 0, "pair.py ended early:\n{printed}");
         printed.push_str(&String::from_utf8_lossy(&buf[..n]));
-        let found = printed.lines().find_map(|l| {
-            let rest = l.trim().strip_prefix("estia pair approve ")?;
-            let (id, code) = rest.split_once(" --code ")?;
-            Some((id.trim().to_string(), code.trim().to_string()))
-        });
-        if let Some(f) = found {
-            break f;
+        let id = printed.lines().find_map(|l| Some(l.trim().strip_prefix("estia pair approve ")?.trim().to_string()));
+        let code = printed.lines().find_map(|l| estia_engine::PairingCode::parse(l.trim().strip_prefix("code: ")?));
+        if let (Some(id), Some(code)) = (id, code) {
+            break (id, code);
         }
     };
-    let approved =
-        h.state.pairings.approve_with_code(&id, &h.state.tokens, Some(&code), false).expect("the engine accepts the code pair.py computed");
-    // What `estia pair approve` prints, typed into pair.py: it keeps the
-    // token only once this matches the code it computed itself.
-    let confirmation = approved.confirm_shown().expect("a confirmation code");
+    assert!(!id.contains(' '), "the approve command carries no code to type: {id:?}");
+    assert!(estia_engine::tls::is_pairing_id(&id), "the id cannot pass for a code: {id:?}");
+    let row = h.state.pairings.list().into_iter().find(|p| p.id == id).expect("the request pair.py made");
+    assert_eq!(row.pairing_code(), Some(shown), "pair.py shows the engine's code:\n{printed}");
+    h.state.pairings.approve_with_code(&id, &h.state.tokens, row.code.as_deref(), false).unwrap();
     let mut stdin = pair.stdin.take().unwrap();
-    stdin.write_all(format!("{confirmation}\n").as_bytes()).await.unwrap();
+    let answer = match answer {
+        Answer::No => "n\n".to_string(),
+        Answer::PipedYes => "y\n".to_string(),
+        Answer::EngineCode => format!("{}\n", row.code.clone().unwrap()),
+    };
+    stdin.write_all(answer.as_bytes()).await.unwrap();
     drop(stdin);
     let status = tokio::time::timeout(std::time::Duration::from_secs(20), pair.wait()).await.expect("pair.py finished").unwrap();
     let mut rest = String::new();
     out.read_to_string(&mut rest).await.unwrap();
     printed.push_str(&rest);
-    assert!(status.success(), "pair.py failed:\n{printed}");
+    let mut err = String::new();
+    pair.stderr.take().unwrap().read_to_string(&mut err).await.unwrap();
+    printed.push_str(&err);
+    (status.success(), printed)
+}
+
+/// "`estia remote-check`, remote_client.rs and the Python examples work with
+/// the pinned certificate": `pair.py` pairs over HTTPS (recording the
+/// certificate, committing, revealing) and shows the code it computed, which
+/// is the code the engine shows (so Python computes the same one as Rust);
+/// the operator approves, `pair.py` asks whether the engine shows its code
+/// and, its stdin being a pipe, keeps the token only when given the engine's
+/// six digits: a piped "y" is refused, since no person compared anything.
+/// Then `no_sdk.py` chats with the token and the pin, and refuses a wrong pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn python_examples_pair_and_chat_over_tls() {
+    if !python3_available() {
+        eprintln!("skip: python3 not available");
+        return;
+    }
+    let h = start_tls(ConnLimits::default(), true).await;
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/python");
+
+    // A user who says the engine does not show the code: pair.py keeps
+    // neither the token nor the pin, though the engine approved.
+    let refused = h.dir.join("refused-token");
+    let (ok, printed) = pair_py(&h, &examples, &refused, Answer::No).await;
+    assert!(!ok, "pair.py must fail on a no:\n{printed}");
+    assert!(!refused.exists(), "no token kept on a no:\n{printed}");
+    assert!(!printed.contains("ESTIA_PIN="), "no pin printed on a no:\n{printed}");
+
+    // A script that writes "y" without anyone looking: not an answer.
+    let piped = h.dir.join("piped-token");
+    let (ok, printed) = pair_py(&h, &examples, &piped, Answer::PipedYes).await;
+    assert!(!ok && !piped.exists() && !printed.contains("ESTIA_PIN="), "a piped y pins nothing:\n{printed}");
+    assert!(printed.contains("not a terminal") && printed.contains("six digits"), "says what to give instead:\n{printed}");
+
+    let token_file = h.dir.join("token");
+    let (ok, printed) = pair_py(&h, &examples, &token_file, Answer::EngineCode).await;
+    assert!(ok, "pair.py failed:\n{printed}");
     let token = std::fs::read_to_string(&token_file).unwrap().trim().to_string();
     assert!(token.starts_with("estia_"));
     assert!(printed.contains(&format!("ESTIA_PIN={}", h.fingerprint.to_hex())), "pair.py prints the pin to export:\n{printed}");
@@ -548,6 +597,11 @@ enum Mitm {
     Strip,
     /// Answer the device's polls itself: "approved", with a token of its own.
     FakeApproval,
+    /// File a request of its own at the engine under the device's name,
+    /// reveal at once, and answer the device with the code the engine shows
+    /// for that request as the pairing id: the device would print that code
+    /// beside its own, for an operator glancing from the engine's screen.
+    CraftedId,
 }
 
 struct Interceptor {
@@ -583,6 +637,20 @@ async fn start_interceptor(m: Arc<Interceptor>, identity: &tls::TlsIdentity) -> 
     async fn pair(State(m): St, Json(body): Json<Value>) -> (axum::http::StatusCode, Json<Value>) {
         let name = body["name"].as_str().unwrap_or("?").to_string();
         let scopes: Vec<String> = body["scopes"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect();
+        if m.mode() == Mitm::CraftedId {
+            use estia_engine::tls as etls;
+            let (st, fp) = (Arc::clone(&m.engine), m.engine_fp);
+            let engine_code = tokio::task::spawn_blocking(move || {
+                let own = etls::random_nonce().unwrap();
+                let p = st.pairings.request_tls(&name, &scopes, Some("10.0.0.66".into()), Some(&etls::pairing_commitment(&own))).unwrap();
+                st.pairings.reveal(&p.id, &etls::nonce_hex(&own), &fp).unwrap().code.unwrap()
+            })
+            .await
+            .unwrap();
+            let engine_nonce = etls::nonce_hex(&etls::random_nonce().unwrap());
+            let answer = serde_json::json!({"id": engine_code, "status": "pending", "expires_in": 300, "engine_nonce": engine_nonce, "tls": m.tls()});
+            return (axum::http::StatusCode::ACCEPTED, Json(answer));
+        }
         let strip = m.mode() == Mitm::Strip;
         let commitment = body["commitment"].as_str().filter(|_| !strip).map(String::from);
         let st = Arc::clone(&m.engine);
@@ -613,7 +681,11 @@ async fn start_interceptor(m: Arc<Interceptor>, identity: &tls::TlsIdentity) -> 
         let (status, token) = tokio::task::spawn_blocking(move || st.pairings.poll(&i)).await.unwrap().unwrap();
         Json(serde_json::json!({"id": id, "status": status, "token": token, "tls": m.tls()}))
     }
+    async fn health(State(m): St) -> Json<Value> {
+        Json(serde_json::json!({"version": "0.5.0", "api_version": 1, "tls": m.tls()}))
+    }
     let app = axum::Router::new()
+        .route("/engine/health", get(health))
         .route("/engine/pair", post(pair))
         .route("/engine/pair/:id/reveal", post(reveal))
         .route("/engine/pair/:id", get(poll))
@@ -627,13 +699,22 @@ async fn start_interceptor(m: Arc<Interceptor>, identity: &tls::TlsIdentity) -> 
 
 /// A pairing intercepted by something that presents its own certificate is
 /// caught both ways, whatever the interceptor does:
-/// - it relays the codes: the engine refuses the code the device shows;
-/// - it answers the device's polls itself: the device refuses, because no
-///   confirmation code the engine's operator can read matches its own;
-/// - it strips the commitment, so the engine sees a request with no code:
-///   no approval path takes that without the approver's explicit word (the
-///   HTTP route's `no_code`, the CLI's `--no-code`), and even then the device
-///   has no confirmation code to accept, so it never pins the interceptor.
+/// - it relays the exchange: the device and the engine show different codes,
+///   so the operator does not approve and the user does not confirm; a
+///   script that typed the device's code is refused, and an approval without
+///   the code (a blind one) is refused on every path;
+/// - it answers the device's polls itself: the device hears "approved", but
+///   the engine shows another code, so the user does not confirm, and a
+///   device that does not confirm has nothing to pin;
+/// - it strips the commitment, so the engine sees a request with no code
+///   while the device shows one: no approval path takes that without the
+///   approver's explicit word (the HTTP route's `no_code`, the CLI's
+///   `--no-code`), and even then the engine shows no code for the user at the
+///   device to confirm, so the device never pins the interceptor;
+/// - it answers with a pairing id made of the code the engine shows for a
+///   request of its own, to put that code on the device's screen too: the
+///   Rust client and pair.py refuse an id an engine does not make, before
+///   revealing anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_interceptor_is_caught_both_ways() {
     use estia_server::pairing::{PairingCheck, PairingStatus};
@@ -648,46 +729,70 @@ async fn an_interceptor_is_caught_both_ways() {
     let url = start_interceptor(Arc::clone(&m), &identity).await;
     let row = |id: &str| h.state.pairings.list().into_iter().find(|p| p.id == id).unwrap();
     let minted = || TokenStore::open(h.dir.join("tokens.json")).unwrap().list().into_iter().filter(|r| r.name.starts_with("pair:")).count();
+    let (e_url, admin, fp) = (h.url(), h.admin.clone(), h.fingerprint);
+    let admin_client = Arc::new(blocking(move || RemoteEngine::with_pin(e_url, Some(admin), fp).unwrap()).await);
+    let raw = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    let raw_approve = |id: &str, body: Option<&'static str>| {
+        let mut r = raw.post(format!("{}/engine/pairings/{id}/approve", h.url())).bearer_auth(&h.admin);
+        if let Some(b) = body {
+            r = r.header("content-type", "application/json").body(b);
+        }
+        r.send()
+    };
 
     // 1. Relayed: the device's code comes from the interceptor's certificate,
-    //    the engine's from its own. The operator types the device's: refused.
+    //    the engine's from its own, so the two screens differ.
     let u = url.clone();
     let device = blocking(move || estia_engine::begin_pairing(&u, "phone", &["generate"]).unwrap()).await;
     assert!(device.certificate().unwrap().matches(&m.own_fp), "the device met the interceptor's certificate");
     assert_eq!(row(device.id()).check(), PairingCheck::Code);
-    let shown = device.code().unwrap().digits();
-    let e = h.state.pairings.approve_with_code(device.id(), &h.state.tokens, Some(&shown), false).unwrap_err();
+    let on_device = *device.code().unwrap();
+    let on_engine = row(device.id()).pairing_code().expect("the engine shows a code");
+    assert_ne!(on_device, on_engine, "the operator sees two different codes and does not approve");
+    // A script that read the device's code is refused.
+    let e = h.state.pairings.approve_with_code(device.id(), &h.state.tokens, Some(&on_device.digits()), false).unwrap_err();
     assert!(e.to_string().contains("does not match"), "{e}");
+    // A blind approval, with no code, is refused on every path: the store,
+    // the HTTP route with `{}`, with `no_code`, and with no body at all.
+    assert!(h.state.pairings.approve(device.id(), &h.state.tokens).is_err());
+    assert!(h.state.pairings.approve_with_code(device.id(), &h.state.tokens, None, true).is_err());
+    let (a, i) = (Arc::clone(&admin_client), device.id().to_string());
+    let (decided, without_code, said_no_code) =
+        blocking(move || (a.decide_pairing(&i, true), a.approve_pairing(&i, None), a.approve_pairing_without_code(&i))).await;
+    for r in [decided, without_code, said_no_code] {
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("same code as this engine"), "{e}");
+    }
+    assert_eq!(raw_approve(device.id(), None).await.unwrap().status().as_u16(), 400, "no body");
     assert_eq!((row(device.id()).status, minted()), (PairingStatus::Pending, 0), "nothing minted");
 
     // 2. The interceptor answers the device's polls itself. The device hears
-    //    "approved", but no code from the engine's side confirms it: not the
-    //    confirmation code the engine holds for this request, not any other.
+    //    "approved" and asks the user whether the engine shows its code; the
+    //    engine shows another one and approved nothing, so the user says no,
+    //    and the device, which pins only on a yes, never pins.
     *m.mode.lock().unwrap() = Mitm::FakeApproval;
     let d = device.clone();
     let outcome = blocking(move || d.poll().unwrap()).await;
     assert_eq!(outcome, PairingOutcome::Approved { token: "estia_made_up_by_the_interceptor".into() });
-    let engines = row(device.id()).confirm.expect("the engine computed a confirmation code on reveal");
-    for typed in [engines.as_str(), "000000", shown.as_str()] {
-        let e = device.confirm(typed).unwrap_err().to_string();
-        assert!(e.contains("not the confirmation code"), "{typed}: {e}");
-    }
+    assert_ne!(row(device.id()).pairing_code(), device.code().copied(), "what the user sees on the engine is not the device's code");
+    assert_eq!(row(device.id()).status, PairingStatus::Pending, "the engine approved nothing");
+    let unverified: estia_engine::UnverifiedFingerprint = device.certificate().unwrap();
+    assert!(!unverified.matches(&h.fingerprint), "all the device holds without a yes is the interceptor's certificate, unverified");
 
     // 3. Stripped: the engine sees a request over https with no code, while
     //    the device shows one, made from a nonce the interceptor made up.
     *m.mode.lock().unwrap() = Mitm::Strip;
     let u = url.clone();
     let device = blocking(move || estia_engine::begin_pairing(&u, "laptop", &["generate"]).unwrap()).await;
-    assert!(device.code().is_some());
+    assert!(device.code().is_some(), "the device shows a code");
     let id = device.id().to_string();
     assert_eq!(row(&id).check(), PairingCheck::Uncoded);
+    assert_eq!(row(&id).code_shown(), None, "the engine shows none: the screens differ");
     // No approval without the approver's explicit word: not the store's
     // `approve`, not the HTTP route with `{}` (`decide_pairing(id, true)`,
     // `approve_pairing(id, None)`) or no body at all, and not the code the
     // device shows either.
     assert!(h.state.pairings.approve(&id, &h.state.tokens).is_err());
-    let (e_url, admin, fp) = (h.url(), h.admin.clone(), h.fingerprint);
-    let admin_client = Arc::new(blocking(move || RemoteEngine::with_pin(e_url, Some(admin), fp).unwrap()).await);
     let (a, i, c) = (Arc::clone(&admin_client), id.clone(), device.code().unwrap().digits());
     let (decided, without_body, with_code) =
         blocking(move || (a.decide_pairing(&i, true), a.approve_pairing(&i, None), a.approve_pairing(&i, Some(&c)))).await;
@@ -696,31 +801,89 @@ async fn an_interceptor_is_caught_both_ways() {
         assert!(e.contains("no code") && e.contains("deny this request") && e.contains("no_code"), "{e}");
     }
     assert!(with_code.unwrap_err().to_string().contains("different request"));
-    // Raw HTTP: no body, and a code with no_code, are refused too.
-    let raw = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
-    let approve_url = format!("{}/engine/pairings/{id}/approve", h.url());
     for body in [None, Some(r#"{"code":"123456","no_code":true}"#)] {
-        let mut r = raw.post(&approve_url).bearer_auth(&h.admin);
-        if let Some(b) = body {
-            r = r.header("content-type", "application/json").body(b);
-        }
-        let r = r.send().await.unwrap();
-        assert_eq!(r.status().as_u16(), 400, "{body:?}");
+        assert_eq!(raw_approve(&id, body).await.unwrap().status().as_u16(), 400, "{body:?}");
     }
     assert_eq!((row(&id).status, minted()), (PairingStatus::Pending, 0), "nothing minted");
     // An approver who says explicitly there is no code gets what they asked
-    // for, but the engine has no confirmation code to give, so the device,
-    // which shows a code, cannot be told one and never pins the interceptor.
+    // for; but the engine still shows no code, so the user at the device,
+    // asked whether the engine shows its code, says no: no pin.
     let (a, i) = (Arc::clone(&admin_client), id.clone());
     let v = blocking(move || a.approve_pairing_without_code(&i).unwrap()).await;
-    assert!(v["confirm"].is_null(), "{v}");
+    assert!(v["code"].is_null() && v.get("confirm").is_none(), "{v}");
     *m.mode.lock().unwrap() = Mitm::Forward;
     let d = device.clone();
     assert!(matches!(blocking(move || d.poll().unwrap()).await, PairingOutcome::Approved { .. }));
-    assert!(device.confirm("000000").is_err());
+    assert_eq!(row(&id).code_shown(), None, "still no code on the engine's screen to say yes to");
+
+    // 4. A crafted id: the interceptor's own request, named like the device,
+    //    shows a code on the engine; the interceptor answers the device with
+    //    that code as the id. The device refuses the id before it reveals.
+    *m.mode.lock().unwrap() = Mitm::CraftedId;
+    let before = h.state.pairings.list().len();
+    let u = url.clone();
+    let e = blocking(move || estia_engine::begin_pairing(&u, "tablet", &["generate"]).unwrap_err()).await.to_string();
+    assert!(e.contains("not one an engine makes"), "{e}");
+    let rows = h.state.pairings.list();
+    assert_eq!(rows.len(), before + 1, "the interceptor's own request");
+    let own = rows.iter().find(|p| p.name == "tablet").unwrap();
+    let crafted = own.code.clone().expect("the engine shows a code for it");
+    assert!(e.contains(&crafted), "the refused id is the code the engine shows for the interceptor's request: {e}");
+    assert!(estia_engine::tls::is_pairing_id(&own.id) && !estia_engine::tls::is_pairing_id(&crafted));
+    if python3_available() {
+        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/python");
+        let o = tokio::process::Command::new("python3")
+            .arg("pair.py")
+            .args(["--name", "tablet", "--scopes", "generate", "--out"])
+            .arg(h.dir.join("crafted-token"))
+            .current_dir(&examples)
+            .env("ESTIA_URL", &url)
+            .env_remove("ESTIA_PIN")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let (out, err) = (String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+        assert!(!o.status.success() && err.contains("not one an engine makes"), "{out}\n{err}");
+        assert!(!out.contains("code:") && !h.dir.join("crafted-token").exists(), "pair.py showed no code and kept nothing:\n{out}");
+    }
 }
 
-/// estia_tls.py's own checks: the known-answer vectors for both codes, a
+/// The engine never sends a device its own view of the code: not in the
+/// answer to the request, to the reveal, or to any poll, before or after the
+/// approval. Something in between would relay it; the device trusts only the
+/// code it computed, compared with the engine's screen by a person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_engine_never_sends_the_device_its_code() {
+    let h = start_tls(ConnLimits::default(), true).await;
+    let raw = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    let nonce = [9u8; 32];
+    let body = serde_json::json!({"name": "phone", "scopes": ["generate"], "commitment": estia_engine::tls::pairing_commitment(&nonce)});
+    let r = raw.post(format!("{}/engine/pair", h.url())).json(&body).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    let mut answers = vec![r.text().await.unwrap()];
+    let id = serde_json::from_str::<Value>(&answers[0]).unwrap()["id"].as_str().unwrap().to_string();
+    assert!(estia_engine::tls::is_pairing_id(&id), "an id the device can show beside its code: {id}");
+    let reveal = serde_json::json!({"nonce": estia_engine::tls::nonce_hex(&nonce)});
+    let r = raw.post(format!("{}/engine/pair/{id}/reveal", h.url())).json(&reveal).send().await.unwrap();
+    assert!(r.status().is_success());
+    answers.push(r.text().await.unwrap());
+    let poll = || async { raw.get(format!("{}/engine/pair/{id}", h.url())).send().await.unwrap().text().await.unwrap() };
+    answers.push(poll().await);
+    let row = h.state.pairings.list().into_iter().find(|p| p.id == id).unwrap();
+    let (digits, shown) = (row.code.clone().expect("the engine computed its code"), row.code_shown().unwrap());
+    h.state.pairings.approve_with_code(&id, &h.state.tokens, Some(&digits), false).unwrap();
+    answers.push(poll().await);
+    answers.push(poll().await);
+    assert!(answers[3].contains("estia_"), "the token came with the first poll after the approval: {}", answers[3]);
+    for a in &answers {
+        let v: Value = serde_json::from_str(a).unwrap();
+        assert!(v.get("code").is_none() && v.get("confirm").is_none(), "{a}");
+        assert!(!a.contains(&format!("\"{digits}\"")) && !a.contains(&shown), "the engine's code reached the device: {a}");
+    }
+}
+
+/// estia_tls.py's own checks: the known-answer vector for the code, a
 /// pinned context that refuses to start without a pin, and plain http only to
 /// this machine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

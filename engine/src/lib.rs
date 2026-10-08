@@ -36,7 +36,7 @@
 //!   An engine on the LAN serves HTTPS with its own certificate, which a
 //!   device pins ([`RemoteEngine::with_pin`], feature `remote-tls`);
 //!   [`remote::begin_pairing`] gets the token, and the pin once the user
-//!   confirms it with the code the engine's operator reads out.
+//!   confirms that the engine shows the same code as the device.
 //! - [`tls`]: the certificate as clients see it: [`Fingerprint`], the
 //!   [`PairingCode`]s both ends of a pairing compute, and the pin check.
 //!

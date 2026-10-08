@@ -183,7 +183,7 @@ Quarterly revenue grew twelve percent.</textarea>
   <div class="card">
     <h2>Pending pairings</h2>
     <div class="tbl"><table><thead><tr><th>Id</th><th>Name</th><th>From</th><th>Scopes</th><th>Status</th><th>Code</th><th></th></tr></thead><tbody id="pairings"></tbody></table></div>
-    <p class="note">Approving from here needs an <code>admin</code> token. A device that pairs over https shows a 6-digit code: approve with the code <em>the device</em> shows, and the engine checks it against its own. The engine then gives a confirmation code: read it to the person at the device, who types it there. On the engine machine, <code>estia pair approve &lt;id&gt; --code &lt;code&gt;</code> does the same.</p>
+    <p class="note">Approving from here needs an <code>admin</code> token. A device that pairs over https shows a 6-digit code, and the Code column shows the engine's code for its request, computed from the engine's own certificate. Approve only when the two are the same, comparing this column and nothing else: a name or an address can hold digits too. If the device shows another code, something between it and the engine presented its own certificate, so deny the request. Once approved, the device asks whether the engine shows its code; the person there says yes only if this column shows it. On the engine machine, <code>estia pair approve &lt;id&gt;</code> shows the code and asks the same.</p>
   </div>
   <div class="card">
     <h2>Load</h2>
@@ -609,8 +609,8 @@ async function loadAdmin() {
     const p = await json("GET", "/engine/pairings");
     $("pairings").innerHTML = p.pairings.length ? p.pairings.map((x) => `<tr><td class="mono">${esc(x.id)}</td><td>${esc(x.name)}</td><td class="mono">${esc(x.from || "")}</td><td>${(x.scopes || []).map((sc) => (sc === "admin" || sc === "models:write") ? `<strong class="bad">${esc(sc)}</strong>` : esc(sc)).join(", ")}</td>
       <td>${esc(x.status)}${x.claimed ? " · claimed" : ""}</td>
-      <td class="mono">${x.check === "code" ? "set" : x.check === "waiting" ? "waiting" : x.check === "none" ? `<span class="warn">none</span>` : "—"}</td>
-      <td>${x.status === "pending" ? `<button class="b s" data-ok="${esc(x.id)}" data-name="${esc(x.name)}" data-check="${esc(x.check || "")}" data-scopes="${esc((x.scopes || []).join(","))}">Approve</button> <button class="b s" data-no="${esc(x.id)}">Deny</button>` : ""}</td></tr>`).join("")
+      <td class="mono">${x.check === "code" && /^\d{6}$/.test(x.code || "") ? `<strong>${esc(x.code.slice(0, 3))} ${esc(x.code.slice(3))}</strong>` : x.check === "waiting" ? "waiting" : x.check === "none" ? `<span class="warn">none</span>` : "—"}</td>
+      <td>${x.status === "pending" ? `<button class="b s" data-ok="${esc(x.id)}" data-name="${esc(x.name)}" data-check="${esc(x.check || "")}" data-code="${esc(x.code || "")}" data-scopes="${esc((x.scopes || []).join(","))}">${x.check === "code" ? "The device shows this code — approve" : "Approve"}</button> <button class="b s" data-no="${esc(x.id)}">Deny</button>` : ""}</td></tr>`).join("")
       : `<tr><td colspan="7" class="mute">none</td></tr>`;
   } catch (e) { $("pairings").innerHTML = `<tr><td colspan="7" class="bad">${esc(e.message)}</td></tr>`; }
   try {
@@ -625,16 +625,18 @@ $("pairings").addEventListener("click", async (e) => {
   // Granting admin hands over the whole engine (tokens, pairings, models); make it a decision.
   const scopes = (e.target.dataset.scopes || "").split(",");
   if (ok && scopes.includes("admin") && !confirm(`"${e.target.dataset.name}" is asking for ADMIN: it could approve other devices, mint tokens and delete models.\n\nApprove only if you started this request yourself.`)) return;
-  // The code is typed from the device's screen, never shown here: the
-  // engine compares it with the one it computed from its own certificate.
+  // A request with a code is approved with the code shown in its row,
+  // sent back: the engine refuses one without it, so nothing approves such a
+  // request without having shown its code. The button says what the person
+  // checked before pressing it.
   let body = {};
+  const code = e.target.dataset.code || "";
   if (ok) {
     const check = e.target.dataset.check;
     if (check === "waiting") { alert("The device has not finished the certificate check yet; try again in a moment."); return; }
     if (check === "code") {
-      const code = prompt(`Type the 6-digit code "${e.target.dataset.name}" shows:`);
-      if (!code) return;
-      body = { code: code.replace(/[\s-]/g, "") };
+      if (!/^\d{6}$/.test(code)) { alert("The engine lists no code for this request yet; try again in a moment."); return; }
+      body = { code };
     }
     if (check === "none") {
       if (!confirm(`"${e.target.dataset.name}" came over https without a pairing code: a browser or curl cannot show one.\n\nIf the device shows a 6-digit code, cancel and deny this request: something between it and the engine removed the code.\n\nOtherwise approve only if the certificate fingerprint it shows matches \`estia tls fingerprint\` on the engine's machine.`)) return;
@@ -643,8 +645,8 @@ $("pairings").addEventListener("click", async (e) => {
   }
   try {
     const r = await json("POST", `/engine/pairings/${encodeURIComponent(ok || no)}/${ok ? "approve" : "deny"}`, body);
-    // The device trusts the engine only once this code is typed there.
-    if (ok && r && r.confirm) alert(`Approved. On "${e.target.dataset.name}", type this confirmation code:\n\n${r.confirm.slice(0, 3)} ${r.confirm.slice(3)}`);
+    // The device trusts the engine only once its user says the engine shows its code.
+    if (ok && r && r.check === "code") alert(`Approved. "${e.target.dataset.name}" now asks whether the engine shows its code. The answer there is yes only if the code it asks about is ${code.slice(0, 3)} ${code.slice(3)}, the one this engine shows.`);
   } catch (err) { alert(err.message); }
   loadAdmin();
 });

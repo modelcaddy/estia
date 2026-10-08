@@ -24,7 +24,7 @@ through. The check runs in the handshake itself (sslsocket_class and
 sslobject_class), so it covers sockets, deferred handshakes and asyncio
 transports alike.
 
-Run it to check the pairing-code functions against the known-answer vector in
+Run it to check the pairing-code function against the known-answer vector in
 docs/api.md:
 
     python estia_tls.py
@@ -149,8 +149,8 @@ class PinnedContext(ssl.SSLContext):
         """For pairing only: records the first certificate it sees (in `.pin`)
         and requires that one from then on, so one context carries a whole
         pairing and a certificate swapped in the middle is refused. Nothing
-        has vouched for that certificate until the pairing's codes match: see
-        pair.py."""
+        has vouched for that certificate until the user confirms that the
+        engine shows the device's pairing code: see pair.py."""
         return cls(_LEARN)
 
     def check_peer(self, der: bytes | None) -> None:
@@ -233,25 +233,15 @@ def pairing_commitment(device_nonce: bytes) -> str:
     return hashlib.sha256(b"estia pairing commitment v1\x00" + device_nonce).hexdigest()
 
 
-def _six_digits(label: bytes, fp: str, device_nonce: bytes, engine_nonce: bytes) -> str:
-    d = hashlib.sha256(label + b"\x00" + bytes.fromhex(normalize(fp)) + device_nonce + engine_nonce).digest()
-    return f"{int.from_bytes(d[:8], 'big') % 1_000_000:06d}"
-
-
 def pairing_code(fp: str, device_nonce: bytes, engine_nonce: bytes) -> str:
-    """The 6-digit code the device shows: computed from the certificate it
-    saw; the engine computes it from its own. The operator types the device's
-    into `estia pair approve <id> --code <code>`."""
-    return _six_digits(b"estia pairing code v1", fp, device_nonce, engine_nonce)
-
-
-def pairing_confirmation(fp: str, device_nonce: bytes, engine_nonce: bytes) -> str:
-    """The 6-digit code `estia pair approve` prints once it accepted the
-    pairing code. The user types it into the device, which compares it with
-    this, computed from the certificate it saw, and pins that certificate only
-    when they match: the proof that the approval came from the engine. Never
-    show it on the device."""
-    return _six_digits(b"estia pairing confirm v1", fp, device_nonce, engine_nonce)
+    """The 6-digit code the device shows, computed from the certificate it saw;
+    the engine computes its own from its certificate and shows it on its
+    machine (`estia pair approve`, `estia pair list`). They are the same only
+    when the device saw the engine's certificate: a person compares the two
+    screens, on both ends. Never take the engine's code from anything the
+    device received: the engine does not send it."""
+    d = hashlib.sha256(b"estia pairing code v1\x00" + bytes.fromhex(normalize(fp)) + device_nonce + engine_nonce).digest()
+    return f"{int.from_bytes(d[:8], 'big') % 1_000_000:06d}"
 
 
 if __name__ == "__main__":
@@ -259,7 +249,6 @@ if __name__ == "__main__":
     device, engine = bytes(range(0x20, 0x40)), bytes(range(0x40, 0x60))
     assert pairing_commitment(device) == "71f9884a2523f984d667e49fff85b931cdaff466dc51fe953ca46436319974dd"
     assert pairing_code(fp, device, engine) == "865695"
-    assert pairing_confirmation(fp, device, engine) == "452618"
     assert short(fp) == "0001 0203 0405 0607"
     assert normalize("SHA256 Fingerprint=" + ":".join(fp[i:i + 2].upper() for i in range(0, 64, 2))) == fp
     # A pinned context needs a pin; only learning() starts without one.
@@ -282,4 +271,4 @@ if __name__ == "__main__":
         else:
             raise AssertionError(f"context_for({url!r}) must refuse plain http to another machine")
     assert context_for("https://192.168.1.20:27200", pin=fp).pin == fp
-    print("ok: the pairing codes and commitment match the known-answer vector; contexts refuse to run without a pin")
+    print("ok: the pairing code and commitment match the known-answer vector; contexts refuse to run without a pin")

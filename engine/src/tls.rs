@@ -1,5 +1,5 @@
-//! The engine's TLS certificate as clients see it: its fingerprint, the codes
-//! people type when a device pairs, and the check that pins it.
+//! The engine's TLS certificate as clients see it: its fingerprint, the code
+//! people compare when a device pairs, and the check that pins it.
 //!
 //! On a LAN bind the engine serves HTTPS with a self-signed certificate (the
 //! server's `tls` module makes it). Nothing vouches for that certificate, so
@@ -9,18 +9,19 @@
 //!
 //! How a device learns the fingerprint safely:
 //!
-//! - **Pairing** proves, in both directions, which certificate each end used.
-//!   The device commits to a random nonce ([`pairing_commitment`]) before it
-//!   sees the engine's nonce; both sides then compute two 6-digit codes from
-//!   the fingerprint they each used and the two nonces. The operator types
-//!   the device's [`pairing_code`] into `estia pair approve`, and the engine
-//!   refuses it unless it matches its own: so the engine knows the device saw
-//!   its certificate. `estia pair approve` then prints the engine's
-//!   [`pairing_confirmation`], and the user types it into the device, which
-//!   pins the certificate only if it matches its own: so the device knows the
-//!   approval came from the engine, not from something in between answering
-//!   its polls. Something in between that presented its own certificate gets
-//!   one guess in a million at each code and cannot prepare one in advance.
+//! - **Pairing** proves, in both directions, which certificate each end used,
+//!   the way Bluetooth's numeric comparison does. The device commits to a
+//!   random nonce ([`pairing_commitment`]) before it sees the engine's nonce;
+//!   both sides then compute one 6-digit [`pairing_code`] from the
+//!   fingerprint they each used and the two nonces, and each shows its own.
+//!   A person checks that the two screens show the same code and says so on
+//!   both: the operator on the engine's side (`estia pair approve` asks), so
+//!   the engine knows the device saw its certificate; the user on the
+//!   device's side, so the device knows the engine saw the same exchange and
+//!   pins the certificate only then. Neither end ever sends its code to the
+//!   other: something in between would relay it. Something in between that
+//!   presented its own certificate makes the two codes differ, except by a
+//!   one-in-a-million chance it cannot improve by preparing in advance.
 //! - **Pasting** a fingerprint the operator read with `estia tls fingerprint`
 //!   ([`UnverifiedFingerprint::matches`]).
 //! - **Comparing** the 64-bit short form ([`Fingerprint::short`]) by eye and
@@ -199,11 +200,11 @@ impl Serialize for UnverifiedFingerprint {
     }
 }
 
-/// A 6-digit code both ends of a pairing compute: the pairing code
-/// ([`pairing_code`]), which the device shows and the operator types into
-/// `estia pair approve <id> --code <code>`, and the confirmation code
-/// ([`pairing_confirmation`]), which `estia pair approve` prints and the user
-/// types into the device. Shown as `482 913`.
+/// The 6-digit code both ends of a pairing compute ([`pairing_code`]), each
+/// from the certificate it used: the device shows its own, the engine its own
+/// (`estia pair list`, `estia pair approve`), and a person checks they are the
+/// same. A script approving on the engine's side gives the device's as
+/// `estia pair approve <id> --code 482913`. Shown as `482 913`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PairingCode(u32);
 
@@ -258,7 +259,6 @@ impl<'de> Deserialize<'de> for PairingCode {
 
 const COMMITMENT_LABEL: &[u8] = b"estia pairing commitment v1";
 const CODE_LABEL: &[u8] = b"estia pairing code v1";
-const CONFIRM_LABEL: &[u8] = b"estia pairing confirm v1";
 
 /// What a device sends with its pairing request before it sees the engine's
 /// nonce: SHA-256(`"estia pairing commitment v1"` ‖ 0x00 ‖ nonce), in hex.
@@ -275,26 +275,11 @@ pub fn pairing_commitment(device_nonce: &[u8; 32]) -> String {
 /// ‖ 0x00 ‖ fingerprint ‖ device nonce ‖ engine nonce) as a big-endian
 /// integer, modulo 1 000 000. The device computes it with the fingerprint of
 /// the certificate it saw, the engine with its own; they agree only when the
-/// two are the same certificate. The device shows it; the operator types it.
+/// two are the same certificate. Each end shows its own and never sends it to
+/// the other: a person compares the two screens.
 pub fn pairing_code(fp: &Fingerprint, device_nonce: &[u8; 32], engine_nonce: &[u8; 32]) -> PairingCode {
-    six_digits(CODE_LABEL, fp, device_nonce, engine_nonce)
-}
-
-/// The confirmation code: [`pairing_code`] with the label `"estia pairing
-/// confirm v1"`. It travels the other way: the engine reveals it only to the
-/// operator, once the approval with the right pairing code succeeded
-/// (`estia pair approve` prints it), and the user types it into the device.
-/// Something between the device and the engine can answer the device's polls
-/// with "approved", but cannot show this code where the operator reads it, so
-/// a device that pins only after a match never pins an interceptor's
-/// certificate. It is never sent to the device.
-pub fn pairing_confirmation(fp: &Fingerprint, device_nonce: &[u8; 32], engine_nonce: &[u8; 32]) -> PairingCode {
-    six_digits(CONFIRM_LABEL, fp, device_nonce, engine_nonce)
-}
-
-fn six_digits(label: &[u8], fp: &Fingerprint, device_nonce: &[u8; 32], engine_nonce: &[u8; 32]) -> PairingCode {
     let mut h = Sha256::new();
-    h.update(label);
+    h.update(CODE_LABEL);
     h.update([0]);
     h.update(fp.as_bytes());
     h.update(device_nonce);
@@ -328,6 +313,45 @@ pub fn parse_nonce(s: &str) -> Option<[u8; 32]> {
         out[i] = hex_value(pair[0])? << 4 | hex_value(pair[1])?;
     }
     Some(out)
+}
+
+/// The letters a pairing id is made of: lowercase, without the ones that pass
+/// for a digit (`b g i l o q s z`). A device shows its request's id next to
+/// its pairing code, and whatever answers the request chooses the id, so an
+/// id must not be readable as a code: an interceptor would otherwise answer
+/// with an id such as `771204`, the code the engine shows for a request of
+/// its own, and put that code on the device's screen too.
+pub const PAIRING_ID_ALPHABET: &str = "acdefhjkmnprtuvwxy";
+
+/// Letters in a pairing id: 16 of 18, about 66 bits.
+pub const PAIRING_ID_LEN: usize = 16;
+
+/// A new pairing id: [`PAIRING_ID_LEN`] letters of [`PAIRING_ID_ALPHABET`],
+/// drawn without bias from the operating system's random source.
+pub fn random_pairing_id() -> std::io::Result<String> {
+    let alphabet = PAIRING_ID_ALPHABET.as_bytes();
+    // The largest multiple of the alphabet's size that fits in a byte: bytes
+    // at or above it are drawn again, so every letter is equally likely.
+    let limit = 256 - 256 % alphabet.len();
+    let mut id = String::with_capacity(PAIRING_ID_LEN);
+    while id.len() < PAIRING_ID_LEN {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+        for b in bytes.into_iter().map(usize::from).filter(|b| *b < limit) {
+            if id.len() == PAIRING_ID_LEN {
+                break;
+            }
+            id.push(char::from(alphabet[b % alphabet.len()]));
+        }
+    }
+    Ok(id)
+}
+
+/// Is `s` an id an engine makes ([`random_pairing_id`])? A device pairing
+/// over HTTPS refuses any other before it goes on, so no id it shows can pass
+/// for a code.
+pub fn is_pairing_id(s: &str) -> bool {
+    s.len() == PAIRING_ID_LEN && s.bytes().all(|b| PAIRING_ID_ALPHABET.as_bytes().contains(&b))
 }
 
 fn hex_value(b: u8) -> Option<u8> {
@@ -530,15 +554,31 @@ mod tests {
         let code = pairing_code(&fp, &device, &engine);
         assert_eq!(code.digits(), "865695");
         assert_eq!(code.to_string(), "865 695");
-        let confirm = pairing_confirmation(&fp, &device, &engine);
-        assert_eq!(confirm.digits(), "452618");
-        assert_ne!(pairing_confirmation(&Fingerprint::from_bytes(seq(0x01)), &device, &engine), confirm);
         assert_eq!(fp.short(), "0001 0203 0405 0607");
         assert_eq!(fp.to_hex(), "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         // Every input matters.
         assert_ne!(pairing_code(&Fingerprint::from_bytes(seq(0x01)), &device, &engine), code);
         assert_ne!(pairing_code(&fp, &seq(0x21), &engine), code);
         assert_ne!(pairing_code(&fp, &device, &seq(0x41)), code);
+    }
+
+    /// Pairing ids cannot pass for a code: letters only, none that reads as
+    /// a digit; and a device refuses anything else.
+    #[test]
+    fn pairing_ids_hold_no_digit_and_nothing_like_one() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = random_pairing_id().unwrap();
+            assert!(is_pairing_id(&id), "{id}");
+            assert!(!id.chars().any(|c| c.is_numeric() || "bgilqosz".contains(c)), "{id}");
+            seen.insert(id);
+        }
+        assert_eq!(seen.len(), 200, "ids do not repeat");
+        assert!(PAIRING_ID_ALPHABET.chars().all(|c| c.is_ascii_lowercase()));
+        for not_an_id in ["771204", "6de47a30928f4f15", "", "acdefhjkmnprtuv", "acdefhjkmnprtuvwx", "ACDEFHJKMNPRTUVW", "acdefhjkmnprtuv1"]
+        {
+            assert!(!is_pairing_id(not_an_id), "{not_an_id}");
+        }
     }
 
     #[test]

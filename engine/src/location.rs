@@ -25,7 +25,7 @@ pub enum EngineLocation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
         /// The engine's certificate fingerprint, from pairing (what
-        /// [`crate::PendingPairing::confirm`] returns) or confirmed by the
+        /// [`crate::PendingPairing::confirm_match`] returns) or confirmed by the
         /// user: connect with [`EngineLocation::connect`]. `None` for plain
         /// HTTP on this machine. JSON `"pin": "<64 hex digits>"`.
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -200,10 +200,10 @@ release from working. For Estia that covers:
 - **Discovery.** The Bonjour service type `_estia._tcp` and the keys of its
   record (`api_version`, `engine_version`, `protocol_version`, and on an
   engine serving HTTPS `tls` and `fp`).
-- **Pairing codes and pins.** The commitment, pairing code and confirmation
-  code definitions in [api.md](api.md#pairing) (their labels end in `v1`; a
-  change is a new label), and the fingerprint format devices store (the
-  SHA-256 of the certificate's DER bytes, 64 hex digits).
+- **Pairing codes and pins.** The commitment and pairing code definitions in
+  [api.md](api.md#pairing) (their labels end in `v1`; a change is a new
+  label), and the fingerprint format devices store (the SHA-256 of the
+  certificate's DER bytes, 64 hex digits).
 - **The Rust API** of the library crates: their public items, under
   [Cargo's SemVer rules](https://doc.rust-lang.org/cargo/reference/semver.html).
 - **The model registry.** Models may be added in any release. Removing one,

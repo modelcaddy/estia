@@ -48,8 +48,12 @@ The concepts behind them are explained in
 
    On another device, pair instead. Run `python/pair.py` (or
    `estia pair request --engine https://<engine>:27200`); it shows a 6-digit
-   code. Approve the request on the engine's machine with `estia pair approve
-   <id> --code <code>`. The engine must be serving the LAN (`estia serve
+   code. On the engine's machine, `estia pair approve <id>` shows the
+   engine's code for the request: approve if it is the same, then answer yes
+   on the device when it asks whether the engine shows its code (from a
+   script, with no terminal, give the engine's six digits instead: a piped
+   `y` is refused). The engine
+   must be serving the LAN (`estia serve
    --lan`) for other devices to reach it, and then it serves https with its
    own certificate: pairing prints the fingerprint to pin (`ESTIA_PIN`).
 
@@ -109,7 +113,7 @@ From another device, over https, the Python examples need the pin as well:
 
 ```bash
 export ESTIA_URL=https://192.168.1.20:27200
-python pair.py --name "my laptop"        # shows a code, asks for the confirmation code, prints ESTIA_PIN
+python pair.py --name "my laptop"        # shows a code, asks whether the engine shows it too, prints ESTIA_PIN
 export ESTIA_TOKEN=$(cat estia-token) ESTIA_PIN=<what pair.py printed>
 python chat.py
 ```

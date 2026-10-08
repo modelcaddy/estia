@@ -25,10 +25,11 @@
 //! - `https://` with a pin ([`RemoteEngine::with_pin`], [`RemoteEngine::connect`]):
 //!   how a device talks to an engine on the LAN. Exactly the certificate with
 //!   that SHA-256 fingerprint is trusted, whatever its names or dates. The pin
-//!   comes from pairing ([`begin_pairing`], then [`PendingPairing::confirm`]
-//!   with the confirmation code the operator read), or from `estia tls
-//!   fingerprint` on the engine's machine, pasted into the app and checked
-//!   against [`probe_certificate`]. A different certificate is
+//!   comes from pairing ([`begin_pairing`], then
+//!   [`PendingPairing::confirm_match`] once the user said the engine shows the
+//!   same code as the device), or from `estia tls fingerprint` on the engine's
+//!   machine, pasted into the app and checked against [`probe_certificate`].
+//!   A different certificate is
 //!   [`SessionError::CertificateMismatch`], and the request is never sent.
 //!   Needs the `remote-tls` feature.
 //! - `https://` without a pin ([`RemoteEngine::new`]): the system's trust
@@ -505,7 +506,7 @@ impl RemoteEngine {
     /// (`check: none`): the operator can approve it only explicitly without
     /// one, and the device learns nothing about the certificate it pins. Use
     /// [`begin_pairing`], which checks the certificate both ways.
-    #[deprecated(since = "0.5.0", note = "use begin_pairing, which checks the engine's certificate with a code both ways")]
+    #[deprecated(since = "0.5.0", note = "use begin_pairing, which checks the engine's certificate with a code compared on both ends")]
     pub fn pair_request(&self, name: &str, scopes: &[&str]) -> Result<String> {
         off_reactor(|| {
             let resp = self
@@ -531,9 +532,10 @@ impl RemoteEngine {
     }
 
     /// Admin: pending and recent pairings on the daemon. Each row carries
-    /// `check` (`code`, `waiting`, `none` or `plain`), `code`, the code the
-    /// engine computed for it (see [`crate::tls`]), and once approved
-    /// `confirm`, the confirmation code for the user to type into the device.
+    /// `check` (`code`, `waiting`, `none` or `plain`) and `code`, the code the
+    /// engine computed for it from its own certificate (see [`crate::tls`]):
+    /// show it to the operator, who checks the device shows the same, and to
+    /// the user at the device, who checks the same before confirming there.
     pub fn pairings(&self) -> Result<Value> {
         self.get_json("/engine/pairings")
     }
@@ -551,8 +553,8 @@ impl RemoteEngine {
     /// approval sends no code, so an engine from 0.5 on accepts it only for a
     /// request over plain HTTP from its own machine (`check: plain`). It
     /// refuses it for a request with a code (use
-    /// [`RemoteEngine::approve_pairing`] with the code the device shows) and
-    /// for a request over HTTPS without one (`check: none`, see
+    /// [`RemoteEngine::approve_pairing`] with the code the operator compared)
+    /// and for a request over HTTPS without one (`check: none`, see
     /// [`RemoteEngine::approve_pairing_without_code`]).
     pub fn decide_pairing(&self, id: &str, approve: bool) -> Result<Value> {
         if approve {
@@ -565,12 +567,19 @@ impl RemoteEngine {
         })
     }
 
-    /// Admin: approve a pairing with the code the device shows (`482913`, or
-    /// `482 913`). The engine compares it with the code it computed from its
-    /// own certificate and refuses a mismatch: the device then saw another
-    /// certificate, and the request should be denied. The answer carries
-    /// `confirm`, the confirmation code to show the user, who types it into
-    /// the device ([`PendingPairing::confirm`]).
+    /// Admin: approve a pairing with its code (`482913`, or `482 913`). Show
+    /// the operator the code [`RemoteEngine::pairings`] lists for the request,
+    /// ask whether the device shows the same, and send that code back only on
+    /// their yes. The engine refuses an approval of a request with a code
+    /// unless the code given equals its own: that ties the approval to this
+    /// request and stops a blind or codeless one (a request whose commitment
+    /// something in between stripped). It cannot tell whether anyone
+    /// compared: code that sends back the listed code without asking approves
+    /// without looking, whatever the device shows. A script that read the
+    /// code off the device gives that one instead; a mismatch is refused, and
+    /// the request should then be denied. Then tell the user at the device to
+    /// confirm there that the engine shows the same code
+    /// ([`PendingPairing::confirm_match`]).
     ///
     /// `None` only for a request over plain HTTP from the engine's own
     /// machine (`check: plain`), or an engine older than 0.5.
@@ -648,22 +657,28 @@ pub fn probe_certificate(base_url: &str) -> Result<UnverifiedFingerprint> {
 ///
 /// Over `https://` it connects without trusting the engine yet, commits to a
 /// random nonce, asks for a token, reveals the nonce once the engine has
-/// answered with its own, and computes two 6-digit codes from the certificate
-/// it saw and the two nonces:
+/// answered with its own, and computes the 6-digit pairing code
+/// ([`PendingPairing::code`]) from the certificate it saw and the two nonces.
+/// The engine computes its own from its certificate and shows it to the
+/// operator; neither end sends its code to the other. A person compares the
+/// two screens and confirms on both:
 ///
-/// - the **pairing code** ([`PendingPairing::code`]): show it. The operator
-///   types it into `estia pair approve <id> --code <code>`, and the engine
-///   approves only when it computed the same code from its own certificate.
+/// - on the engine's side, `estia pair approve <id>` shows the engine's code
+///   and approves only when the operator says the device shows the same.
 ///   That tells the engine the device saw its certificate.
-/// - the **confirmation code**, which the device keeps: `estia pair approve`
-///   prints the engine's, and the user types it into the device
-///   ([`PendingPairing::confirm`]). That tells the device the approval came
-///   from the engine. Without it a device cannot tell: whatever answered its
-///   request could also answer its polls with "approved" and a token of its
-///   own making.
+/// - on the device's side, once [`PendingPairing::poll`] says approved, ask
+///   the user whether the engine shows the code this device shows, and call
+///   [`PendingPairing::confirm_match`] only on a yes. That tells the device
+///   the engine saw the same exchange: without it a device cannot tell, since
+///   whatever answered its request could also answer its polls with
+///   "approved" and a token of its own making.
 ///
-/// The certificate seen here is the one every later call of this pairing must
-/// present (the polls included), and the pin once confirmed.
+/// Something in between that presented its own certificate makes the two
+/// codes differ. The certificate seen here is the one every later call of
+/// this pairing must present (the polls included), and the pin once the user
+/// confirmed. An answer whose pairing id is not one an engine makes
+/// ([`tls::is_pairing_id`]: letters that cannot pass for digits) is refused
+/// before the reveal, since the id is shown next to the code.
 ///
 /// `http://` is allowed for this machine only (`localhost`, a loopback
 /// address), with no codes: to another machine the token would cross the
@@ -678,6 +693,8 @@ pub fn begin_pairing(base_url: &str, name: &str, scopes: &[&str]) -> Result<Pend
         Some("https") => {}
         Some("http") if is_loopback_url(&base_url) => {
             let engine = RemoteEngine::new(base_url.clone(), None)?;
+            // No code on this machine, so no id to mistake for one: an engine
+            // older than 0.5, with hex ids, pairs too.
             let (id, expires_in) = off_reactor(|| request_pairing(&engine, name, scopes, None))?.0;
             return Ok(PendingPairing::new(base_url, id, None, expires_in));
         }
@@ -694,6 +711,17 @@ pub fn begin_pairing(base_url: &str, name: &str, scopes: &[&str]) -> Result<Pend
     let ((id, expires_in), answer) = off_reactor(|| request_pairing(&engine, name, scopes, Some(&tls::pairing_commitment(&nonce))))?;
     let seen = engine.pin().ok_or_else(|| err("pair request: the engine presented no certificate"))?;
     check_stated(&answer, seen)?;
+    // The id is shown next to the code, and whatever answered chose it: an
+    // id that could pass for a code (`771204`) is refused before the reveal.
+    if !tls::is_pairing_id(&id) {
+        return Err(err(format!(
+            "pair request: the answer's pairing id `{}` is not one an engine makes ({} letters, none that pass for a \
+             digit): whatever answered may be putting a code of its own on this screen. Stop, and pair again from a \
+             network you trust",
+            id.chars().take(32).collect::<String>(),
+            tls::PAIRING_ID_LEN
+        )));
+    }
     let engine_nonce = answer["engine_nonce"].as_str().and_then(tls::parse_nonce).ok_or_else(|| {
         err("the engine did not answer the commitment with a nonce: it is older than 0.5, or did not see this request arrive over https")
     })?;
@@ -706,11 +734,7 @@ pub fn begin_pairing(base_url: &str, name: &str, scopes: &[&str]) -> Result<Pend
             .map_err(|e| engine.transport_err("pair reveal", e))?;
         RemoteEngine::check(resp).map(drop)
     })?;
-    let codes = Codes {
-        certificate: seen,
-        code: tls::pairing_code(&seen, &nonce, &engine_nonce),
-        confirmation: tls::pairing_confirmation(&seen, &nonce, &engine_nonce),
-    };
+    let codes = Codes { certificate: seen, code: tls::pairing_code(&seen, &nonce, &engine_nonce) };
     let pending = PendingPairing::new(base_url, id, Some(codes), expires_in);
     let _ = pending.client.set(engine);
     Ok(pending)
@@ -753,20 +777,26 @@ fn check_stated(answer: &Value, seen: Fingerprint) -> Result<()> {
 /// What an `https://` pairing computed from the certificate it saw.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Codes {
-    /// The certificate this device saw: the pin once confirmed.
+    /// The certificate this device saw: the pin once the user confirmed.
     certificate: Fingerprint,
-    /// The pairing code, shown to the operator.
+    /// The pairing code, shown on the device and compared with the engine's.
     code: PairingCode,
-    /// The confirmation code the engine's operator will read out; kept here
-    /// and never shown.
-    confirmation: PairingCode,
 }
 
 /// A pairing in progress on the device: what [`begin_pairing`] returns. It
-/// holds no secret (an interceptor could compute every code in it from what
+/// holds no secret (an interceptor could compute the code in it from what
 /// crossed the network), so a host can keep it between calls (it serialises)
-/// and poll from wherever. It must never show the confirmation code it
-/// expects: the user types the one the engine's operator reads.
+/// and poll from wherever.
+///
+/// The flow on the device: show [`PendingPairing::code`], large, from the
+/// start; [`PendingPairing::poll`] every couple of seconds; once it says
+/// [`PairingOutcome::Approved`], keep the token aside and ask the user
+/// "Does the engine show 482 913?" with this device's code; on a yes,
+/// [`PendingPairing::confirm_match`] returns the pin to store with the token.
+/// On a no, discard the token and ask the operator to deny the request.
+/// Compare only against what the engine's own screen shows (`estia pair
+/// list`, `estia pair approve`, an admin app), never against anything this
+/// device received: the engine never sends its code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingPairing {
     base_url: String,
@@ -788,13 +818,13 @@ pub enum PairingOutcome {
     Pending,
     /// The operator refused.
     Denied,
-    /// An answer of "approved", with the token (handed over once: store it
+    /// An answer of "approved", with the token (handed over once: keep it
     /// now). Over `https://` this alone proves nothing: whatever answered the
     /// device's request could answer its polls too, with a token of its own.
-    /// Before using the token, ask the user for the confirmation code `estia
-    /// pair approve` printed on the engine's machine and pass it to
-    /// [`PendingPairing::confirm`], which returns the pin. A loopback
-    /// `http://` pairing has nothing to confirm
+    /// Before using the token, ask the user whether the engine shows the code
+    /// this device shows ([`PendingPairing::code`]), and on a yes call
+    /// [`PendingPairing::confirm_match`], which returns the pin. A loopback
+    /// `http://` pairing has no code to compare
     /// ([`PendingPairing::needs_confirmation`] is false).
     Approved { token: String },
     /// Approved, but an earlier poll collected the token. Ask the operator to
@@ -819,50 +849,52 @@ impl PendingPairing {
         &self.base_url
     }
 
-    /// The pairing code to show, large: the operator types it on the engine's
-    /// machine. `None` for a loopback `http://` pairing.
+    /// The pairing code this device computed from the certificate it saw:
+    /// show it, large, while the pairing is pending, and again when asking
+    /// the user whether the engine shows the same. `None` for a loopback
+    /// `http://` pairing.
     pub fn code(&self) -> Option<&PairingCode> {
         self.codes.as_ref().map(|c| &c.code)
     }
 
-    /// The certificate this device saw. Nothing has vouched for it until
-    /// [`PendingPairing::confirm`] matches; that returns it as the pin.
-    /// `None` for a loopback `http://` pairing.
+    /// The certificate this device saw. Nothing has vouched for it until the
+    /// user confirmed the codes match ([`PendingPairing::confirm_match`],
+    /// which returns it as the pin). `None` for a loopback `http://` pairing.
     pub fn certificate(&self) -> Option<UnverifiedFingerprint> {
         self.codes.map(|c| UnverifiedFingerprint::new(c.certificate))
     }
 
-    /// Does this pairing end with a confirmation code typed on the device?
-    /// True over `https://`; false for a loopback `http://` pairing.
+    /// Must the user confirm, once approved, that the engine shows this
+    /// device's code? True over `https://`; false for a loopback `http://`
+    /// pairing, which has no certificate and no code.
     pub fn needs_confirmation(&self) -> bool {
         self.codes.is_some()
     }
 
-    /// The device's half of the check: `typed` is the confirmation code that
-    /// `estia pair approve` printed on the engine's machine (`452618`, or
-    /// `452 618`). When it equals the one this device computed from the
-    /// certificate it saw, the engine approved this very request having seen
-    /// that certificate's code, and the certificate is returned: the pin, to
-    /// store with the token. Any other code is an error: either a typo (ask
-    /// again), or the approval did not come from the engine, and the token
-    /// must not be used.
+    /// The device's half of the check, after the user said yes to "Does the
+    /// engine show 482 913?" (this device's [`PendingPairing::code`]): returns
+    /// the pin to store with the token, the certificate this device saw.
+    /// Over `https://` it is always `Some`; `None` for a loopback `http://`
+    /// pairing, which has nothing to pin.
     ///
-    /// Read the code only from the engine's machine (the operator, `estia
-    /// pair approve`, an admin app), never from anything this device received.
-    pub fn confirm(&self, typed: &str) -> Result<Fingerprint> {
-        let Some(codes) = self.codes else {
-            return Err(err("this pairing went over plain http to this machine: it has no certificate and nothing to confirm"));
-        };
-        let given = PairingCode::parse(typed).ok_or_else(|| err("a confirmation code is six digits, such as 452618"))?;
-        if given != codes.confirmation {
-            return Err(err(format!(
-                "that is not the confirmation code this device expects. Check it is the one `estia pair approve {}` printed \
-                 on the engine's machine. If it is, the approval did not come from that engine: something between this \
-                 device and the engine answered in its place. Do not use the token; deny the pairing there and pair again",
-                self.id
-            )));
-        }
-        Ok(codes.certificate)
+    /// It checks nothing itself: the person did. Call it only after an
+    /// explicit yes, given while the engine's screen (`estia pair list`,
+    /// `estia pair approve`, an admin app) was in front of them, and only
+    /// after [`PendingPairing::poll`] returned the token. If the engine shows
+    /// another code, or none, something between this device and the engine
+    /// answered with its own certificate: do not call this, discard the
+    /// token, and ask the operator to deny the request. A device that never
+    /// calls it never pins.
+    ///
+    /// Code with nobody to ask must not call it on its own say-so: then the
+    /// check is gone, and an interceptor that answers the polls with
+    /// "approved" is pinned. Compare instead the six digits read off the
+    /// engine's screen through a channel you trust with [`PendingPairing::code`]
+    /// (`PairingCode::parse`, then `==`), and call this only when they are
+    /// equal, as `estia pair request` does when its input is not a terminal.
+    #[must_use = "the pin: store it with the token"]
+    pub fn confirm_match(self) -> Option<Fingerprint> {
+        self.codes.map(|c| c.certificate)
     }
 
     /// When the engine drops the request if nobody decides (Unix seconds).
@@ -870,12 +902,13 @@ impl PendingPairing {
         self.expires_unix
     }
 
-    /// What the operator runs: `estia pair approve <id> --code 482913`.
+    /// What the operator runs on the engine's machine: `estia pair approve
+    /// <id>`. Over `https://` it shows the engine's code and asks whether this
+    /// device shows the same. The id is letters only, none that pass for a
+    /// digit ([`tls::is_pairing_id`]), so it cannot be mistaken for a code
+    /// beside the one this device shows.
     pub fn approve_command(&self) -> String {
-        match self.code() {
-            Some(c) => format!("estia pair approve {} --code {}", self.id, c.digits()),
-            None => format!("estia pair approve {}", self.id),
-        }
+        format!("estia pair approve {}", self.id)
     }
 
     fn engine(&self) -> Result<Arc<RemoteEngine>> {
@@ -888,8 +921,9 @@ impl PendingPairing {
 
     /// Ask the engine once, over the connection held to the certificate this
     /// device saw. Errors are worth another poll (the engine restarting, Wi-Fi
-    /// dropping) except [`SessionError::CertificateMismatch`]: then cancel,
-    /// and if the engine refused the operator's code, tell the user so too.
+    /// dropping) except [`SessionError::CertificateMismatch`]: then cancel.
+    /// [`PairingOutcome::Approved`] is not the end over `https://`: see
+    /// [`PendingPairing::confirm_match`].
     pub fn poll(&self) -> Result<PairingOutcome> {
         let engine = self.engine()?;
         let v: Value = off_reactor(|| {
@@ -1241,56 +1275,59 @@ mod tests {
         assert_eq!(scheme_of("not a url"), None);
     }
 
-    fn codes(certificate: Fingerprint, code: &str, confirmation: &str) -> Codes {
-        Codes { certificate, code: PairingCode::parse(code).unwrap(), confirmation: PairingCode::parse(confirmation).unwrap() }
+    fn codes(certificate: Fingerprint, code: &str) -> Codes {
+        Codes { certificate, code: PairingCode::parse(code).unwrap() }
     }
 
-    /// A pairing in progress survives a round trip through a host's storage,
+    /// A pairing in progress survives a round trip through a host's storage
+    /// (one stored by the build that also kept a confirmation code included),
     /// and says what the operator runs.
     #[test]
     fn pending_pairings_serialise_and_say_what_to_run() {
         let pin = Fingerprint::of_certificate(b"engine");
-        let p = PendingPairing::new("https://10.0.0.5:27200".into(), "6de47a30928f4f15".into(), Some(codes(pin, "042913", "452618")), 300);
-        assert_eq!(p.approve_command(), "estia pair approve 6de47a30928f4f15 --code 042913");
+        let p = PendingPairing::new("https://10.0.0.5:27200".into(), "hwkrcmatyfendpux".into(), Some(codes(pin, "042913")), 300);
+        assert_eq!(p.approve_command(), "estia pair approve hwkrcmatyfendpux");
         assert_eq!(p.code().unwrap().to_string(), "042 913");
         assert!(p.needs_confirmation());
         assert!(p.certificate().unwrap().matches(&pin));
         let back: PendingPairing = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!((back.id(), back.code().copied()), (p.id(), p.code().copied()));
-        assert_eq!(back.confirm("452 618").unwrap(), pin, "the restored pairing confirms the same way");
+        assert_eq!(back.confirm_match(), Some(pin), "the restored pairing confirms the same way");
+        let older: PendingPairing = serde_json::from_value(serde_json::json!({
+            "base_url": "https://10.0.0.5:27200", "id": "ab", "expires_unix": 0,
+            "codes": {"certificate": pin, "code": "042913", "confirmation": "452618"},
+        }))
+        .unwrap();
+        assert_eq!(older.code().unwrap().digits(), "042913");
         let plain = PendingPairing::new("http://127.0.0.1:1".into(), "ab".into(), None, 300);
         assert_eq!(plain.approve_command(), "estia pair approve ab");
-        assert!(!plain.needs_confirmation() && plain.certificate().is_none());
-        assert!(plain.confirm("452618").is_err(), "nothing to confirm over loopback http");
+        assert!(!plain.needs_confirmation() && plain.certificate().is_none() && plain.code().is_none());
+        assert_eq!(plain.confirm_match(), None, "nothing to pin over loopback http");
     }
 
-    /// The device pins only after the confirmation code the engine's operator
-    /// read matches its own: an "approved" answer alone proves nothing.
+    /// The two screens show the same code only when the device saw the
+    /// engine's certificate, and the device has nothing to pin until the user
+    /// confirms they do: an "approved" answer alone proves nothing.
     #[test]
-    fn the_device_pins_only_the_confirmed_certificate() {
+    fn the_device_pins_only_after_the_user_confirms_the_codes_match() {
         let seen = Fingerprint::of_certificate(b"the certificate this device saw");
         let (nonce_d, nonce_e) = ([1u8; 32], [2u8; 32]);
         let p = PendingPairing::new(
             "https://10.0.0.5:27200".into(),
-            "6de47a30928f4f15".into(),
-            Some(Codes {
-                certificate: seen,
-                code: tls::pairing_code(&seen, &nonce_d, &nonce_e),
-                confirmation: tls::pairing_confirmation(&seen, &nonce_d, &nonce_e),
-            }),
+            "hwkrcmatyfendpux".into(),
+            Some(Codes { certificate: seen, code: tls::pairing_code(&seen, &nonce_d, &nonce_e) }),
             300,
         );
-        // What the real engine prints when its certificate is another one
-        // (the device met an interceptor): refused, with what to do.
-        let engines = tls::pairing_confirmation(&Fingerprint::of_certificate(b"the engine's certificate"), &nonce_d, &nonce_e);
-        let e = p.confirm(&engines.digits()).unwrap_err().to_string();
-        assert!(e.contains("not the confirmation code") && e.contains("Do not use the token"), "{e}");
-        // The pairing code is not the confirmation code.
-        assert!(p.confirm(&p.code().unwrap().digits()).is_err());
-        assert!(p.confirm("12345").unwrap_err().to_string().contains("six digits"));
-        // The engine's own code, from the certificate the device saw.
-        let right = tls::pairing_confirmation(&seen, &nonce_d, &nonce_e);
-        assert_eq!(p.confirm(&right.to_string()).unwrap(), seen);
+        // What the engine shows when its certificate is another one (the
+        // device met an interceptor): another code, so the user says no.
+        let engines = tls::pairing_code(&Fingerprint::of_certificate(b"the engine's certificate"), &nonce_d, &nonce_e);
+        assert_ne!(p.code(), Some(&engines));
+        // What it shows when the device saw its certificate: the same code.
+        assert_eq!(p.code(), Some(&tls::pairing_code(&seen, &nonce_d, &nonce_e)));
+        // Until then the certificate is unverified, which pins nothing.
+        let unverified: UnverifiedFingerprint = p.certificate().unwrap();
+        assert!(unverified.matches(&seen));
+        assert_eq!(p.confirm_match(), Some(seen), "the user said yes: the certificate it saw is the pin");
     }
 
     fn use_it(base: &str) {

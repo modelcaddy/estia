@@ -4,15 +4,16 @@
 What it shows:
   - checking the engine with GET /engine/health (no token needed)
   - over https: recording the certificate the engine presents, and proving
-    with two 6-digit codes, one each way, that it is the engine's own
-    (estia_tls.py)
+    with one 6-digit code, shown on both ends and compared by a person, that
+    it is the engine's own (estia_tls.py)
   - asking for a token with POST /engine/pair: a name, the scopes you need, and
     a commitment to a random nonce; revealing the nonce once the engine has
-    answered with its own, and computing the codes
+    answered with its own, and computing the code
   - polling GET /engine/pair/<id> until the operator approves or denies, and
     giving up before the engine drops the request (5 minutes after it was made)
-  - asking for the confirmation code the operator's `estia pair approve`
-    printed, and keeping the token only when it matches
+  - asking whether the engine shows the same code, and keeping the token only
+    on a yes (typed at a terminal; a script gives the six digits the engine
+    shows instead, which must equal this script's code)
   - saving the token to a file only you can read (mode 0600), and printing the
     certificate fingerprint to pin from now on (ESTIA_PIN)
 
@@ -20,21 +21,29 @@ Scopes: none to run it. The token it receives has the scopes you ask for.
 Standard library only.
 
     ESTIA_URL=https://192.168.1.20:27200 python pair.py --name "kitchen tablet"
-    # it prints a code; on the engine's machine: estia pair approve <id> --code <code>
-    # that prints a confirmation code: type it here when asked
+    # it prints a code; on the engine's machine, `estia pair approve <id>` shows
+    # the engine's code and asks whether this device shows the same
+    # once approved, this script asks whether the engine shows its code: y
     export ESTIA_TOKEN=$(cat estia-token) ESTIA_PIN=<the fingerprint it prints>
 
-Why the codes: nothing vouches for an engine's own certificate, so the first
-connection could be to something in between that presents its own. Both
-codes are computed from the certificate this script saw and from two nonces,
-one of which it committed to before seeing the other; the engine computes them
-from its real certificate, so they agree only when the certificate is the
-engine's. The engine checks the first (the operator types it); this script
-checks the second (you type it), so neither side can be fooled by an answer
-that did not come from the other. If the engine refuses the code, or the
-confirmation code does not match here, stop: do not use the token.
+With stdin not a terminal (a script drives it), "y" is not an answer: a
+script could write it without anyone looking. Write the six digits the engine
+shows for the request instead (`estia pair list` on its machine); this script
+keeps the token only if they equal its own code.
 
-`http://127.0.0.1:27200` (an engine on this machine) pairs without codes.
+Why the code: nothing vouches for an engine's own certificate, so the first
+connection could be to something in between that presents its own. The code
+is computed from the certificate this script saw and from two nonces, one of
+which it committed to before seeing the other; the engine computes its own
+from its real certificate, so the two agree only when the certificate is the
+engine's. Neither end sends its code to the other: you compare the two
+screens, and say so on both. The operator approves only when this device
+shows the engine's code; this script keeps the token only when you say the
+engine shows its code, so neither side is fooled by an answer that did not
+come from the other. If the codes differ, stop: deny the request on the
+engine, and do not use the token.
+
+`http://127.0.0.1:27200` (an engine on this machine) pairs without a code.
 
 It waits 290 s by default (`--wait`), just under the 5 minutes the engine
 keeps a request, and then prints:
@@ -52,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -62,7 +72,7 @@ import estia_tls
 URL = os.environ.get("ESTIA_URL", "http://127.0.0.1:27200").rstrip("/")
 HTTPS = URL.lower().startswith("https://")
 # Over https: pinned to ESTIA_PIN when it is set, else the first certificate
-# seen is recorded and required from then on (the codes below prove it).
+# seen is recorded and required from then on (the code below proves it).
 if HTTPS:
     CTX = estia_tls.PinnedContext(os.environ["ESTIA_PIN"]) if os.environ.get("ESTIA_PIN") else estia_tls.PinnedContext.learning()
 else:
@@ -74,6 +84,11 @@ else:
 EXPIRES_S = 300
 DEFAULT_WAIT_S = 290
 EXPIRY = "The engine drops a pairing request 5 minutes after it was made; run pair.py again to ask anew."
+# What an engine's pairing ids are made of: 16 lowercase letters, none that
+# passes for a digit. This script shows the id next to its code, and whatever
+# answers the request chooses it: an id such as "771204" would put a code on
+# this screen that is not this script's.
+PAIRING_ID = re.compile(r"[acdefhjkmnprtuvwxy]{16}")
 
 
 class EngineError(Exception):
@@ -112,23 +127,42 @@ def check_stated(answer: dict) -> None:
         )
 
 
-def confirm(expected: str) -> bool:
-    """Ask for the confirmation code `estia pair approve` printed on the
-    engine's machine; three tries, for typos. Read from stdin, never shown."""
-    for _ in range(3):
-        print("\napproved. Type the confirmation code `estia pair approve` printed on the engine's machine: ", end="", flush=True)
-        line = sys.stdin.readline()
-        if not line:
-            print("\nno confirmation code: the token is not kept until it is typed", file=sys.stderr)
-            return False
-        typed = "".join(c for c in line if c.isdigit())
-        if typed == expected:
+def confirm(code: str, pid: str) -> bool:
+    """Ask whether the engine shows this script's code for the request (on its
+    machine: `estia pair approve`, `estia pair list`, an admin app). At a
+    terminal a yes counts, and so do the six digits the engine shows. Without
+    one only those digits do: a "y" piped in proves nobody compared anything.
+    Anything else, or no answer, keeps the token back."""
+    at_terminal = sys.stdin.isatty()
+    if at_terminal:
+        print(f"\napproved. Does the engine show {code[:3]} {code[3:]} for this request? [y/N] ", end="", flush=True)
+    else:
+        print(f"\napproved. The six digits the engine shows for request {pid}: ", end="", flush=True)
+    answer = sys.stdin.readline().strip().lower()
+    digits = answer.replace(" ", "").replace("-", "")
+    if len(digits) == 6 and digits.isascii() and digits.isdigit():
+        if digits == code:
             return True
-        print("that is not the confirmation code this device expects.", file=sys.stderr)
+        print(
+            f"\npairing not confirmed; the token is not kept. The engine shows {digits[:3]} {digits[3:]}, this device "
+            f"{code[:3]} {code[3:]}: something between them answered in the engine's place. Deny the request there "
+            f"(estia pair deny {pid}) and pair again.",
+            file=sys.stderr,
+        )
+        return False
+    if answer in ("y", "yes") and at_terminal:
+        return True
+    if answer in ("y", "yes"):
+        print(
+            "\npairing not confirmed; the token is not kept. stdin is not a terminal, so \"y\" is not an answer: a script "
+            f"could write it without anyone comparing the codes. Write the six digits the engine shows for request {pid} "
+            "(estia pair list on its machine) instead.",
+            file=sys.stderr,
+        )
+        return False
     print(
-        "pairing not confirmed: if you typed the code `estia pair approve` printed, the approval did not come from that "
-        "engine: something between this device and the engine answered in its place. Do not use the token; deny the "
-        "pairing on the engine and pair again.",
+        "\npairing not confirmed; the token is not kept. If the engine shows another code, or none, something between "
+        f"this device and the engine answered in its place: deny the request there (estia pair deny {pid}) and pair again.",
         file=sys.stderr,
     )
     return False
@@ -147,7 +181,12 @@ def save_token(path: str, token: str) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Ask an Estia engine for a token and wait for approval.")
-    p.add_argument("--name", default="my-app", help="how the operator sees this device (letters, digits, spaces, . _ - ' ( ))")
+    p.add_argument(
+        "--name",
+        default="my-app",
+        help="how the operator sees this device: letters, digits, single spaces and . _ - ' ( ), "
+        "with at most 4 digits in a row (only a letter such as a-z ends a row)",
+    )
     p.add_argument("--scopes", default="generate,embed,models:read", help="comma-separated scopes to ask for")
     p.add_argument("--out", default="estia-token", help="file to save the token in (created with mode 0600)")
     p.add_argument(
@@ -186,8 +225,18 @@ def main() -> int:
     try:
         pairing = call("POST", "/engine/pair", body)
         check_stated(pairing)
-        pid = pairing["id"]
-        code = expected_confirmation = None
+        pid = str(pairing.get("id") or "")
+        code = None
+        if not pid:
+            print("the engine answered without a pairing id", file=sys.stderr)
+            return 1
+        if HTTPS and not PAIRING_ID.fullmatch(pid):
+            print(
+                f"the answer's pairing id {pid[:32]!r} is not one an engine makes (16 letters, none that pass for a digit): "
+                "whatever answered may be putting a code of its own on this screen. Stop, and pair again from a network you trust.",
+                file=sys.stderr,
+            )
+            return 1
         if HTTPS:
             try:
                 engine_nonce = bytes.fromhex(pairing.get("engine_nonce") or "")
@@ -198,7 +247,6 @@ def main() -> int:
                 return 1
             call("POST", f"/engine/pair/{pid}/reveal", {"nonce": nonce.hex()})
             code = estia_tls.pairing_code(CTX.pin, nonce, engine_nonce)
-            expected_confirmation = estia_tls.pairing_confirmation(CTX.pin, nonce, engine_nonce)
     except EngineError as e:
         if e.status == 429:
             print(f"too many pairing requests are waiting: {e.message}\nWait for one to be decided or to expire (5 minutes).", file=sys.stderr)
@@ -212,10 +260,10 @@ def main() -> int:
     print(f"pairing id: {pid}  (name {args.name!r}, scopes {','.join(scopes)})")
     if code:
         print(f"\n    code: {code[:3]} {code[3:]}\n")
-        print("Approve it on the engine's machine with this code:")
-        print(f"  estia pair approve {pid} --code {code}")
-        print("It prints a confirmation code: type that here when asked.")
-        print("If the engine says the code does not match, stop here: something answered in its place.")
+        print("Approve it on the engine's machine, which shows its own code for this request:")
+        print(f"  estia pair approve {pid}")
+        print(f"Approve only if the engine shows {code[:3]} {code[3:]} too. If it shows another code, stop here:")
+        print("something between this device and the engine answered in its place.")
     else:
         print("Approve it on the engine's machine:")
         print(f"  estia pair approve {pid}")
@@ -264,14 +312,15 @@ def main() -> int:
                 print("\napproved, but the token was already collected by another poll", file=sys.stderr)
                 return 1
             # Over https an "approved" answer alone proves nothing: whatever
-            # answered the request could answer the polls too.
-            if expected_confirmation and not confirm(expected_confirmation):
+            # answered the request could answer the polls too. The person
+            # compares this script's code with the engine's screen.
+            if code and not confirm(code, pid):
                 return 1
             save_token(args.out, token)
             print(f"\napproved. Token saved to {args.out} (mode 0600).")
             print(f"  export ESTIA_TOKEN=$(cat {args.out})")
             if CTX is not None:
-                # The certificate the codes proved: pin it for every later call.
+                # The certificate the code proved: pin it for every later call.
                 print(f"  export ESTIA_PIN={CTX.pin}")
             return 0
     print(f"\nno decision within {args.wait} s. {EXPIRY}", file=sys.stderr)

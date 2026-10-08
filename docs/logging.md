@@ -132,7 +132,7 @@ runner was then version 2.1.0):
 {"timestamp":"2026-09-26T07:29:52.035818Z","level":"INFO","message":"runner handshake","model":"gemma4-e2b-it-4bit-mlx","pid":54146,"runner":"mlx-python","runner_version":"2.1.0","protocol":2,"capabilities":"generate,stream,embed,cancel,load,chat,tools,prompt_cache,count_tokens","target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:54.259940Z","level":"INFO","message":"model loaded","model":"gemma4-e2b-it-4bit-mlx","kind":"generation","load_ms":2223,"target":"estia_engine::resident","span":{"request_id":"e63b82ec3d6d1695","name":"request"}}
 {"timestamp":"2026-09-26T07:29:55.081943Z","level":"INFO","request_id":"json-stream-1","method":"POST","path":"/v1/chat/completions","status":200,"duration_ms":540,"peer":"127.0.0.1:52658","caller":"builder","asked":"fast","model":"gemma4-e2b-it-4bit-mlx","stream":true,"max_tokens":60,"prompt_tokens":16,"cached_tokens":0,"completion_tokens":36,"time_to_first_token_ms":144,"tokens_per_s":66.7,"finish":"stop","target":"estia_server::access"}
-{"timestamp":"2026-09-26T07:29:55.542889Z","level":"INFO","message":"pairing requested","id":"d4650fbed2ae965a","name":"laptop","scopes":"generate,embed","from":"127.0.0.1","target":"estia_server::pairing","span":{"request_id":"a43995f8678d7f17","name":"request"}}
+{"timestamp":"2026-09-26T07:29:55.542889Z","level":"INFO","message":"pairing requested","id":"vddmwdcnvntravrh","name":"laptop","scopes":"generate,embed","from":"127.0.0.1","target":"estia_server::pairing","span":{"request_id":"a43995f8678d7f17","name":"request"}}
 {"timestamp":"2026-09-26T07:30:07.873609Z","level":"INFO","request_id":"60821612923d0aa3","method":"POST","path":"/v1/embeddings","status":200,"duration_ms":2518,"peer":"127.0.0.1:52682","caller":"embedonly2","asked":"embed","model":"embeddinggemma-300m-4bit","load_ms":2461,"inputs":2,"dims":768,"target":"estia_server::access"}
 {"timestamp":"2026-09-26T07:30:07.883858Z","level":"INFO","request_id":"a7e58cf390b5f3d8","method":"POST","path":"/v1/chat/completions","status":403,"duration_ms":0,"peer":"127.0.0.1:52686","caller":"embedonly2","error_type":"permission_error","error":"token lacks the `generate` scope","target":"estia_server::access"}
 {"timestamp":"2026-09-26T07:31:49.662579Z","level":"INFO","message":"released idle model","model":"gemma4-e2b-it-4bit-mlx","idle_s":60,"target":"estia_server"}
@@ -276,7 +276,7 @@ does not apply to the request is left out.
 | `runtime install started`, `runtime install phase`, `runtime install finished`, `runtime install failed` | info, warn on failure | `job_id`, `phase`, `step`, `python`, `mlx_lm`, `secs`, `error` |
 | `role table replaced` | info | `roles` |
 | `pairing requested` | info | `id`, `name`, `scopes`, `from`, `check` (`waiting` for a request with a commitment, `none`, `plain`) |
-| `pairing code ready; the operator approves with the code the device shows` | info | `id`, `name`. The device revealed its nonce; neither code is logged |
+| `pairing code ready; the operator approves once the device shows the same code as this engine` | info | `id`, `name`. The device revealed its nonce; the code is not logged |
 | `pairing approved` | info | `id`, `name`, `scopes`, `token_name`, `check` |
 | `pairing denied` | info | `id`, `name`, `revoked`, `token_name` |
 | `pairing token collected` | info | `id`, `name` |

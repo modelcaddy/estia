@@ -30,13 +30,35 @@ and use today's names (the project took the name Estia in 0.3.0).
   device again over `https://`, then revoke the token it had: it crossed the
   network in clear.
 - Devices pin the certificate's SHA-256 fingerprint. Pairing proves, both
-  ways, which certificate each end used: the device commits to a nonce, the
-  engine answers with its own, and both compute two 6-digit codes from the
-  fingerprint and the two nonces. The operator types the device's pairing
-  code into `estia pair approve <id> --code <code>`, which prints the
-  confirmation code; the user types that into the device, which pins the
-  certificate only when it matches. `estia pair list` shows each request's
-  code and the engine's certificate.
+  ways, which certificate each end used, by compare-and-confirm (as in
+  Bluetooth's numeric comparison): the device commits to a nonce, the engine
+  answers with its own, and both compute one 6-digit code from the
+  fingerprint and the two nonces. Each shows its own and neither sends it to
+  the other. `estia pair approve <id>` shows the engine's code and asks
+  "Does the device show 482 913? [y/N]"; a yes approves with that code (a
+  script passes `--code`, which must match). Once approved, the device asks
+  whether the engine shows its code and pins the certificate only on a yes,
+  typed at a terminal: with stdin not a terminal, `y` is refused and the
+  device reads the six digits the engine shows instead, pinning only if they
+  equal its own. `estia pair list` shows each request's code and the
+  engine's certificate. What is left is a person who confirms without
+  looking, or code that answers for them, and look-alikes in what the
+  sender chooses (a name's letters, its IPv6 address); SECURITY.md says so.
+- **Breaking:** a pairing name may hold at most 4 digits in a row, so that no
+  name passes for a pairing code on the screens where codes are compared:
+  only a letter with case (a-z, α-ω, а-я, …) ends a row, so spaces,
+  punctuation, modifier letters, combining marks and letters of scripts
+  without case (some print as a blank, a dash or a dot) do not;
+  `phone 482 913` and `phone 482ㅡ913` are a 400. Every default-ignorable
+  character (the Hangul fillers, which are letters that print as a blank,
+  variation selectors, tags) is refused in a name, and escaped wherever the
+  CLI prints text from outside.
+- **Breaking:** pairing ids are 16 letters of `acdefhjkmnprtuvwxy`
+  (lowercase, without `b g i l o q s z`), no longer 16 hex digits. A device
+  shows its id next to its code, so `begin_pairing` and `pair.py` refuse,
+  over HTTPS, an id of any other form before they reveal: an interceptor
+  could otherwise answer with an id made of the code the engine shows for a
+  request of its own.
 - **Breaking:** an approval of a request over HTTPS that has no code (a
   browser, curl, or a commitment stripped on the way) needs the approver's
   explicit word: `estia pair approve <id> --no-code`, or `{"no_code": true}`
@@ -47,31 +69,38 @@ and use today's names (the project took the name Estia in 0.3.0).
 - HTTP: `POST /engine/pair` takes `commitment` and answers `engine_nonce`,
   `check` and `tls`; `POST /engine/pair/{id}/reveal`; `/engine/health` and
   the poll answer carry `tls` (`{fingerprint, short}`, or null on a
-  loopback-only engine); `/engine/pairings` rows carry `check`, `code` and,
-  once approved, `confirm`; the approve route takes `{"code"}` or
-  `{"no_code": true}` and answers `confirm`. Bonjour TXT: `tls`, `fp`.
+  loopback-only engine); `/engine/pairings` rows carry `check` and `code`
+  (the engine's, before and after the approval); the approve route takes
+  `{"code"}` or `{"no_code": true}`. No answer to the device carries the
+  code. Bonjour TXT: `tls`, `fp`.
   `API_VERSION` stays 1: the transport and the pairing checks are the two
   kinds of breaking change it does not count (docs/versioning.md says why);
   everything else is an addition.
 - CLI: `estia tls fingerprint [--json]`, `estia tls rotate [--yes]`; `--pin`
   (default `ESTIA_PIN`, which an `http://` engine ignores) on `remote-check`,
   `dashboard` and `pair list|approve|deny --engine`; `estia pair request`
-  shows the code, asks for the confirmation code, then prints the token and
-  the pin, and `--json` prints `{url, name, scopes, token, pin}`; `estia pair
-  approve` prints the confirmation code; `estia token new` prints the
+  shows the code and, once approved, asks whether the engine shows the same
+  (from a script: the engine's six digits on stdin, never `y`), then prints
+  the token and the pin, and `--json` prints `{url, name, scopes, token,
+  pin}` on stdout and its steps as JSON lines on stderr (`request`, `retry`,
+  `confirm`); `estia pair approve` shows the engine's code and asks in a
+  terminal (`--code`, the code the device shows, without one); `estia token new` prints the
   fingerprint a LAN device needs; `estia status`, `discover` and `service
   install` show the certificate and `https://` URLs, and `status` and
   `dashboard` reach an engine bound to one LAN address over https. LAN
   addresses come from `ip` where there is no `ifconfig`.
 - Rust: `tls::Fingerprint`, `UnverifiedFingerprint`, `PairingCode`,
-  `pairing_commitment`, `pairing_code`, `pairing_confirmation`;
+  `pairing_commitment`, `pairing_code`, `PAIRING_ID_ALPHABET`,
+  `PAIRING_ID_LEN`, `random_pairing_id`, `is_pairing_id`;
   `RemoteEngine::with_pin`, `connect`, `cleartext`, `pin`, `get_json`,
   `approve_pairing`, `approve_pairing_without_code`;
   `EngineLocation::connect`; `remote::probe_certificate`;
   `remote::begin_pairing` → `PendingPairing` (`code`, `certificate`,
-  `needs_confirmation`, `confirm`) → `poll()` → `PairingOutcome`. The pinned
-  client is behind the new `remote-tls` feature of `estia-engine` (rustls
-  with ring); without it those calls return an error naming the feature.
+  `needs_confirmation`, `poll` → `PairingOutcome`, and `confirm_match`, which
+  returns the pin once the user said the engine shows the same code). The
+  pinned client is behind the new `remote-tls` feature of `estia-engine`
+  (rustls with ring); without it those calls return an error naming the
+  feature.
   A host that also uses rustls with aws-lc-rs and lets rustls pick its
   provider must install one at start-up (docs/building-clients.md).
   **Breaking:** `EngineLocation::Remote` has a `pin` field (build it with a
@@ -84,14 +113,19 @@ and use today's names (the project took the name Estia in 0.3.0).
   commitment: use `begin_pairing`). Server: `serve_router_tls`,
   `tls::{TlsIdentity, TlsServe, Transport, VALIDITY_DAYS, load,
   load_or_create, rotate}`, `PairingStore::{request_tls, reveal,
-  approve_with_code}`. **Breaking** for struct literals: `pairing::Pairing`
-  has `tls`, `commitment`, `engine_nonce`, `code` and `confirm`;
+  approve_with_code}`, `pairing::{MAX_NAME_DIGIT_RUN, ends_digit_run,
+  is_format_char}`. **Breaking** for struct
+  literals: `pairing::Pairing` has `tls`, `commitment`, `engine_nonce` and
+  `code`;
   `EngineRecord` has `tls`.
 - Examples: `examples/python/estia_tls.py` pins a certificate with the
   standard library (urllib, and the OpenAI SDK through
   `openai_http_client`); `PinnedContext` refuses to start without a pin
   (`PinnedContext.learning()` is for pairing only), and `context_for`
-  refuses plain http to another machine. `pair.py` pairs with both codes.
+  refuses plain http to another machine. `pair.py` pairs with the code,
+  asking whether the engine shows it too (a yes only from a terminal; a
+  script gives the engine's six digits), and refuses a pairing id an engine
+  would not make.
   The Python examples run on Python 3.9 or newer. The curl quickstart and
   `scripts/smoke-test.sh` take `ESTIA_PINNEDPUBKEY` / `--pinnedpubkey` for
   `curl -k --pinnedpubkey`.

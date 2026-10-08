@@ -6,11 +6,12 @@
 //!   - pinning an engine on the LAN: it serves https with its own
 //!     certificate, and `RemoteEngine::connect` trusts exactly the one whose
 //!     fingerprint it is given (`ESTIA_PIN`, or what pairing returns).
-//!     Pairing shows a 6-digit code the operator types into `estia pair
-//!     approve`, which proves to the engine that the device saw its real
-//!     certificate; `estia pair approve` then prints a confirmation code the
-//!     user types here, which proves to the device that the approval came
-//!     from the engine
+//!     Pairing shows a 6-digit code here, and `estia pair approve` shows the
+//!     engine's own on its machine. The operator approves only when the two
+//!     are the same, which proves to the engine that the device saw its real
+//!     certificate; once approved, this program asks whether the engine shows
+//!     the same code and pins only on a yes, which proves to the device that
+//!     the engine saw the same exchange
 //!   - a streamed chat with a cache key: the second turn reuses the cache
 //!   - cancelling a stream with a `CancelToken`
 //!   - `GenHandle` / `EmbedHandle`: code that holds a handle works the same
@@ -207,16 +208,17 @@ fn run(url: &str) -> Result<()> {
 }
 
 /// Ask for a token and wait for the operator. The token comes back once;
-/// over https the certificate to pin comes from the confirmation code.
+/// over https the certificate to pin comes once the user says the engine
+/// shows the same code as this program.
 fn pair(url: &str, name: &str) -> Result<(String, Option<Fingerprint>)> {
     // Over https: connects without trusting the engine yet, commits to a
-    // nonce, and computes the codes from the certificate it saw.
+    // nonce, and computes the code from the certificate it saw.
     let pending = estia_engine::begin_pairing(url, name, &["generate", "embed"])?;
     if let Some(code) = pending.code() {
         println!("\n    code: {code}\n");
-        println!("The operator types this code on the engine's machine, and `estia pair approve` prints a confirmation");
-        println!("code to type here. If the engine says the code does not match, stop: something between this device");
-        println!("and the engine answered with its own certificate.");
+        println!("`estia pair approve` shows the engine's code on its machine: the operator approves only if it is");
+        println!("{code} too. If the engine shows another code, stop: something between this device and the engine");
+        println!("answered with its own certificate.");
     }
     println!("Approve it on the engine's machine:\n  {}", pending.approve_command());
     // The engine drops an undecided request 300 s after it arrived. Stop
@@ -226,9 +228,9 @@ fn pair(url: &str, name: &str) -> Result<(String, Option<Fingerprint>)> {
         std::thread::sleep(Duration::from_secs(2));
         match pending.poll() {
             Ok(PairingOutcome::Approved { token }) => {
-                // Over https "approved" alone proves nothing: the device
-                // checks the code the operator read from `estia pair approve`.
-                let pin = if pending.needs_confirmation() { Some(confirm(&pending)?) } else { None };
+                // Over https "approved" alone proves nothing: the user checks
+                // that the engine shows the code this program shows.
+                let pin = confirm(pending)?;
                 println!("approved. Store the token somewhere only this app can read; it is not shown again.");
                 println!("To run again without pairing:\n  export ESTIA_URL={url} ESTIA_TOKEN={token}");
                 if let Some(p) = pin {
@@ -251,26 +253,36 @@ fn pair(url: &str, name: &str) -> Result<(String, Option<Fingerprint>)> {
     Err(SessionError::Runner("no decision in time: the request expires 5 minutes after it was made. Pair again.".into()))
 }
 
-/// Read the confirmation code from stdin: the pin once it matches, three
-/// tries for typos.
-fn confirm(pending: &estia_engine::PendingPairing) -> Result<Fingerprint> {
-    let mut last = SessionError::Runner("no confirmation code".into());
-    for _ in 0..3 {
-        print!("Type the confirmation code `estia pair approve` printed on the engine's machine: ");
-        let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        match pending.confirm(line.trim()) {
-            Ok(pin) => return Ok(pin),
-            Err(e) => {
-                eprintln!("{e}");
-                last = e;
-            }
-        }
+/// Ask whether the engine shows this program's code: the pin on a yes
+/// (`None` over http://127.0.0.1, which has no code), an error otherwise.
+/// A yes counts only from a terminal: piped in, nobody compared anything.
+/// Without a terminal, the answer must be the six digits the engine shows
+/// (`estia pair list` on its machine), and they must equal this code.
+fn confirm(pending: estia_engine::PendingPairing) -> Result<Option<Fingerprint>> {
+    use std::io::IsTerminal;
+    let Some(code) = pending.code().copied() else { return Ok(pending.confirm_match()) };
+    let at_terminal = std::io::stdin().is_terminal();
+    if at_terminal {
+        print!("approved. Does the engine show {code} for this request? [y/N] ");
+    } else {
+        print!("approved. The six digits the engine shows for this request: ");
     }
-    Err(last)
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    let answer = line.trim().to_ascii_lowercase();
+    let matched = match estia_engine::PairingCode::parse(&answer) {
+        Some(shown) => shown == code,
+        None => at_terminal && matches!(answer.as_str(), "y" | "yes"),
+    };
+    if matched {
+        return Ok(pending.confirm_match());
+    }
+    Err(SessionError::Runner(format!(
+        "not confirmed, so the token is not used. If the engine shows another code than {code}, something between this \
+         device and the engine answered in its place: deny the request there (estia pair deny {})",
+        pending.id()
+    )))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

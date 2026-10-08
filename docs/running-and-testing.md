@@ -586,50 +586,60 @@ Plain HTTP still works from the engine's own machine (`http://127.0.0.1:27200`);
 from any other device it gets `https_required`.
 
 **A laptop, with a terminal.** If `estia` is installed on the laptop, it pairs,
-shows a code, asks for the confirmation code once you have approved, and
-saves the token in a file only you can read:
+shows a code, asks once you have approved whether the engine shows the same
+code, and saves the token in a file only you can read:
 
 ```console
 $ (umask 077 && estia pair request --engine https://192.168.1.20:27200 --name laptop \
     --scopes generate,embed,models:read > ~/.estia-token)
-engine certificate 78cd 9cd1 cca5 b77a (not trusted yet: the codes check it)
-pairing request `2b1d08617b811355` sent as `laptop`.
+engine certificate 78cd 9cd1 cca5 b77a (not trusted yet: the code checks it)
+pairing request `upvvrnkhkdnxwpvn` sent as `laptop`.
 
     code: 982 541
 
 on the engine's machine, the operator runs:
-  estia pair approve 2b1d08617b811355 --code 982541
-It prints a confirmation code: type that here when asked. If the engine says the code does not match, stop: something between this device and the engine answered in its place.
+  estia pair approve upvvrnkhkdnxwpvn
+which shows the engine's code for this request: they approve only if it is 982 541 too. If the engine shows another code, stop: something between this device and the engine answered in its place.
 waiting up to 290s …
-approved. Type the confirmation code `estia pair approve` printed on the engine's machine: 317 044
+approved. Does the engine show 982 541 for this request? [y/N] y
 pin: 78cd9cd1cca5b77a0f427954f9a1e44e3b5ce0124e9115d9b65afe40b5100d72
   (this engine's certificate: pass it as --pin or ESTIA_PIN to remote-check, dashboard and pair --engine)
 ```
 
-On the engine's machine, type the code the laptop shows, and read the
-confirmation code it prints back to the laptop:
+On the engine's machine, approve: it shows the engine's code and asks
+whether the laptop shows the same. Leave it on screen; the laptop asks the
+same question the other way once you have approved:
 
 ```console
 $ estia pair list
 engine certificate  78cd 9cd1 cca5 b77a  (estia tls fingerprint shows all of it)
 ID                 STATUS                 CODE      SCOPES                       FROM             NAME
-2b1d08617b811355   Pending                982 541   generate,embed,models:read   192.168.1.30     laptop
-$ estia pair approve 2b1d08617b811355 --code 982541
-approved 2b1d08617b811355 with scopes [generate,embed,models:read] from 192.168.1.30, name `laptop`, the code matched — the client collects its token on its next poll
+upvvrnkhkdnxwpvn   Pending                982 541   generate,embed,models:read   192.168.1.30     laptop
+$ estia pair approve upvvrnkhkdnxwpvn
+pairing upvvrnkhkdnxwpvn asks for scopes [generate,embed,models:read] from 192.168.1.30, under the name `laptop`
 
-    confirmation code: 317 044
+    code: 982 541
 
-on the device, type this code to finish pairing: the device checks it before it trusts this engine
+Does the device show 982 541? [y/N] y
+approved upvvrnkhkdnxwpvn with scopes [generate,embed,models:read] from 192.168.1.30, name `laptop`, the codes match — the client collects its token on its next poll
+
+on the device, confirm that this engine shows 982 541: the device trusts this engine only after that
 ```
 
-A wrong code is refused (`the code does not match …`): if the laptop shows a
-different code from the one you typed, deny the request. If the laptop says
-the confirmation code does not match, it does not keep the token: deny the
-request here too. Without `estia`, pair with `examples/python/pair.py`, which
-needs only Python, prints the same code, asks for the confirmation code and
-prints an `export ESTIA_PIN=…` line. Then check the engine from the laptop,
-pinning its certificate (`--pinnedpubkey` is the `curl` line of `estia tls
-fingerprint`):
+If the laptop shows a different code, answer no and deny the request
+(`estia pair deny <id>`); if you answer no on the laptop, it does not keep
+the token: deny the request here too. In a script, `estia pair approve <id>
+--code <the laptop's code>` approves without the question, and a wrong code
+is refused (`the code does not match …`). On the laptop the same holds the
+other way: when `estia pair request` reads from something that is not a
+terminal, a `y` is refused, and it takes the six digits the engine shows for
+the request (`estia pair list`) instead, pinning only if they equal its own
+code; with `--json` it prints the id and its code as a `request` event on
+stderr, and a `confirm` event just before it reads the answer. Without `estia`, pair with
+`examples/python/pair.py`, which needs only Python, prints the same code,
+asks the same question and prints an `export ESTIA_PIN=…` line. Then check
+the engine from the laptop, pinning its certificate (`--pinnedpubkey` is the
+`curl` line of `estia tls fingerprint`):
 
 ```bash
 export ESTIA_PIN=78cd9cd1cca5b77a0f427954f9a1e44e3b5ce0124e9115d9b65afe40b5100d72
@@ -654,7 +664,7 @@ scripts/smoke-test.sh --url https://192.168.1.20:27200 --pinnedpubkey 'sha256//K
 
    ```bash
    estia pair list                                # ID, STATUS, CODE, SCOPES, FROM, NAME
-   estia pair approve 3b3126f92a839435 --no-code
+   estia pair approve dexuhpfwucdypprw --no-code
    ```
 
 4. The page picks up its token and keeps it in the browser. Use the Chat
@@ -666,15 +676,15 @@ The same pairing without a code, by hand with curl on the engine's machine
 ```text
 $ curl -s -X POST http://127.0.0.1:27200/engine/pair -H 'Content-Type: application/json' \
     -d '{"name": "laptop", "scopes": ["generate", "embed", "models:read"]}'
-{"check":"plain","engine_nonce":null,"expires_in":300,"how":"the operator approves with `estia pair approve <id>`; poll GET /engine/pair/<id> until approved","id":"3b3126f92a839435","status":"pending","tls":{…}}
-$ estia pair approve 3b3126f92a839435
-approved 3b3126f92a839435 with scopes [generate,embed,models:read] from 127.0.0.1, name `laptop` — the client collects its token on its next poll
-$ curl -s http://127.0.0.1:27200/engine/pair/3b3126f92a839435
-{"id":"3b3126f92a839435","status":"approved","tls":{…},"token":"estia_..."}
-$ curl -s http://127.0.0.1:27200/engine/pair/3b3126f92a839435
-{"id":"3b3126f92a839435","status":"approved","tls":{…},"token":null}
-$ estia pair deny 3b3126f92a839435
-denied 3b3126f92a839435 (name `laptop`); its token pair:laptop:3b3126f92a839435 was revoked
+{"check":"plain","engine_nonce":null,"expires_in":300,"how":"the operator approves with `estia pair approve <id>`; poll GET /engine/pair/<id> until approved","id":"dexuhpfwucdypprw","status":"pending","tls":{…}}
+$ estia pair approve dexuhpfwucdypprw
+approved dexuhpfwucdypprw with scopes [generate,embed,models:read] from 127.0.0.1, name `laptop` — the client collects its token on its next poll
+$ curl -s http://127.0.0.1:27200/engine/pair/dexuhpfwucdypprw
+{"id":"dexuhpfwucdypprw","status":"approved","tls":{…},"token":"estia_..."}
+$ curl -s http://127.0.0.1:27200/engine/pair/dexuhpfwucdypprw
+{"id":"dexuhpfwucdypprw","status":"approved","tls":{…},"token":null}
+$ estia pair deny dexuhpfwucdypprw
+denied dexuhpfwucdypprw (name `laptop`); its token pair:laptop:dexuhpfwucdypprw was revoked
 ```
 
 The token is handed out once. `estia pair deny` takes it back, even after it
@@ -761,9 +771,9 @@ shows each request and response in full.
 | `estia serve` says it minted an admin token but did not print it | stderr was not a terminal, so the token would have gone to a log file | `estia token new local --replace` prints a new one. |
 | `400` of type `https_required`: `this engine serves other devices over HTTPS only` | A client on another device used `http://` with a LAN engine (an app paired with 0.4, or a typed URL) | Use `https://` and pair again so the app pins the certificate. Then revoke the old token (`estia token list`, `estia token revoke pair:<name>:<id>`): it crossed the network in clear. |
 | `the engine at … presented certificate …, but this app pinned …` (`CertificateMismatch`) | The certificate is not the one the device paired with: the operator ran `estia tls rotate`, the data directory was replaced, or something on the network is answering in the engine's place | Ask the operator. If they rotated it, pair again. If not, do not send anything to that address. |
-| `the code does not match` on `estia pair approve` | The device saw another certificate than the engine's | Deny the request (`estia pair deny <id>`), and cancel on the device. Look for what is between them (a proxy, a captive portal, another machine on the address). |
-| `this request has a code` / `this request came over https with no code` on approve | `--code` and `--no-code` follow the request: a device that pairs over https shows a code; a browser or curl does not | Give the code the device shows, or `--no-code` after comparing the fingerprint; `estia pair list` shows which in the CODE column. A device that shows a code while its request has none (`none`) met something that removed the code: deny it. |
-| `not the confirmation code this device expects` on the device | The code typed is not the one `estia pair approve` printed for this request, or the approval did not come from the engine | Check the code. If it is the one printed, something between the device and the engine answered in its place: do not use the token, and deny the request on the engine. |
+| The device and `estia pair approve` show different codes, or `the code does not match` on `estia pair approve --code` | The device saw another certificate than the engine's | Answer no, deny the request (`estia pair deny <id>`), and answer no on the device. Look for what is between them (a proxy, a captive portal, another machine on the address). |
+| `this request has a code` / `this request came over https with no code` on approve | The flags follow the request: a device that pairs over https shows a code; a browser or curl does not | For a code, run `estia pair approve <id>` in a terminal and compare, or give the code the device shows with `--code` in a script; for none, `--no-code` after comparing the fingerprint. `estia pair list` shows which in the CODE column. A device that shows a code while its request has none (`none`) met something that removed the code: deny it. |
+| `pairing not confirmed` on the device | The user did not answer yes to "Does the engine show … ?" | If the engine shows another code, or none, something between the device and the engine answered in its place: do not use the token, and deny the request on the engine. Otherwise pair again and answer `y`. |
 | `… serves https with its own certificate: give its fingerprint with --pin` | `remote-check`, `dashboard` or `pair --engine` was given an `https://` engine without a pin | `--pin <fingerprint>` or `ESTIA_PIN`: what `estia pair request` printed, or `estia tls fingerprint` on the engine's machine. |
 | A browser warns about the engine's certificate | It is self-signed: no authority vouches for it | Compare the SHA-256 in the browser's certificate viewer with `estia tls fingerprint`, and accept it only if they match. |
 

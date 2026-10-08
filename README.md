@@ -27,9 +27,10 @@ breaking changes before 1.0.
   has not yet run the Gemma 4 GGUF files, and on Linux it has run only in CI
   (the adapter's tests, on Ubuntu x64). Estia does not build for Windows yet.
 - **TLS on the LAN, with a certificate of its own.** A LAN engine serves HTTPS
-  with a self-signed certificate that each device pins when it pairs; two
-  6-digit codes, one typed on each side, prove the device saw the engine's
-  real certificate and the approval came from the engine. Loopback stays
+  with a self-signed certificate that each device pins when it pairs; one
+  6-digit code, shown on both screens and confirmed on both sides, proves the
+  device saw the engine's real certificate and the approval came from the
+  engine. Loopback stays
   plain HTTP. Browsers show a certificate warning
   you accept by hand, after comparing the fingerprint (see
   [Using it from other devices](#using-it-from-other-devices)). Devices
@@ -427,46 +428,62 @@ estia pair request --engine https://192.168.1.20:27200 --name laptop --scopes ge
 ```
 
 ```text
-engine certificate 3f2a 9c41 7b0e d512 (not trusted yet: the codes check it)
-pairing request `772ca7c0bf6ada4b` sent as `laptop`.
+engine certificate 3f2a 9c41 7b0e d512 (not trusted yet: the code checks it)
+pairing request `kdyucekctckcyfnu` sent as `laptop`.
 
     code: 482 913
 
 on the engine's machine, the operator runs:
-  estia pair approve 772ca7c0bf6ada4b --code 482913
-It prints a confirmation code: type that here when asked.
+  estia pair approve kdyucekctckcyfnu
+which shows the engine's code for this request: they approve only if it is 482 913 too. …
 ```
 
-Approve on the engine's machine, typing the code the device shows:
+On the engine's machine, approve. It shows the engine's own code for the
+request and asks whether the device shows the same:
 
 ```bash
 estia pair list                                        # ID, STATUS, CODE, SCOPES, FROM, NAME
-estia pair approve 772ca7c0bf6ada4b --code 482913      # or: estia pair deny 772ca7c0bf6ada4b
+estia pair approve kdyucekctckcyfnu                    # or: estia pair deny kdyucekctckcyfnu
 ```
 
 ```text
-approved 772ca7c0bf6ada4b with scopes [generate,embed,models:read] from 192.168.1.31, name `laptop`, the code matched — …
+pairing kdyucekctckcyfnu asks for scopes [generate,embed,models:read] from 192.168.1.31, under the name `laptop`
 
-    confirmation code: 452 618
+    code: 482 913
 
-on the device, type this code to finish pairing: the device checks it before it trusts this engine
+Does the device show 482 913? [y/N] y
+approved kdyucekctckcyfnu with scopes [generate,embed,models:read] from 192.168.1.31, name `laptop`, the codes match — …
+
+on the device, confirm that this engine shows 482 913: the device trusts this engine only after that
 ```
 
-Type the confirmation code on the device when it asks. It then prints the
+The device then asks `Does the engine show 482 913 for this request? [y/N]`.
+Answer `y` only if the engine's screen shows that code. It then prints the
 token on stdout (`--json` prints `{url, name, scopes, token, pin}` instead)
 and the certificate fingerprint to pin on stderr. It waits up to 290 s for the
 approval (`--wait-seconds`; the engine drops an undecided request after 5
-minutes).
+minutes). In a script, where nobody can answer, approve with the code the
+device shows: `estia pair approve <id> --code 482913`, which the engine
+refuses unless it equals its own. The device side works the same way: when
+its stdin is not a terminal, `y` is not an answer (a script could write it
+without anyone looking), so it reads the six digits the engine shows for the
+request (`estia pair list` on the engine's machine) and pins only if they
+equal its own code. With `--json` it prints the id and its code as JSON
+events on stderr, for a script or an app that wraps it.
 
-The two codes are how the device and the engine prove to each other which
-certificate each used. The device commits to a random number before it learns
-the engine's; both ends then compute both codes from the certificate
-fingerprint they each used and the two numbers. The engine approves only when
-the code you type equals its own, and the device trusts the engine only when
-the confirmation code you type there equals its own. If the engine says the
-code does not match, or the device says the confirmation code does not,
-something between the device and the engine answered with its own
-certificate: deny the request, and cancel on the device.
+The code is how the device and the engine prove to each other which
+certificate each used, the way Bluetooth pairing compares a number on two
+screens. The device commits to a random number before it learns the
+engine's; both ends then compute the code from the certificate fingerprint
+they each used and the two numbers, and each shows its own: neither sends its
+code to the other. The engine approves only when you say the device shows its
+code, and the device trusts the engine only when you say the engine shows the
+device's. If the two codes differ, something between the device and the
+engine answered with its own certificate: deny the request, and answer no on
+the device. The check is only as good as the look: never answer yes without
+comparing, and compare the code where it is labelled as the code (the
+`code:` line, the CODE column), never digits found elsewhere on the screen,
+such as in a name or an address.
 
 From a browser on the device, open <https://192.168.1.20:27200/client>. The
 browser warns that it does not know the certificate. Open the certificate
@@ -486,9 +503,9 @@ PIN='sha256//KcRfPaV4WCo5XHv9YWvSNn/ZDixnWYjJSznFuOON8mk='
 curl -s -k --pinnedpubkey "$PIN" -X POST https://192.168.1.20:27200/engine/pair \
   -H 'Content-Type: application/json' \
   -d '{"name": "laptop", "scopes": ["generate", "embed", "models:read"]}'
-# {"id":"772ca7c0bf6ada4b","status":"pending","check":"none",...}
+# {"id":"kdyucekctckcyfnu","status":"pending","check":"none",...}
 
-curl -s -k --pinnedpubkey "$PIN" https://192.168.1.20:27200/engine/pair/772ca7c0bf6ada4b
+curl -s -k --pinnedpubkey "$PIN" https://192.168.1.20:27200/engine/pair/kdyucekctckcyfnu
 # poll until "status":"approved"; that response carries the token, once
 ```
 
@@ -497,10 +514,14 @@ commitment, the reveal and the code are described in
 [docs/api.md](docs/api.md#pairing).
 
 A client holding an `admin` token can approve from anywhere: with
-`estia pair approve <id> --code <code> --engine https://192.168.1.20:27200 --token <admin token> --pin <fingerprint>`,
-from the Admin tab of `/client`, or with `POST /engine/pairings/<id>/approve`
-and `{"code": "482913"}` (`{"no_code": true}` for a browser or curl). Each
-shows the confirmation code to type into the device.
+`estia pair approve <id> --engine https://192.168.1.20:27200 --token <admin token> --pin <fingerprint>`,
+which shows the engine's code and asks the same question; from the Admin tab
+of `/client`, which shows each request's code with a **The device shows this
+code — approve** button; or with `POST /engine/pairings/<id>/approve` and the
+request's code, `{"code": "482913"}` (`{"no_code": true}` for a browser or
+curl). A request with a code is never approved without it. That ties the
+approval to the request whose code was shown; it does not prove that anyone
+compared, so an app sends the code back only on the operator's yes.
 
 Read the requested scopes before you approve. A device can ask for `admin`,
 which is full control of the engine. `estia pair approve` refuses such a
@@ -518,10 +539,15 @@ with `estia token revoke`.
 Limits on pairing requests, which anyone who can reach the port may send:
 
 - The name is at most 64 characters: letters and digits in any script, single
-  spaces, and `. _ - ' ’ ( )`. Anything else, such as control characters,
-  escape sequences, invisible or bidi characters, emoji, colons or double
-  spaces, is refused with 400, because names are printed in your terminal.
-  Unknown scopes are refused too.
+  spaces, and `. _ - ' ’ ( )`, with at most 4 digits in a row (only a letter
+  with case, such as a-z, α-ω or а-я, ends a row). Anything else, such as
+  control characters, escape sequences, invisible or bidi characters (the
+  Hangul fillers, which print as a blank, among them), emoji, colons,
+  double spaces or a run of digits that could pass for a pairing code
+  (`phone 482 913`, `phone 482ㅡ913`), is refused with 400, because names are
+  printed in your terminal next to the code you compare. Unknown scopes are
+  refused too. Pairing ids are 16 letters with no digit or digit look-alike
+  in them, since the device shows its id next to its code.
 - Requests expire after 5 minutes. At most 24 can wait at once, and at most 4
   from one address. Past either limit the engine answers 429 until a request is
   decided or expires.
@@ -809,8 +835,8 @@ Request and response shapes for every route are in [docs/api.md](docs/api.md).
 | `status` | Data directory, runtime, runner, machine and memory policy, installed models, roles, running server, pending pairings, service |
 | `dashboard` | Live terminal view of a running server (`--token` for stats and pairings, `--pin` for an `https://` `--engine`, `--once` for one snapshot) |
 | `token new <name> [--scopes] [--replace]`, `token list`, `token revoke <name>` | Bearer tokens; a new token defaults to `admin`; names are unique, `--replace` rotates one. `new` also prints the certificate fingerprint a LAN device needs |
-| `pair list`, `pair approve <id> [--code <code> \| --no-code] [--allow-admin]`, `pair deny <id>` | Decide pairing requests; `list` shows each request's code. Approve with the code the device shows (`--no-code` for a browser or curl); it prints the confirmation code to type into the device. Add `--engine`, `--token` and `--pin` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
-| `pair request --engine <url> [--json]` | Ask an engine for a token, show the pairing code, wait for approval, ask for the confirmation code `pair approve` printed; then prints the token and the certificate fingerprint to pin |
+| `pair list`, `pair approve <id> [--code <code> \| --no-code] [--allow-admin]`, `pair deny <id>` | Decide pairing requests; `list` shows each request's code. `approve` shows the engine's code and asks whether the device shows the same; a script passes `--code` with the code the device shows (`--no-code` for a browser or curl). Add `--engine`, `--token` and `--pin` to act on another engine. Approving `admin` needs `--allow-admin`; denying an approved request revokes its token |
+| `pair request --engine <url> [--json]` | Ask an engine for a token, show the pairing code, wait for approval, ask whether the engine shows the same code; on a yes, print the token and the certificate fingerprint to pin |
 | `tls fingerprint [--json]`, `tls rotate [--yes]` | The engine's certificate: its fingerprint, short form and curl pin; make a new one (every paired device must pair again) |
 | `discover` | Find engines on the LAN, with the certificate each advertises (unverified) |
 | `remote-check --engine <url> [--pin]` | Health, one generation and one embedding against a server; `--pin` (`ESTIA_PIN`) for `https://` |
@@ -949,12 +975,14 @@ the crates in your own program.
   encrypted. Plain HTTP is served to programs on the engine's own machine
   only; from another device it is refused before any handler runs. Each
   device pins the certificate's SHA-256 fingerprint, learnt by pairing, where
-  two 6-digit codes prove it both ways: one the operator types on the engine
-  (the device saw the engine's own certificate, not an interceptor's) and one
-  typed on the device (the approval came from the engine). Browsers and
-  devices given a token by hand compare the fingerprint by eye instead (trust
-  on first use). The key is in `tls/key.pem`, mode 0600.
-  [SECURITY.md](SECURITY.md) says what the codes do and do not prove.
+  one 6-digit code proves it both ways: the device and the engine each show
+  the code they computed, and a person confirms on the engine that the device
+  shows the same (the device saw the engine's own certificate, not an
+  interceptor's) and on the device that the engine does (the approval came
+  from the engine). Browsers and devices given a token by hand compare the
+  fingerprint by eye instead (trust on first use). The key is in
+  `tls/key.pem`, mode 0600. [SECURITY.md](SECURITY.md) says what the code
+  does and does not prove, and what it leaves to the person comparing.
 - **Limits, not rate limiting.** There is no per-client request rate limit.
   There are caps: 24 pending pairing requests, 4 from one address; 8192
   `max_tokens`; 256 inputs per embedding request; a 10-second limit to send a

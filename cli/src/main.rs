@@ -423,12 +423,18 @@ enum PairAction {
         pin: Option<String>,
     },
     /// Approve a request: mints a token with the requested scopes for the client to collect.
+    /// For a request with a code (a device pairing over https), it shows this
+    /// engine's code and asks whether the device shows the same.
     Approve {
         /// The pairing id, as the client and `estia pair list` show it.
         id: String,
-        /// The 6-digit code the device shows. The engine computed its own from
-        /// its certificate; they match only when the device saw that
-        /// certificate. Required for a request that has a code.
+        /// For a script, where nobody can answer the question: the 6-digit
+        /// code read off the device's screen (or out of its `estia pair
+        /// request --json` events). The engine approves only if it equals its
+        /// own, computed from its certificate; they match only when the device
+        /// saw that certificate. Never take it from `estia pair list`: that is
+        /// the engine's own code, and passing it back approves without
+        /// comparing anything. In a terminal, leave it out and compare.
         #[arg(long, value_name = "CODE")]
         code: Option<String>,
         /// Approve a request that has no code (a browser, or curl): compare
@@ -470,15 +476,21 @@ enum PairAction {
         pin: Option<String>,
     },
     /// Client side: ask an engine for a token and wait for the operator's approval.
-    /// Over https it shows a 6-digit code for the operator to type, and prints
-    /// the certificate fingerprint to pin from then on.
+    /// Over https it shows a 6-digit code, which the engine shows too; once
+    /// approved it asks whether the engine shows the same, and prints the
+    /// certificate fingerprint to pin from then on only on a yes. When stdin
+    /// is not a terminal, "y" is not an answer: give the six digits the
+    /// engine shows for the request (`estia pair list` on its machine) on
+    /// stdin instead, and the device pins only if they equal its own code.
     Request {
         /// `https://host:port` of the engine (`http://127.0.0.1:port` for the
         /// one on this machine).
         #[arg(long)]
         engine: String,
         /// How the operator sees this device: up to 64 letters, digits, single
-        /// spaces and `. _ - ' ( )`.
+        /// spaces and `. _ - ' ( )`, with at most 4 digits in a row (only a
+        /// letter such as a-z ends a row), so that no name passes for a
+        /// pairing code.
         #[arg(long, default_value = "estia-cli")]
         name: String,
         /// Scopes to ask for, comma-separated. Ask for the least you need.
@@ -490,7 +502,10 @@ enum PairAction {
         #[arg(long, default_value_t = PAIR_WAIT_DEFAULT_S)]
         wait_seconds: u64,
         /// Print the result as one JSON object on stdout ({url, name, scopes,
-        /// token, pin}) instead of the bare token.
+        /// token, pin}) instead of the bare token, and the steps as one JSON
+        /// object per line on stderr instead of prose: `request` (id, code,
+        /// certificate, approve command), `retry`, and `confirm` once
+        /// approved, when it reads the answer from stdin.
         #[arg(long)]
         json: bool,
     },
@@ -777,22 +792,12 @@ impl Ctx {
 /// True for characters that can steer a terminal or hide what it shows: C0
 /// and C1 controls (ESC opens every escape sequence, CR rewrites the line),
 /// bidi embeddings, overrides and isolates, zero-width and other invisible
-/// format characters, the Unicode line and paragraph separators, and tag
-/// characters.
+/// format characters, the Unicode line and paragraph separators, tag
+/// characters, and every other default-ignorable code point, the Hangul
+/// fillers (letters that print as a blank) among them: the list pairing
+/// names are checked against (`pairing::is_format_char`).
 fn is_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{E0000}'..='\u{E007F}'
-        )
+    c.is_control() || estia_server::pairing::is_format_char(c)
 }
 
 /// `s` with each unsafe character (see [`is_unsafe_char`]) written as a
@@ -1775,8 +1780,8 @@ async fn serve(
     if lan {
         tracing::info!(
             "LAN mode: other devices use https with this engine's own certificate. They pair with \
-             `estia pair request --engine https://<this machine>:{port}` and show a code; approve with \
-             `estia pair approve <id> --code <code>`"
+             `estia pair request --engine https://<this machine>:{port}` and show a code; `estia pair approve <id>` \
+             shows this engine's code for it: approve when the two are the same"
         );
     }
     if let Some(MemoryBudget(b)) = memory_budget {
@@ -2096,7 +2101,7 @@ async fn setup(ctx: &Ctx, roles: &[String], no_models: bool, variant: Option<&st
   each device pairs for a token and pins the certificate):
   estia serve --lan              or: estia service install
   from the other device: estia discover · estia pair request --engine https://<this machine>:27200
-  it shows a code; approve it here with: estia pair approve <id> --code <code>"
+  it shows a code; here, estia pair approve <id> shows the engine's: approve if they are the same"
     );
     Ok(())
 }
@@ -2572,7 +2577,7 @@ fn dashboard(ctx: &Ctx, engine: Option<String>, token: Option<String>, pin: Opti
                     if pending.is_empty() {
                         "".to_string()
                     } else {
-                        "  — approve with: estia pair approve <id> --code <the code the device shows>".to_string()
+                        "  — estia pair approve <id> when the device shows the same code".to_string()
                     }
                 );
                 for x in pending {
@@ -2627,9 +2632,11 @@ struct PairRow {
     id: String,
     status: String,
     pending: bool,
-    /// The approval check: the code (`482 913`), `waiting`, `none`, or `-`
-    /// for plain HTTP from the engine's machine.
+    /// The CODE column: the engine's code (`482 913`), `waiting`, `none`, or
+    /// `-` for plain HTTP from the engine's machine.
     code: String,
+    /// The engine's code for the request, once the device has revealed.
+    pairing_code: Option<estia_engine::PairingCode>,
     /// The check by name (`code`, `waiting`, `none`, `plain`; `?` from an
     /// engine older than 0.5).
     check: String,
@@ -2639,9 +2646,9 @@ struct PairRow {
 }
 
 /// The CODE column for a check and its code.
-fn code_column(check: &str, code: Option<&str>) -> String {
+fn code_column(check: &str, code: Option<estia_engine::PairingCode>) -> String {
     match check {
-        "code" => code.and_then(estia_engine::PairingCode::parse).map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+        "code" => code.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
         "waiting" => "waiting".into(),
         "none" => "none".into(),
         _ => "-".into(),
@@ -2664,7 +2671,8 @@ impl PairRow {
                 }
             ),
             pending: p.status == estia_server::pairing::PairingStatus::Pending,
-            code: code_column(p.check().as_str(), p.code.as_deref()),
+            code: code_column(p.check().as_str(), p.pairing_code()),
+            pairing_code: p.pairing_code(),
             check: p.check().as_str().to_string(),
             scopes: p.scopes.iter().map(|s| safe(s)).collect(),
             from: safe(p.from.as_deref().unwrap_or("?")),
@@ -2687,7 +2695,8 @@ impl PairRow {
                 }
             ),
             pending: p["status"] == "pending",
-            code: code_column(p["check"].as_str().unwrap_or("?"), p["code"].as_str()),
+            code: code_column(p["check"].as_str().unwrap_or("?"), p["code"].as_str().and_then(estia_engine::PairingCode::parse)),
+            pairing_code: p["code"].as_str().and_then(estia_engine::PairingCode::parse),
             check: safe(p["check"].as_str().unwrap_or("?")),
             scopes: jlist(&p["scopes"]),
             from: jtext(&p["from"]),
@@ -2725,11 +2734,31 @@ fn certificate_line(fp: Option<estia_engine::Fingerprint>) -> String {
     }
 }
 
-/// What `pair approve` sends for a request with this check: the code, or
-/// nothing; or why it refuses. The engine applies the same rules; this says
-/// which flag to use before anything is sent.
-fn approve_code(check: &str, code: Option<&str>, no_code: bool) -> Result<Option<String>> {
-    let code = match code {
+/// Puts a yes/no question to the operator; `None` where nobody can answer it
+/// (stdin is not a terminal).
+type Ask<'a> = Option<&'a mut dyn FnMut(&str) -> Result<bool>>;
+
+/// Ask `question` on stderr and read the answer from `input`: yes only for
+/// `y` or `yes`; anything else, or nothing at all, is no.
+fn ask_yes_no(question: &str, input: &mut impl std::io::BufRead) -> Result<bool> {
+    eprint!("{question} [y/N] ");
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        eprintln!();
+        return Ok(false);
+    }
+    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+}
+
+/// What `pair approve` sends for this request: its code, or nothing; or why
+/// it refuses. A request with a code is approved with `--code` (a script,
+/// which read the device's code: the engine compares it with its own), or,
+/// where someone can answer (`ask`), by showing the engine's code and asking
+/// whether the device shows the same: a yes sends that code back. The engine
+/// applies the same rules; this says which flag to use before anything is
+/// sent.
+fn approve_code(row: &PairRow, given: Option<&str>, no_code: bool, ask: Ask<'_>) -> Result<Option<String>> {
+    let given = match given {
         Some(c) => Some(
             estia_engine::PairingCode::parse(c)
                 .ok_or_else(|| anyhow!("--code takes the six digits the device shows, such as 482913"))?
@@ -2737,9 +2766,40 @@ fn approve_code(check: &str, code: Option<&str>, no_code: bool) -> Result<Option
         ),
         None => None,
     };
-    match (check, code, no_code) {
+    match (row.check.as_str(), given, no_code) {
         ("code", Some(c), _) => Ok(Some(c)),
-        ("code", None, _) => Err(anyhow!("this request has a code: run the same command with --code <the six digits the device shows>")),
+        ("code", None, true) => Err(anyhow!(
+            "this request has a code, so --no-code does not apply: approve it once the device shows the same code as this \
+             engine (`estia pair approve {}` in a terminal shows it and asks)",
+            row.id
+        )),
+        ("code", None, false) => {
+            let Some(code) = row.pairing_code else {
+                return Err(anyhow!("the engine lists no code for this request yet; try again in a moment"));
+            };
+            let Some(ask) = ask else {
+                return Err(anyhow!(
+                    "this request has a code: run `estia pair approve {}` in a terminal, which shows this engine's code and asks \
+                     whether the device shows the same; a script passes --code <the six digits the device shows>",
+                    row.id
+                ));
+            };
+            let question = format!(
+                "pairing {} asks for scopes [{}] from {}, under the name `{}`\n\n    code: {code}\n\nDoes the device show {code}?",
+                row.id,
+                row.scopes.join(","),
+                row.from,
+                row.name
+            );
+            if ask(&question)? {
+                return Ok(Some(code.digits()));
+            }
+            Err(anyhow!(
+                "not approved. If the device shows another code than {code}, something between it and this engine presented \
+                 its own certificate: deny the request (estia pair deny {}) and cancel on the device",
+                row.id
+            ))
+        }
         ("waiting", _, _) => Err(anyhow!("the device has not finished the certificate check; try again in a moment")),
         ("none" | "plain", Some(_), _) => Err(anyhow!(
             "this request has no code, but you gave one: the device you are looking at made a different request; deny this one"
@@ -2755,12 +2815,15 @@ fn approve_code(check: &str, code: Option<&str>, no_code: bool) -> Result<Option
     }
 }
 
-/// After an approval with a code: the confirmation code the user types into
-/// the device, which pins the engine's certificate only when it matches. It
-/// is shown here, on the engine's side, and never sent to the device.
-fn print_confirmation(confirm: Option<estia_engine::PairingCode>) {
-    if let Some(c) = confirm {
-        println!("\n    confirmation code: {c}\n\non the device, type this code to finish pairing: the device checks it before it trusts this engine");
+/// After approving a request with a code: the device's half. It shows the
+/// same code and asks whether this engine shows it; it pins this engine's
+/// certificate only on a yes. Nothing is sent to it from here.
+fn print_device_step(row: &PairRow, sent: Option<&str>) {
+    if row.check != "code" {
+        return;
+    }
+    if let Some(c) = sent.and_then(estia_engine::PairingCode::parse) {
+        println!("\non the device, confirm that this engine shows {c}: the device trusts this engine only after that");
     }
 }
 
@@ -2794,7 +2857,9 @@ fn check_approval(id: &str, scopes: &[String], from: &str, name: &str, allow_adm
     Ok(())
 }
 
-fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
+/// `estia pair …`. `ask` puts the approve question to the operator, where
+/// someone can answer it.
+fn pair(ctx: &Ctx, action: PairAction, ask: Ask<'_>) -> Result<()> {
     use estia_server::pairing::PairingStore;
     use estia_server::tokens::TokenStore;
     let store = PairingStore::new(&ctx.data_dir);
@@ -2840,7 +2905,7 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                 let mut send = code.clone();
                 if row.pending {
                     check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
-                    send = approve_code(&row.check, code.as_deref(), no_code)?;
+                    send = approve_code(&row, code.as_deref(), no_code, ask)?;
                 }
                 let v = if no_code { r.approve_pairing_without_code(&id)? } else { r.approve_pairing(&id, send.as_deref())? };
                 println!(
@@ -2850,9 +2915,9 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                     row.from,
                     jtext(&v["name"]),
                     safe(r.base_url()),
-                    if send.is_some() { ", the code matched" } else { "" }
+                    if send.is_some() { ", the codes match" } else { "" }
                 );
-                print_confirmation(v["confirm"].as_str().and_then(estia_engine::PairingCode::parse));
+                print_device_step(&row, send.as_deref());
                 return Ok(());
             }
             let pending = store.list().into_iter().find(|p| p.id == id).ok_or_else(|| anyhow!("no pairing `{}` (expired?)", safe(&id)))?;
@@ -2860,7 +2925,7 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
             let mut send = code.clone();
             if row.pending {
                 check_approval(&row.id, &row.scopes, &row.from, &row.name, allow_admin)?;
-                send = approve_code(&row.check, code.as_deref(), no_code)?;
+                send = approve_code(&row, code.as_deref(), no_code, ask)?;
             }
             let tokens = TokenStore::open(ctx.data_dir.join("tokens.json"))?;
             let approved = store.approve_with_code(&id, &tokens, send.as_deref(), no_code)?;
@@ -2871,9 +2936,9 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
                 p.scopes.join(","),
                 p.from,
                 p.name,
-                if send.is_some() { ", the code matched" } else { "" }
+                if send.is_some() { ", the codes match" } else { "" }
             );
-            print_confirmation(approved.confirm.as_deref().filter(|_| send.is_some()).and_then(estia_engine::PairingCode::parse));
+            print_device_step(&row, send.as_deref());
         }
         PairAction::Deny { id, engine, token, pin } => {
             if let Some(r) = remote(&engine, &token, &pin)? {
@@ -2895,7 +2960,11 @@ fn pair(ctx: &Ctx, action: PairAction) -> Result<()> {
             let row = PairRow::local(&p);
             println!("denied {} (name `{}`){revoked}", row.id, row.name);
         }
-        PairAction::Request { engine, name, scopes, wait_seconds, json } => pair_request(&engine, &name, &scopes, wait_seconds, json)?,
+        // Someone at a terminal can answer the device's question with a yes;
+        // anything else must give the engine's code (see `confirm_pairing`).
+        PairAction::Request { engine, name, scopes, wait_seconds, json } => {
+            pair_request(&engine, &name, &scopes, wait_seconds, json, ask.is_some())?
+        }
     }
     Ok(())
 }
@@ -2908,30 +2977,35 @@ fn pair_request_json(url: &str, name: &str, scopes: &[String], token: &str, pin:
 
 /// `estia pair request`: the device side, through [`estia_engine::begin_pairing`].
 /// The token goes to stdout (or the JSON object with `--json`); everything
-/// else to stderr.
-fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, json: bool) -> Result<()> {
+/// else to stderr (one JSON event per line with `--json`). `interactive`:
+/// stdin is a terminal, so a person can answer the question with a yes.
+fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, json: bool, interactive: bool) -> Result<()> {
     use estia_engine::{PairingOutcome, SessionError};
     let base = engine.trim().trim_end_matches('/').to_string();
     let refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
     let pending = estia_engine::begin_pairing(&base, name, &refs).context("pairing request refused")?;
     let id = pending.id().to_string();
-    if let Some(cert) = pending.certificate() {
-        eprintln!("engine certificate {} (not trusted yet: the codes check it)", cert.short());
-    }
-    match pending.code() {
-        Some(code) => eprintln!(
-            "pairing request `{id}` sent as `{}`.\n\n    code: {code}\n\non the engine's machine, the operator runs:\n  {}\n\
-             It prints a confirmation code: type that here when asked. If the engine says the code does not match, stop: \
-             something between this device and the engine answered in its place.\n\
-             waiting up to {wait_seconds}s …",
-            safe(name),
-            pending.approve_command()
-        ),
-        None => eprintln!(
-            "pairing request `{id}` sent as `{}` — waiting up to {wait_seconds}s for the operator to run: {}",
-            safe(name),
-            pending.approve_command()
-        ),
+    if json {
+        eprintln!("{}", request_event(&pending));
+    } else {
+        if let Some(cert) = pending.certificate() {
+            eprintln!("engine certificate {} (not trusted yet: the code checks it)", cert.short());
+        }
+        match pending.code() {
+            Some(code) => eprintln!(
+                "pairing request `{id}` sent as `{}`.\n\n    code: {code}\n\non the engine's machine, the operator runs:\n  {}\n\
+                 which shows the engine's code for this request: they approve only if it is {code} too. If the engine shows \
+                 another code, stop: something between this device and the engine answered in its place.\n\
+                 waiting up to {wait_seconds}s …",
+                safe(name),
+                pending.approve_command()
+            ),
+            None => eprintln!(
+                "pairing request `{id}` sent as `{}` — waiting up to {wait_seconds}s for the operator to run: {}",
+                safe(name),
+                pending.approve_command()
+            ),
+        }
     }
     let deadline = Instant::now() + std::time::Duration::from_secs(wait_seconds);
     loop {
@@ -2944,10 +3018,7 @@ fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, 
             Ok(PairingOutcome::Approved { token }) => {
                 // Over https the answer alone proves nothing: whatever
                 // answered the request could answer the polls too.
-                let pin = match pending.needs_confirmation() {
-                    true => Some(confirm_pairing(&pending, &mut std::io::stdin().lock())?),
-                    false => None,
-                };
+                let pin = confirm_pairing(pending.clone(), &mut std::io::stdin().lock(), interactive, json)?;
                 if json {
                     println!("{}", pair_request_json(&base, name, scopes, &token, pin));
                 } else {
@@ -2968,6 +3039,7 @@ fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, 
             }
             Ok(PairingOutcome::Pending) => {}
             Err(e @ SessionError::CertificateMismatch { .. }) => return Err(e.into()),
+            Err(e) if json => eprintln!("{}", serde_json::json!({"event": "retry", "id": id, "detail": e.to_string()})),
             Err(e) => eprintln!("could not poll the engine ({}); retrying", safe(&e.to_string())),
         }
         if Instant::now() >= deadline {
@@ -2979,29 +3051,92 @@ fn pair_request(engine: &str, name: &str, scopes: &[String], wait_seconds: u64, 
     }
 }
 
-/// Ask for the confirmation code `estia pair approve` printed, on stderr, and
-/// read it from `input`: the pin when it matches (three tries, for typos),
-/// else an error that says not to use the token. Nothing is printed to
-/// stdout before it matches.
-fn confirm_pairing(pending: &estia_engine::PendingPairing, input: &mut impl std::io::BufRead) -> Result<estia_engine::Fingerprint> {
-    let mut last = None;
-    for _ in 0..3 {
-        eprint!("approved. Type the confirmation code `estia pair approve` printed on the engine's machine: ");
-        let mut line = String::new();
-        if input.read_line(&mut line)? == 0 {
-            return Err(anyhow!(
-                "no confirmation code on stdin: the token is kept back until the code `estia pair approve` printed is typed here"
-            ));
-        }
-        match pending.confirm(line.trim()) {
-            Ok(pin) => return Ok(pin),
-            Err(e) => {
-                eprintln!("{}", safe(&e.to_string()));
-                last = Some(e);
-            }
-        }
+/// `estia pair request --json`'s first event: what the device shows, for an
+/// app that wraps the command to show it. The code is this device's own
+/// (null over loopback http, which has none).
+fn request_event(pending: &estia_engine::PendingPairing) -> serde_json::Value {
+    serde_json::json!({
+        "event": "request",
+        "id": pending.id(),
+        "code": pending.code().map(|c| c.digits()),
+        "certificate": pending.certificate().map(|c| c.short()),
+        "approve": pending.approve_command(),
+        "expires_unix": pending.expires_unix(),
+    })
+}
+
+/// Once approved, over https: ask on stderr whether the engine shows this
+/// device's code, and read the answer from `input`; return the pin when the
+/// answer holds. Nothing is printed to stdout before that. A loopback
+/// `http://` pairing has no code: no question, no pin.
+///
+/// What holds: the six digits the engine shows, equal to this device's code;
+/// or, only where a person is at a terminal (`interactive`), `y`. A `y` that
+/// is not typed at a terminal is refused: a script can write it without
+/// anyone comparing anything, which would pin whatever answered the polls.
+/// A script that has the engine's code (`estia pair list` on its machine)
+/// writes that instead; the device compares it with its own. With `json`
+/// the question is a `confirm` event on stderr.
+fn confirm_pairing(
+    pending: estia_engine::PendingPairing,
+    input: &mut impl std::io::BufRead,
+    interactive: bool,
+    json: bool,
+) -> Result<Option<estia_engine::Fingerprint>> {
+    let Some(code) = pending.code().copied() else {
+        return Ok(pending.confirm_match());
+    };
+    let id = safe(pending.id());
+    if json {
+        eprintln!("{}", confirm_event(&pending, interactive));
+    } else if interactive {
+        eprint!("approved. Does the engine show {code} for this request? [y/N] ");
+    } else {
+        eprint!("approved. The six digits the engine shows for request {id} (estia pair list on its machine): ");
     }
-    Err(anyhow!("pairing not confirmed: {}", safe(&last.map(|e| e.to_string()).unwrap_or_else(|| "no confirmation code".into()))))
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 && !json {
+        eprintln!();
+    }
+    let answer = line.trim().to_ascii_lowercase();
+    let differ = |shown: &str| {
+        anyhow!(
+            "pairing not confirmed; the token is not kept. The engine shows {shown}, this device {code}: something between \
+             this device and the engine answered in its place. Deny the request there (estia pair deny {id}) and pair again"
+        )
+    };
+    match estia_engine::PairingCode::parse(&answer) {
+        Some(given) if given == code => return Ok(pending.confirm_match()),
+        Some(given) => return Err(differ(&given.to_string())),
+        None => {}
+    }
+    match answer.as_str() {
+        "y" | "yes" if interactive => Ok(pending.confirm_match()),
+        "y" | "yes" => Err(anyhow!(
+            "pairing not confirmed; the token is not kept. stdin is not a terminal, so `y` is not an answer: a script \
+             could write it without anyone comparing the codes. Write the six digits the engine shows for request {id} \
+             (`estia pair list` on its machine) instead"
+        )),
+        _ => Err(anyhow!(
+            "pairing not confirmed; the token is not kept. If the engine shows another code than {code}, or none, something \
+             between this device and the engine answered in its place: deny the request there (estia pair deny {id}) and pair again"
+        )),
+    }
+}
+
+/// The `confirm` event of `estia pair request --json`: the device was told
+/// "approved", and reads its answer from stdin next.
+fn confirm_event(pending: &estia_engine::PendingPairing, interactive: bool) -> serde_json::Value {
+    serde_json::json!({
+        "event": "confirm",
+        "id": pending.id(),
+        "code": pending.code().map(|c| c.digits()),
+        "answer": if interactive {
+            "y if the engine shows this code, or the six digits it shows"
+        } else {
+            "the six digits the engine shows for this request (y is not an answer when stdin is not a terminal)"
+        },
+    })
 }
 
 fn discover(seconds: u64) -> Result<()> {
@@ -3536,7 +3671,13 @@ async fn run_cli() -> Result<()> {
             .await
         }
         Cmd::Token { action } => token(&ctx, action),
-        Cmd::Pair { action } => tokio::task::block_in_place(|| pair(&ctx, action)),
+        Cmd::Pair { action } => tokio::task::block_in_place(|| {
+            // The approve question needs someone at a terminal; a script
+            // passes --code instead (piping "y" in is not an answer).
+            let mut ask = |question: &str| ask_yes_no(question, &mut std::io::stdin().lock());
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            pair(&ctx, action, if interactive { Some(&mut ask) } else { None })
+        }),
         Cmd::Discover { seconds } => tokio::task::block_in_place(|| discover(seconds)),
         Cmd::RemoteCheck { engine, token, pin, model } => {
             tokio::task::block_in_place(|| remote_check(&engine, token, pin.as_deref(), &model))
@@ -3653,7 +3794,7 @@ mod tests {
     #[test]
     fn pair_list_puts_scopes_before_the_name_and_flags_admin() {
         let row = PairRow::remote(&serde_json::json!({
-            "id": "6de47a30928f4f15", "status": "pending", "from": "127.0.0.1",
+            "id": "hwkrcmatyfendpux", "status": "pending", "from": "127.0.0.1",
             "name": "ipad                 generate   Pending\u{1b}[8m", "scopes": ["admin"],
         }));
         let lines = pairing_lines(&[row]);
@@ -3691,18 +3832,18 @@ mod tests {
             pin: None,
             allow_admin,
         };
-        let err = pair(&ctx, approve(&admin.id, false)).unwrap_err();
+        let err = pair(&ctx, approve(&admin.id, false), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("[admin]") && msg.contains("10.0.0.9") && msg.contains("--allow-admin"), "{msg}");
         assert!(!msg.contains('\x1b'), "{msg}");
         let still = store.list().into_iter().find(|p| p.id == admin.id).unwrap();
         assert_eq!(still.status, PairingStatus::Pending, "refused means nothing was minted");
         assert!(estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().is_empty());
-        pair(&ctx, approve(&admin.id, true)).unwrap();
+        pair(&ctx, approve(&admin.id, true), None).unwrap();
         assert_eq!(store.list().into_iter().find(|p| p.id == admin.id).unwrap().status, PairingStatus::Approved);
         let tokens = || estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().list();
         assert_eq!(tokens().len(), 1);
-        pair(&ctx, PairAction::Deny { id: admin.id.clone(), engine: None, token: None, pin: None }).unwrap();
+        pair(&ctx, PairAction::Deny { id: admin.id.clone(), engine: None, token: None, pin: None }, None).unwrap();
         assert!(tokens().is_empty(), "deny after approve revokes the minted token");
         // models:write is approved with a warning; plain scopes need nothing.
         assert!(check_approval("x", &["models:write".into()], "?", "n", false).is_ok());
@@ -3710,25 +3851,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn row(check: &str, code: Option<&str>) -> PairRow {
+        PairRow::remote(&serde_json::json!({
+            "id": "hwkrcmatyfendpux", "status": "pending", "check": check, "code": code,
+            "scopes": ["generate"], "from": "10.0.0.4", "name": "phone",
+        }))
+    }
+
     /// `pair approve` asks for the right flag before anything is sent, by the
-    /// request's check.
+    /// request's check, and in a terminal asks whether the codes match.
     #[test]
     fn approve_needs_the_code_the_request_has() {
-        assert_eq!(approve_code("code", Some("482 913"), false).unwrap().as_deref(), Some("482913"));
-        assert!(approve_code("code", None, false).unwrap_err().to_string().contains("--code"));
-        assert!(approve_code("code", Some("48291"), false).unwrap_err().to_string().contains("six digits"));
-        assert!(approve_code("waiting", Some("482913"), false).unwrap_err().to_string().contains("try again"));
-        assert!(approve_code("none", None, false).unwrap_err().to_string().contains("--no-code"));
-        assert_eq!(approve_code("none", None, true).unwrap(), None);
-        assert!(approve_code("none", Some("482913"), false).unwrap_err().to_string().contains("different request"));
-        assert!(approve_code("plain", Some("482913"), false).is_err());
-        assert_eq!(approve_code("plain", None, false).unwrap(), None);
-        assert_eq!(approve_code("?", Some("482913"), false).unwrap().as_deref(), Some("482913"), "an older engine gets what was given");
+        let coded = row("code", Some("482913"));
+        // A script: --code, which the engine compares with its own.
+        assert_eq!(approve_code(&coded, Some("482 913"), false, None).unwrap().as_deref(), Some("482913"));
+        assert!(approve_code(&coded, Some("48291"), false, None).unwrap_err().to_string().contains("six digits"));
+        // No terminal and no --code: refused, and says what to do.
+        let e = approve_code(&coded, None, false, None).unwrap_err().to_string();
+        assert!(e.contains("in a terminal") && e.contains("--code"), "{e}");
+        assert!(!e.contains("482"), "the refusal does not hand a script the engine's code: {e}");
+        // --no-code never stands in for a code.
+        let mut never = |_: &str| -> Result<bool> { panic!("no question for --no-code") };
+        assert!(approve_code(&coded, None, true, Some(&mut never)).unwrap_err().to_string().contains("--no-code does not apply"));
+        // A terminal: the engine's code is shown and a yes sends it back.
+        let mut asked = String::new();
+        let mut yes = |q: &str| -> Result<bool> {
+            asked = q.to_string();
+            Ok(true)
+        };
+        assert_eq!(approve_code(&coded, None, false, Some(&mut yes)).unwrap().as_deref(), Some("482913"));
+        assert!(asked.contains("code: 482 913") && asked.ends_with("Does the device show 482 913?"), "{asked}");
+        assert!(asked.contains("[generate]") && asked.contains("10.0.0.4") && asked.contains("`phone`"), "{asked}");
+        assert!(asked.find("phone").unwrap() < asked.find("code:").unwrap(), "the code is not on the name's line: {asked}");
+        let mut no = |_: &str| -> Result<bool> { Ok(false) };
+        let e = approve_code(&coded, None, false, Some(&mut no)).unwrap_err().to_string();
+        assert!(e.contains("not approved") && e.contains("estia pair deny hwkrcmatyfendpux"), "{e}");
+        // The question and the answer, as the terminal sees them.
+        assert!(ask_yes_no("q", &mut std::io::Cursor::new("y\n")).unwrap());
+        assert!(ask_yes_no("q", &mut std::io::Cursor::new(" YES \n")).unwrap());
+        for answer in ["n\n", "\n", "482913\n", "yy\n", ""] {
+            assert!(!ask_yes_no("q", &mut std::io::Cursor::new(answer)).unwrap(), "{answer:?}");
+        }
+
+        let mut never = |_: &str| -> Result<bool> { panic!("nothing to compare") };
+        assert!(approve_code(&row("waiting", None), Some("482913"), false, None).unwrap_err().to_string().contains("try again"));
+        assert!(approve_code(&row("waiting", None), None, false, Some(&mut never)).unwrap_err().to_string().contains("try again"));
+        assert!(approve_code(&row("none", None), None, false, None).unwrap_err().to_string().contains("--no-code"));
+        assert_eq!(approve_code(&row("none", None), None, true, Some(&mut never)).unwrap(), None);
+        assert!(approve_code(&row("none", None), Some("482913"), false, None).unwrap_err().to_string().contains("different request"));
+        assert!(approve_code(&row("plain", None), Some("482913"), false, None).is_err());
+        assert_eq!(approve_code(&row("plain", None), None, false, Some(&mut never)).unwrap(), None);
+        let old = PairRow::remote(&serde_json::json!({"id": "a", "status": "pending", "scopes": ["generate"], "name": "phone"}));
+        assert_eq!(
+            approve_code(&old, Some("482913"), false, None).unwrap().as_deref(),
+            Some("482913"),
+            "an older engine gets what was given"
+        );
         assert!(Cli::try_parse_from(["estia", "pair", "approve", "x", "--code", "1", "--no-code"]).is_err(), "one or the other");
     }
 
     /// A request over https with a code, approved on the engine's machine:
-    /// the wrong code is refused and mints nothing, the right one approves.
+    /// a no at the prompt, a wrong --code and no code at all are refused and
+    /// mint nothing; a yes approves with the engine's code.
     #[test]
     fn approve_checks_the_code_locally() {
         use estia_engine::tls as etls;
@@ -3751,11 +3935,36 @@ mod tests {
             pin: None,
             allow_admin: false,
         };
-        assert!(pair(&ctx, approve(None)).unwrap_err().to_string().contains("--code"));
-        assert!(pair(&ctx, approve(Some(&bad))).unwrap_err().to_string().contains("does not match"));
-        assert!(estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().is_empty(), "refused means nothing was minted");
-        pair(&ctx, approve(Some(&good))).unwrap();
+        let minted = || estia_server::tokens::TokenStore::open(dir.join("tokens.json")).unwrap().list().len();
+        assert!(pair(&ctx, approve(None), None).unwrap_err().to_string().contains("--code"), "no terminal, no --code");
+        let mut no = |_: &str| -> Result<bool> { Ok(false) };
+        assert!(pair(&ctx, approve(None), Some(&mut no)).unwrap_err().to_string().contains("not approved"));
+        assert!(pair(&ctx, approve(Some(&bad)), None).unwrap_err().to_string().contains("does not match"));
+        assert_eq!(minted(), 0, "refused means nothing was minted");
+        let mut shown = String::new();
+        let mut yes = |q: &str| -> Result<bool> {
+            shown = q.to_string();
+            Ok(true)
+        };
+        pair(&ctx, approve(None), Some(&mut yes)).unwrap();
+        assert!(shown.contains(&p.code_shown().unwrap()), "the prompt showed the engine's code: {shown}");
         assert_eq!(store.list().into_iter().find(|q| q.id == p.id).unwrap().status, PairingStatus::Approved);
+        assert_eq!(minted(), 1);
+        // --code, the scripted way, approves another request the same way.
+        let q =
+            store.request_tls("tablet", &["generate".into()], Some("10.0.0.5".into()), Some(&etls::pairing_commitment(&nonce))).unwrap();
+        let q = store.reveal(&q.id, &etls::nonce_hex(&nonce), &fp).unwrap();
+        let script = PairAction::Approve {
+            id: q.id.clone(),
+            code: q.code.clone(),
+            no_code: false,
+            engine: None,
+            token: None,
+            pin: None,
+            allow_admin: false,
+        };
+        pair(&ctx, script, None).unwrap();
+        assert_eq!(store.list().into_iter().find(|r| r.id == q.id).unwrap().status, PairingStatus::Approved);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3794,6 +4003,14 @@ mod tests {
         assert_eq!(v["pin"], pin.to_hex());
         assert_eq!(v["scopes"], serde_json::json!(["generate"]));
         assert!(pair_request_json("http://127.0.0.1:1", "x", &[], "t", None)["pin"].is_null());
+        // The help says what a script answers, and what a name may hold.
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let pair = cmd.find_subcommand_mut("pair").unwrap();
+        let request = pair.find_subcommand_mut("request").unwrap().render_long_help().to_string();
+        assert!(request.contains("not a terminal") && request.contains("4 digits in a row"), "{request}");
+        assert!(request.contains("`confirm`") && request.contains("`request`"), "{request}");
+        let approve = pair.find_subcommand_mut("approve").unwrap().render_long_help().to_string();
+        assert!(approve.contains("Never take it from `estia pair list`"), "{approve}");
     }
 
     /// `--engine https://…` needs a pin, and says where to get one; plain
@@ -3850,25 +4067,71 @@ mod tests {
         assert_eq!(local_target("192.168.1.5", 27200, None), ("http://192.168.1.5:27200".to_string(), None));
     }
 
-    /// `estia pair request` keeps the token back until the confirmation code
-    /// the engine's operator read matches; a typo gets another try.
+    /// `estia pair request` keeps the token back until the user says the
+    /// engine shows the same code; anything but a yes keeps it back. A yes
+    /// counts only from a terminal: piped in, it is refused, and a script
+    /// gives the engine's six digits instead, which must equal the device's.
     #[test]
-    fn pair_request_asks_for_the_confirmation_code() {
+    fn pair_request_asks_whether_the_engine_shows_the_same_code() {
         use estia_engine::tls as etls;
         let seen = estia_engine::Fingerprint::from_bytes([5; 32]);
         let (d, e) = ([6u8; 32], [7u8; 32]);
+        let code = etls::pairing_code(&seen, &d, &e);
+        let other = estia_engine::PairingCode::parse(if code.digits() == "000000" { "000001" } else { "000000" }).unwrap();
         let pending: estia_engine::PendingPairing = serde_json::from_value(serde_json::json!({
             "base_url": "https://10.0.0.5:27200", "id": "abc", "expires_unix": 0,
-            "codes": {"certificate": seen, "code": etls::pairing_code(&seen, &d, &e), "confirmation": etls::pairing_confirmation(&seen, &d, &e)},
+            "codes": {"certificate": seen, "code": code},
         }))
         .unwrap();
-        let right = etls::pairing_confirmation(&seen, &d, &e).to_string();
-        let wrong = etls::pairing_confirmation(&estia_engine::Fingerprint::from_bytes([8; 32]), &d, &e).digits();
-        let mut typed = std::io::Cursor::new(format!("{wrong}\n{right}\n"));
-        assert_eq!(confirm_pairing(&pending, &mut typed).unwrap(), seen, "the second try matched");
-        let mut typed = std::io::Cursor::new(format!("{wrong}\n{wrong}\n{wrong}\n{right}\n"));
-        assert!(confirm_pairing(&pending, &mut typed).unwrap_err().to_string().contains("not confirmed"), "three tries");
-        assert!(confirm_pairing(&pending, &mut std::io::Cursor::new("")).unwrap_err().to_string().contains("kept back"));
+        let confirm = |answer: &str, interactive: bool| {
+            confirm_pairing(pending.clone(), &mut std::io::Cursor::new(answer.to_string()), interactive, false)
+        };
+        // At a terminal: a yes, or the engine's six digits.
+        for answer in ["y\n", " YES \n", &format!("{}\n", code.digits()), &format!("{code}\n")] {
+            assert_eq!(confirm(answer, true).unwrap(), Some(seen), "{answer:?}");
+        }
+        // Not at a terminal: only the engine's six digits; a piped `y` is not
+        // an answer, since a script writes it without comparing anything.
+        assert_eq!(confirm(&format!("{}\n", code.digits()), false).unwrap(), Some(seen));
+        for answer in ["y\n", "yes\n"] {
+            let e = confirm(answer, false).unwrap_err().to_string();
+            assert!(e.contains("not a terminal") && e.contains("six digits") && e.contains("estia pair list"), "{answer:?}: {e}");
+        }
+        // Anything else keeps the token back, either way.
+        for interactive in [true, false] {
+            for answer in ["n\n", "", "\n", "yy\n", "48291\n"] {
+                let e = confirm(answer, interactive).unwrap_err().to_string();
+                assert!(e.contains("not confirmed") && e.contains("estia pair deny abc"), "{answer:?}: {e}");
+            }
+            // Another code: the engine saw another exchange (an interceptor).
+            let e = confirm(&format!("{}\n", other.digits()), interactive).unwrap_err().to_string();
+            assert!(e.contains(&format!("The engine shows {other}, this device {code}")), "{e}");
+        }
+        let plain: estia_engine::PendingPairing =
+            serde_json::from_value(serde_json::json!({"base_url": "http://127.0.0.1:1", "id": "ab", "expires_unix": 0})).unwrap();
+        assert_eq!(
+            confirm_pairing(plain.clone(), &mut std::io::Cursor::new(""), false, false).unwrap(),
+            None,
+            "loopback http: nothing asked, nothing pinned"
+        );
+
+        // --json: the steps as events an app can show.
+        let ev = request_event(&pending);
+        assert_eq!(
+            (ev["event"].as_str(), ev["id"].as_str(), ev["code"].as_str()),
+            (Some("request"), Some("abc"), Some(code.digits().as_str()))
+        );
+        assert_eq!(ev["approve"], "estia pair approve abc");
+        assert_eq!(ev["certificate"], seen.short());
+        assert!(request_event(&plain)["code"].is_null());
+        let ev = confirm_event(&pending, false);
+        assert_eq!((ev["event"].as_str(), ev["code"].as_str()), (Some("confirm"), Some(code.digits().as_str())));
+        assert!(ev["answer"].as_str().unwrap().contains("six digits"), "{ev}");
+        assert!(confirm_event(&pending, true)["answer"].as_str().unwrap().starts_with("y if"));
+        assert_eq!(
+            confirm_pairing(pending.clone(), &mut std::io::Cursor::new(format!("{}\n", code.digits())), false, true).unwrap(),
+            Some(seen)
+        );
     }
 
     /// `estia tls fingerprint` before and after a certificate exists, and
@@ -3916,7 +4179,7 @@ mod tests {
 
         assert!(token(&ctx, TokenAction::Revoke { name: "nosuch".into() }).is_err());
         // A device-chosen name with escapes is revocable as `token list` shows it.
-        let raw = "pair:ipad\x1b[8m:6de47a30928f4f15";
+        let raw = "pair:ipad\x1b[8m:hwkrcmatyfendpux";
         TokenStore::open(dir.join("tokens.json")).unwrap().mint(raw, &["admin"]).unwrap();
         token(&ctx, TokenAction::Revoke { name: safe(raw) }).unwrap();
         assert!(TokenStore::open(dir.join("tokens.json")).unwrap().list().iter().all(|r| r.name != raw));

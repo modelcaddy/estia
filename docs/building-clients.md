@@ -134,65 +134,84 @@ to pin (see [Pinning the engine's certificate](#pinning-the-engines-certificate)
 
 An engine on the LAN serves HTTPS with its own certificate, and the first
 connection has nothing to check that certificate against. So a pairing proves,
-in both directions, which certificate each end used: the device commits to a
-random nonce, the engine answers with its own, and both compute two 6-digit
-codes from the certificate fingerprint each of them used and the two nonces.
-The device shows its pairing code; the operator types it into `estia pair
-approve`, and the engine approves only if it equals its own. `estia pair
-approve` then prints the engine's confirmation code; the user types it into
-the device, and the device pins the certificate only if it equals its own.
+in both directions, which certificate each end used, the way Bluetooth's
+numeric comparison does: the device commits to a random nonce, the engine
+answers with its own, and both compute one 6-digit code from the certificate
+fingerprint each of them used and the two nonces. The device shows its code;
+the engine shows its own (`estia pair approve`, `estia pair list`, an admin
+app). A person checks the two are the same and says so on both ends: the
+operator approves only then, and the device pins the certificate only when
+its user says the engine shows the device's code. Neither end ever sends its
+code to the other.
 
 ```text
 device: nonce_d = 32 random bytes; it connects without trusting the
         certificate yet and notes its fingerprint F
 POST /engine/pair {"name": "kitchen tablet", "scopes": ["generate"], "commitment": sha256(label ‖ nonce_d)}
-  → 202 {"id": "bb706d7dccbe7777", "status": "pending", "check": "waiting", "engine_nonce": "<64 hex>",
+  → 202 {"id": "pftcdyercxjcduud", "status": "pending", "check": "waiting", "engine_nonce": "<64 hex>",
          "tls": {"fingerprint": "<64 hex>", "short": "3f2a 9c41 7b0e d512"}, ...}
-POST /engine/pair/bb706d7dccbe7777/reveal {"nonce": "<nonce_d, 64 hex>"}   → 200
+POST /engine/pair/pftcdyercxjcduud/reveal {"nonce": "<nonce_d, 64 hex>"}   → 200
 device: code = pairing_code(F, nonce_d, engine_nonce) → shows "482 913"
-GET /engine/pair/bb706d7dccbe7777 → {"status": "pending", "token": null}
-        operator: estia pair approve bb706d7dccbe7777 --code 482913
-        it prints: confirmation code: 452 618
-GET /engine/pair/bb706d7dccbe7777 → {"status": "approved", "token": "estia_..."}   (once)
-device: asks the user for the confirmation code; "452618" must equal
-        pairing_confirmation(F, nonce_d, engine_nonce); then pin F
+GET /engine/pair/pftcdyercxjcduud → {"status": "pending", "token": null}
+        operator: estia pair approve pftcdyercxjcduud
+        it shows the engine's code and asks: Does the device show 482 913? [y/N] y
+GET /engine/pair/pftcdyercxjcduud → {"status": "approved", "token": "estia_..."}   (once)
+device: asks "Does the engine show 482 913?"; the user looks at the engine's
+        screen and taps yes; then pin F
 ```
 
-The exact definitions of the commitment and the codes, with a known-answer
+The exact definitions of the commitment and the code, with a known-answer
 vector, are in [api.md](api.md#pairing). You need not write them: the Rust
-client does all of it in `begin_pairing` and `PendingPairing::confirm`, and
-[`python/estia_tls.py`](../examples/python/estia_tls.py) has the functions in
-the standard library.
+client does all of it in `begin_pairing` and `PendingPairing::confirm_match`,
+and [`python/estia_tls.py`](../examples/python/estia_tls.py) has the
+functions in the standard library.
 
 What your app should do:
 
 - Ask for the smallest set of scopes. The operator sees them before approving,
   and `estia pair approve` refuses `admin` without `--allow-admin`.
 - Use a name the operator will recognise: at most 64 letters, digits, single
-  spaces and `. _ - ' ’ ( )`. Anything else is a 400.
-- Over `https://`, commit before you see the engine's nonce, reveal once it
-  has answered, and show the code large, with the approve command (`estia
-  pair approve <id> --code <code>`). Keep using the connection's certificate
-  for every later call of the pairing, and refuse any other.
-- Never show a code the engine sent you: show the one you computed. That is
-  the engine's half of the check.
-- Tell the user: if the engine says the code does not match, cancel. Something
-  between the device and the engine answered with its own certificate, and
-  whatever token it hands you belongs to it.
+  spaces and `. _ - ' ’ ( )`, with at most 4 digits in a row (a run that
+  could pass for a pairing code is refused, and only a letter with case,
+  such as a-z, α-ω or а-я, ends a run). Anything else is a 400. Derive it
+  from something like the device's model without its year or size
+  ("MacBook Pro 2023 16" holds six digits in a row and is refused).
+- Over `https://`, check the id in the answer before going on: an engine's
+  ids are 16 letters of `acdefhjkmnprtuvwxy`, none that passes for a digit.
+  Refuse anything else (`tls::is_pairing_id` in Rust; `begin_pairing` does
+  it): you show the id next to your code, and whatever answered chose it.
+- Commit before you see the engine's nonce, reveal once it has answered, and
+  show the code large, with the approve command (`estia pair approve <id>`).
+  Keep using the connection's certificate for every later call of the
+  pairing, and refuse any other.
+- Show the code you computed, never one you were sent. The engine never sends
+  its code, so anything that claims to be it came from something else.
+- Tell the user: approve on the engine only if it shows the same code. If it
+  shows another code, cancel: something between the device and the engine
+  answered with its own certificate, and whatever token it hands you belongs
+  to it.
 - Poll every 2 seconds or so, over the same connection. An `approved` answer
   with a token proves nothing by itself over `https://`: whatever answered
-  your request could answer your polls too. Ask the user for the
-  confirmation code `estia pair approve` printed on the engine's machine
-  (allow a retry for typos), and pin the fingerprint you saw only when it
-  equals the one you computed. That is the device's half of the check. If it
-  does not match, tell the user not to trust the pairing, discard the token,
-  and ask them to deny the request on the engine.
-- Never show the confirmation code you expect, and never take one from
-  anything the engine (or whatever answers in its place) sent you: only from
-  the user, who read it on the engine's machine.
+  your request could answer your polls too. Ask the user, with your code on
+  screen, "Does the engine show 482 913?", with "It matches" and "It doesn't"
+  as the answers, and pin the fingerprint you saw only on "It matches". That
+  is the device's half of the check. On "It doesn't", tell the user not to
+  trust the pairing, discard the token, and ask them to deny the request on
+  the engine.
+- Ask the question every time, and do not default it to yes: a user who
+  confirms without looking at the engine's screen is the one way through.
+  Keep showing the code while you ask, and ask the user to compare it with
+  the code the engine labels as such, not with digits elsewhere on its
+  screen.
+- Never answer the question in code. A program with nobody to ask (a
+  provisioning script) gets the six digits the engine shows through a
+  channel it trusts (`estia pair list` over ssh, say), compares them with
+  `code()`, and calls `confirm_match` only when they are equal. `estia pair
+  request` does that when its stdin is not a terminal: it refuses a piped
+  `y` and reads the digits instead.
 - Keep the token the moment it arrives (it is handed out exactly once), but
-  use it only once the pairing is confirmed. Store it in the keychain, or in
-  a file created with mode 0600.
+  use it only once the user confirmed. Store it in the keychain, or in a
+  file created with mode 0600.
 - Handle the outcomes: `denied`; a 404 once the request has expired, 5
   minutes after it was made; 429 when 24 requests are pending, or 4 from your
   address; 500 when the engine could not read or write its pairing file (poll
@@ -213,12 +232,19 @@ explicitly with `--no-code` after comparing the fingerprint the browser shows.
 
 **Approving from an app.** An app that holds an `admin` token (a host that
 manages its engine) lists requests with `GET /engine/pairings` and shows each
-one's `check`. For `code`, ask the operator for the code the device shows
-and send `{"code": "…"}`; then show the `confirm` from the answer, large,
-for the user to type into the device. For `none`, warn that the device
-cannot show a code (a browser or curl) and that a device which does show one
-means something in between removed it, and send `{"no_code": true}` only
-after the operator confirms. For `plain`, send no body. In Rust:
+one's `check` and `code`. For `code`, show the code large, next to the
+device's name, with a button that says what the operator checks: "The device
+shows this code — approve". On a press, send that code back as
+`{"code": "…"}`. The engine refuses an approval of such a request without its
+code, which ties the approval to the request whose code you showed and stops
+a codeless one; it cannot tell whether anyone compared, so never send the
+code without the operator's press (an app that approves every listed request
+with its listed code approves without looking). Keep showing the code after
+the approval: the user at the device compares against it before confirming
+there. For `none`, warn that the device cannot show a code (a
+browser or curl) and that a device which does show one means something in
+between removed it, and send `{"no_code": true}` only after the operator
+confirms. For `plain`, send no body. In Rust:
 `RemoteEngine::approve_pairing(id, Some(code))`,
 `approve_pairing_without_code(id)` and `approve_pairing(id, None)`.
 `decide_pairing(id, true)` sends no code, so the engine accepts it for a
@@ -240,8 +266,9 @@ engine can present it. Loopback (`http://127.0.0.1:27200`) stays plain HTTP.
 
 Where the pin comes from:
 
-- **Pairing**, which proves it with the two codes (above). The pin is the
-  certificate the device saw, once the confirmation code matches.
+- **Pairing**, which proves it with the code compared on both ends (above).
+  The pin is the certificate the device saw, once its user said the engine
+  shows the same code.
 - **The operator**, for an app given a token by hand: `estia tls fingerprint`
   on the engine's machine prints it, and `estia token new` prints it under
   the token. Let the user paste it, connect, and check that the certificate
@@ -289,7 +316,7 @@ use estia_engine::{begin_pairing, probe_certificate, EngineLocation, Fingerprint
 // Pairing.
 let pending = begin_pairing("https://192.168.1.20:27200", "kitchen tablet", &["generate", "embed"])?;
 show_large(pending.code().unwrap());                 // "482 913"
-println!("{}", pending.approve_command());           // estia pair approve <id> --code 482913
+println!("{}", pending.approve_command());           // estia pair approve <id>
 let token = loop {                                   // every 2 s
     match pending.poll()? {
         PairingOutcome::Approved { token } => break token,
@@ -297,13 +324,16 @@ let token = loop {                                   // every 2 s
         other => return Err(format!("{other:?}").into()),
     }
 };
-// "Approved" alone proves nothing: the user types the confirmation code
-// `estia pair approve` printed on the engine's machine. Ask again on a typo.
-let pin = if pending.needs_confirmation() {
-    Some(pending.confirm(&ask_user("Confirmation code from `estia pair approve`:"))?)
-} else {
-    None                                             // http://127.0.0.1: nothing to confirm
-};
+// "Approved" alone proves nothing: the user compares this device's code
+// with the engine's screen. Pin only on a yes; on a no, drop the token.
+// Never answer in code: with nobody to ask, compare `code()` with the six
+// digits read off the engine (`PairingCode::parse`, then `==`) instead.
+if let Some(code) = pending.code() {
+    if !ask_yes_no(&format!("Does the engine show {code}?")) {
+        return Err("the codes differ: deny the request on the engine".into());
+    }
+}
+let pin = pending.confirm_match();                   // None over http://127.0.0.1
 // Store base_url, token and pin together; connect through the location, which
 // cannot drop the pin.
 let location = EngineLocation::Remote { base_url: "https://192.168.1.20:27200".into(), token: Some(token), name: None, pin };
@@ -323,13 +353,14 @@ match engine.health() {
 ```
 
 `PendingPairing` serialises (it holds no secret: whatever stood between the
-device and the engine could compute every code in it), so an app can keep it
+device and the engine could compute the code in it), so an app can keep it
 between calls, poll from wherever and confirm later. `certificate()` is the
-certificate the device saw, an `UnverifiedFingerprint` until `confirm`
-returns it as the pin. `PairingOutcome::Expired` means the engine dropped the
-request; `AlreadyCollected` that another poll took the token.
+certificate the device saw, an `UnverifiedFingerprint` until `confirm_match`
+returns it as the pin; `code()` is the same before and after the approval.
+`PairingOutcome::Expired` means the engine dropped the request;
+`AlreadyCollected` that another poll took the token.
 `RemoteEngine::pair_request` and `pair_poll` are deprecated: they send no
-commitment, so the request has no codes. Discovery tells you an engine speaks TLS (`Discovered::tls`,
+commitment, so the request has no code. Discovery tells you an engine speaks TLS (`Discovered::tls`,
 `Discovered::url()`), and what certificate it claims (`Discovered::fingerprint`,
 an `UnverifiedFingerprint`: compare it with a stored pin to find your engine
 at a new address, never pin it).
