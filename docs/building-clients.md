@@ -419,10 +419,9 @@ answers 422 before doing any work:
 fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `embeddinggemma-300m-q8_0-gguf@llama-cpp` — re-embed before mixing
 ```
 
-That is `/v1/embeddings`; `/engine/embed` words it more briefly
-(``fingerprint mismatch: host serves `…`, expected `…` ``). Check for status
-422 and a message that starts with `fingerprint mismatch:`, not for the whole
-text.
+Both `/v1/embeddings` and `/engine/embed` return this same message. Check for
+status 422 and a message that starts with `fingerprint mismatch:`, not for the
+whole text.
 
 **Re-embedding.** Any change of embedding model or backend on the host changes
 the fingerprint. On that 422, rebuild the index from your source texts with

@@ -14,6 +14,10 @@ and use today's names (the project took the name Estia in 0.3.0).
 
 ## Unreleased
 
+### HTTP API
+
+- Both embedding routes use the same helpful fingerprint-mismatch error message.
+
 ### Image input
 
 - Chat messages can carry images: OpenAI `image_url` parts with a `data:` URL

@@ -727,9 +727,7 @@ pub async fn embeddings(State(state): State<Arc<AppState>>, Json(req): Json<Embe
     let fingerprint = state.embed_fingerprint(model)?;
     if let Some(expected) = &req.expect_fingerprint {
         if expected != &fingerprint {
-            return Err(ApiError::unprocessable(format!(
-                "fingerprint mismatch: this host serves `{fingerprint}`, you expected `{expected}` — re-embed before mixing"
-            )));
+            return Err(ApiError::fingerprint_mismatch(&fingerprint, expected));
         }
     }
     let prio = priority_of(&req.priority);

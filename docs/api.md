@@ -275,8 +275,7 @@ both fingerprints:
 fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `embeddinggemma-300m-q8_0-gguf@llama-cpp` — re-embed before mixing
 ```
 
-`/engine/embed` says the same more briefly:
-``fingerprint mismatch: host serves `…`, expected `…` ``.
+Both `/engine/embed` and `/v1/embeddings` return this same message.
 
 ## GET /v1/models
 

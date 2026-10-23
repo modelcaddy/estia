@@ -566,6 +566,12 @@ impl ApiError {
     pub fn unprocessable(m: impl Into<String>) -> Self {
         Self { status: StatusCode::UNPROCESSABLE_ENTITY, kind: "invalid_request_error", message: m.into() }
     }
+    /// 422: this host's embedding vectors do not match the caller's index.
+    pub fn fingerprint_mismatch(served: &str, expected: &str) -> Self {
+        Self::unprocessable(format!(
+            "fingerprint mismatch: this host serves `{served}`, you expected `{expected}` — re-embed before mixing"
+        ))
+    }
     pub fn internal(m: impl Into<String>) -> Self {
         Self { status: StatusCode::INTERNAL_SERVER_ERROR, kind: "server_error", message: m.into() }
     }

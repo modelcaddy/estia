@@ -269,6 +269,20 @@ async fn health_auth_models_chat_embed() {
     let (s, v) =
         post(&h, &h.admin, "/engine/embed", json!({"inputs": "x", "expect_fingerprint": "nomic-embed-text-v1.5@mlx-python"})).await;
     assert_eq!(s, 422, "{v}");
+    let native_message = v["error"]["message"].as_str().unwrap().to_owned();
+    assert_eq!(
+        native_message,
+        "fingerprint mismatch: this host serves `embeddinggemma-300m-4bit@mlx-python`, you expected `nomic-embed-text-v1.5@mlx-python` — re-embed before mixing"
+    );
+    let (s, v) = post(
+        &h,
+        &h.admin,
+        "/v1/embeddings",
+        json!({"model": "embeddinggemma-300m-4bit", "input": "x", "expect_fingerprint": "nomic-embed-text-v1.5@mlx-python"}),
+    )
+    .await;
+    assert_eq!(s, 422, "{v}");
+    assert_eq!(v["error"]["message"], native_message);
     let (s, v) = post(
         &h,
         &h.admin,

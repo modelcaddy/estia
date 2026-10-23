@@ -724,7 +724,7 @@ pub async fn embed(State(state): State<Arc<AppState>>, Json(req): Json<EmbedRequ
     let fingerprint = state.embed_fingerprint(model)?;
     if let Some(expected) = &req.expect_fingerprint {
         if expected != &fingerprint {
-            return Err(ApiError::unprocessable(format!("fingerprint mismatch: host serves `{fingerprint}`, expected `{expected}`")));
+            return Err(ApiError::fingerprint_mismatch(&fingerprint, expected));
         }
     }
     let prio = if req.priority.as_deref() == Some("background") { Priority::Background } else { Priority::Interactive };
